@@ -1,0 +1,14 @@
+# Secrets and runtime state -- never commit these.
+.env
+*.session
+*.session-journal
+vault/
+
+# Build output.
+/target/
+
+# IDE
+.idea/
+.venv/
+
+# I like boys btw
