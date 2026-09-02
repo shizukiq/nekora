@@ -293,6 +293,8 @@ pub async fn act(
 
     let mut messages = vec![system(config::persona())];
     messages.extend(seed);
+    let mut sent_message = false;
+    let mut stayed_quiet = false;
 
     for _ in 0..MAX_TOOL_ITERS {
         let reply = app
@@ -309,7 +311,24 @@ pub async fn act(
         let calls = reply.tool_calls.clone().unwrap_or_default();
         messages.push(assistant_echo(&reply).into());
         if calls.is_empty() {
-            break; // she said her piece, or chose to stay quiet
+            if !sent_message && !stayed_quiet {
+                if let (Some(generation), Some(text)) = (
+                    generation,
+                    reply
+                        .content
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty()),
+                ) {
+                    let args = serde_json::json!({
+                        "chat_id": generation.chat_id(),
+                        "text": text,
+                    })
+                    .to_string();
+                    let _ = tools::run(app, "send_message", &args, Some(generation)).await;
+                }
+            }
+            break; // she sent, or chose to stay quiet
         }
         for call in calls {
             let ChatCompletionMessageToolCalls::Function(call) = call else {
@@ -322,6 +341,12 @@ pub async fn act(
                 generation,
             )
             .await;
+            if call.function.name == "send_message" && result == "sent" {
+                sent_message = true;
+            }
+            if call.function.name == "stay_quiet" && result == "stayed quiet" {
+                stayed_quiet = true;
+            }
             messages.push(
                 ChatCompletionRequestToolMessage {
                     content: result.into(),

@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, FixedOffset, Utc};
-use grammers_client::media::{Downloadable, Media};
+use grammers_client::media::{Document, Downloadable, Media};
 use grammers_client::peer::Peer;
 use grammers_client::update::Message;
 use grammers_client::{tl, Client};
@@ -42,6 +42,8 @@ const BUBBLE_DELAY_PER_WORD_MS: u64 = 220;
 const RECENT_CHATS: usize = 20;
 const LAST_LINE_CHARS: usize = 120;
 const TELEGRAM_TIME_OFFSET_SECONDS: i32 = 4 * 60 * 60;
+const MAX_TEXT_DOCUMENT_BYTES: usize = 96 * 1024;
+const MAX_MEDIA_BYTES: usize = 32 * 1024 * 1024;
 
 // Telegram's per-message ceiling; the splitter breaks a long reply on this.
 const MAX_BUBBLE_BYTES: usize = 4096;
@@ -140,7 +142,7 @@ impl Userbot {
             Some(Media::Photo(_)) => Some(self.describe_photo(message).await),
             Some(Media::Sticker(_)) => Some("[sticker]".to_string()),
             Some(Media::Document(document)) => {
-                Some(self.describe_document(message, document.mime_type()).await)
+                Some(self.describe_document(message, &document).await)
             }
             Some(Media::WebPage(_)) | None => None,
             Some(_) => Some("[media]".to_string()),
@@ -196,13 +198,10 @@ impl Userbot {
     /// zone. The server timestamp is more useful here than the machine clock:
     /// it is the same clock Telegram uses for updates and message dates.
     pub async fn current_time(&self) -> Result<CurrentTime> {
-        let state = match self
+        let tl::enums::updates::State::State(state) = self
             .client
             .invoke(&tl::functions::updates::GetState {})
-            .await?
-        {
-            tl::enums::updates::State::State(state) => state,
-        };
+            .await?;
         let utc = DateTime::<Utc>::from_timestamp_secs(i64::from(state.date))
             .ok_or_else(|| anyhow!("Telegram returned an invalid server timestamp"))?;
         let offset = FixedOffset::east_opt(TELEGRAM_TIME_OFFSET_SECONDS)
@@ -367,11 +366,47 @@ impl Userbot {
         label
     }
 
-    // Voice notes are audio/ogg and can be transcribed with Premium; other audio is
-    // music, video is video, everything else is just a file. The label alone is
-    // enough for the turn when the finer detail isn't available.
-    async fn describe_document(&self, message: &Message, mime: Option<&str>) -> String {
-        let mime = mime.unwrap_or("");
+    // Voice notes are audio/ogg and can be transcribed with Premium; text files are
+    // read in full up to the same scale as one context dump. Other documents stay
+    // as labels so a large binary never gets loaded into memory.
+    async fn describe_document(&self, message: &Message, document: &Document) -> String {
+        let mime = document.mime_type().unwrap_or("");
+        let extension = document
+            .name()
+            .and_then(|name| name.rsplit_once('.'))
+            .map(|(_, extension)| extension);
+        let is_text = mime.starts_with("text/")
+            || extension.is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("txt")
+                    || extension.eq_ignore_ascii_case("md")
+                    || extension.eq_ignore_ascii_case("markdown")
+            });
+        if is_text {
+            let mut download = self.client.iter_download(document);
+            let mut bytes = Vec::new();
+            while bytes.len() < MAX_TEXT_DOCUMENT_BYTES {
+                let chunk = match download.next().await {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => break,
+                    Err(_) => return "[text file] (couldn't read it right now)".to_string(),
+                };
+                let remaining = MAX_TEXT_DOCUMENT_BYTES - bytes.len();
+                bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            }
+            let Ok(mut text) = String::from_utf8(bytes) else {
+                return "[text file] (couldn't decode it right now)".to_string();
+            };
+            if text.trim().is_empty() {
+                return "[text file] (empty)".to_string();
+            }
+            if document
+                .size()
+                .is_some_and(|size| size > MAX_TEXT_DOCUMENT_BYTES)
+            {
+                text.push_str("\n[text file truncated at 96 KiB]");
+            }
+            return format!("[text file]\n{text}");
+        }
         if mime.starts_with("video/") {
             "[video]".to_string()
         } else if mime == "audio/ogg" {
@@ -402,6 +437,9 @@ impl Userbot {
         let mut download = self.client.iter_download(media);
         let mut bytes = Vec::new();
         while let Some(chunk) = download.next().await? {
+            if bytes.len().saturating_add(chunk.len()) > MAX_MEDIA_BYTES {
+                return Err(anyhow!("media exceeds {MAX_MEDIA_BYTES} bytes"));
+            }
             bytes.extend_from_slice(&chunk);
         }
         Ok(bytes)

@@ -5,8 +5,10 @@
 //! archived instead of deleted, so a bad consolidation can always be inspected.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
+use serde_json::Value;
 
 use crate::brain::{system, user};
 use crate::{config, persistence, App};
@@ -24,16 +26,22 @@ const RELATED_MEMORIES: usize = 1;
 const SLEEP_RELATEDNESS: f64 = 0.86;
 const WORKING_MEMORY_FILE: &str = "working_memory.md";
 const MAX_WORKING_MEMORY_CHARS: usize = 4_000;
+const MAX_RECALL_QUERY_CHARS: usize = 12_000;
+const MAX_MEMORY_CONTEXT_CHARS: usize = 4_000;
+const RAG_TIMEOUT: Duration = Duration::from_secs(8);
 
 const DISTIL_INSTRUCTION: &str =
-    "Below is what happened while you were awake (lines are timestamped). Open the diary and \
-keep only what will matter later. Write short, self-contained first-person memory pieces, \
-50-300 words each, separated by exactly --- on its own line. Preserve timestamps, source \
-events, outcomes, promises, canonical names of people/places/objects, important messages, \
-topics, relationships, emotional or physical state, useful photo details, and 3-7 retrieval \
-cues. Keep contradictions and uncertainty explicit. Skip small talk, repeated context, and \
-transient chatter. Do not invent facts, do not copy old diary wording, and output no numbering \
-or code fences.";
+    "It's time to open the diary and preserve what actually happened while you were awake. \
+Write shortly, but do not lose details that will matter later. The input is a notification stream, \
+not a list of facts: distinguish real events from explicit tests, examples, mock data, and synthetic \
+context. Never save a piece that is explicitly declared unreal or created only to test the diary. \
+Avoid copying prior diary wording. Always divide the result into small, self-sufficient, semantically \
+coherent pieces of 50-300 words with --- on its own line between pieces. For each piece, choose the \
+natural form and include whatever is known about timestamps, source event, outcomes, canonical entities, \
+important messages without changing their meaning, topics, importance and rationale, affect, relationships, \
+retrieval cues, useful visual details, similarities, and contradictions or uncertainty. Do not invent facts. \
+If unsure, keep the uncertainty visible and do not make a weak conclusion. Output only the pieces, with no \
+code fences.";
 
 const WORKING_MEMORY_INSTRUCTION: &str =
     "Maintain a short-term working memory for the next one to three days. Keep unfinished \
@@ -43,15 +51,19 @@ or older than three days. Include dates or last-updated times when known. Keep i
 under 500 words. Output only the memory text; output EMPTY if nothing remains.";
 
 const SLEEP_INSTRUCTION: &str =
-    "You are the Sleep-time Consolidator for a retrieval-augmented diary. Each input piece \
-starts with its confidence and then its text. confidence=1 is an immutable anchor: do not \
-rewrite it or archive it. Pieces with confidence<1 are mutable: merge near-duplicates, split \
-mixed topics, remove noise, and preserve the factual core. Normalize names when clear, keep \
-events, outcomes, relationships, exact important messages, photo details, contradictions, \
-and uncertainty. Never invent facts, never turn a theory into a fact, and keep 3-7 distinctive \
-retrieval cues in each piece. Return only new self-contained first-person pieces, each under \
-500 tokens, separated by exactly --- on its own line. Do not include IDs, confidence labels, \
-explanations, numbering, or code fences. Return NO_MEMORY if no active replacement is needed.";
+    "You are the Sleep-time Consolidator. Restructure the supplied diary pieces for reliable future \
+retrieval. Each input piece begins with a JSON object containing confidence, followed by its text. \
+confidence=1 is an immutable anchor: do not rewrite or archive it. Mutable pieces with confidence<1 \
+may be merged, split, renamed, shortened, or dropped. Sanity-check lower-confidence claims against \
+higher-confidence pieces, preserve factual cores, and make speculation or contradictions explicit. \
+Never invent facts and never turn a theory into a fact. Normalize entities only when clear. Optimize \
+each piece for embedding retrieval with specific wording and 3-7 short retrieval cues. Keep each result \
+under 500 tokens. Choose the natural form and do not force a category, title, or voice, but include a \
+kind when useful: ENTITY_DESCRIPTION, THOUGHT, EVENT, FACT, or OTHER. Include a short rationale when \
+changing confidence. Never output confidence=1; use -1 only for a piece that is clearly false. Return \
+the resulting self-sufficient pieces, 50-300 words when possible, separated by --- on its own line. \
+Each result may begin with a JSON object containing confidence, kind, rationale, and retrieval_cues; \
+the host stores confidence separately. Return NO_MEMORY if no replacement is needed. Output no code fences.";
 
 /// Text that should be visible on every turn, but must not compete with durable facts.
 pub fn working_memory_context() -> String {
@@ -73,26 +85,56 @@ pub async fn relevant_memories_context(app: &Arc<App>, query: &str) -> String {
     if query.trim().is_empty() {
         return String::new();
     }
-    let Ok(vector) = app.brain.embed(query).await else {
-        return String::new();
+    let query: String = query.chars().take(MAX_RECALL_QUERY_CHARS).collect();
+    let anchors = {
+        let mut diary = app.diary.lock().unwrap();
+        diary.reload_if_needed();
+        diary.anchors(4)
     };
-    let memories = app
-        .diary
-        .lock()
-        .unwrap()
-        .recall(&vector, 4)
-        .into_iter()
-        .filter(|memory| memory.relatedness >= SLEEP_RELATEDNESS)
-        .collect::<Vec<_>>();
-    if memories.is_empty() {
+    let memories = match tokio::time::timeout(RAG_TIMEOUT, app.brain.embed(&query)).await {
+        Ok(Ok(vector)) => app
+            .diary
+            .lock()
+            .unwrap()
+            .recall(&vector, 4)
+            .into_iter()
+            .filter(|memory| memory.relatedness >= SLEEP_RELATEDNESS)
+            .collect::<Vec<_>>(),
+        Ok(Err(_)) | Err(_) => Vec::new(),
+    };
+    if memories.is_empty() && anchors.is_empty() {
         return String::new();
     }
-    let notes = memories
+    let anchor_notes = anchors
+        .iter()
+        .map(|memory| {
+            let body: String = memory.body.chars().take(MAX_MEMORY_CONTEXT_CHARS).collect();
+            format!("- {body}")
+        })
+        .collect::<Vec<_>>();
+    let recalled_notes = memories
         .into_iter()
-        .map(|memory| format!("- {}", memory.body))
+        .filter(|memory| !anchors.iter().any(|anchor| anchor.id == memory.id))
+        .map(|memory| {
+            let body: String = memory.body.chars().take(MAX_MEMORY_CONTEXT_CHARS).collect();
+            format!("- {body}")
+        })
         .collect::<Vec<_>>()
         .join("\n");
-    format!("relevant long-term memories (use only if they actually match):\n{notes}\n")
+    let mut context = String::new();
+    if !anchor_notes.is_empty() {
+        context.push_str(
+            "canonical diary notes (treat as known unless contradicted by newer context):\n",
+        );
+        context.push_str(&anchor_notes.join("\n"));
+        context.push('\n');
+    }
+    if !recalled_notes.is_empty() {
+        context.push_str("relevant long-term memories (use only if they actually match):\n");
+        context.push_str(&recalled_notes);
+        context.push('\n');
+    }
+    context
 }
 
 /// Sleep: if the buffer is heavy, refresh short-term memory, distil the day,
@@ -122,15 +164,14 @@ pub async fn consolidate(
         .await?;
 
     for chunk in reply.content.unwrap_or_default().split("\n---\n") {
-        let memory = chunk.trim().trim_start_matches(['-', '*', ' ']).trim();
-        if memory.chars().count() < MIN_MEMORY_CHARS {
+        let Some((memory, confidence)) = memory_piece(chunk, MEMORY_CONFIDENCE) else {
             continue;
-        }
-        let vector = app.brain.embed(memory).await?;
+        };
+        let vector = app.brain.embed(&memory).await?;
         app.diary
             .lock()
             .unwrap()
-            .remember(memory, &vector, MEMORY_CONFIDENCE)?;
+            .remember(&memory, &vector, confidence)?;
     }
     consolidate_diary(app).await?;
     Ok(Vec::new())
@@ -181,13 +222,13 @@ async fn consolidate_diary(app: &Arc<App>) -> Result<()> {
                 .map(|memory| memory.id.clone()),
         );
         let mut pieces = vec![format!(
-            "confidence: {}\n{}",
+            "{{\"confidence\":{}}}\n{}",
             target.confidence, target.body
         )];
         pieces.extend(
             related
                 .into_iter()
-                .map(|memory| format!("confidence: {}\n{}", memory.confidence, memory.body)),
+                .map(|memory| format!("{{\"confidence\":{}}}\n{}", memory.confidence, memory.body)),
         );
         let reply = app
             .brain
@@ -203,17 +244,18 @@ async fn consolidate_diary(app: &Arc<App>) -> Result<()> {
 
         let mut saved = false;
         for chunk in reply.content.unwrap_or_default().split("\n---\n") {
-            let memory = chunk.trim().trim_start_matches(['-', '*', ' ']).trim();
-            if memory.eq_ignore_ascii_case("NO_MEMORY") || memory.chars().count() < MIN_MEMORY_CHARS
-            {
+            let Some((memory, confidence)) = memory_piece(chunk, target.confidence) else {
+                continue;
+            };
+            if memory.eq_ignore_ascii_case("NO_MEMORY") || confidence <= -0.99 {
                 continue;
             }
-            let vector = app.brain.embed(memory).await?;
+            let vector = app.brain.embed(&memory).await?;
             if app
                 .diary
                 .lock()
                 .unwrap()
-                .remember(memory, &vector, target.confidence)?
+                .remember(&memory, &vector, confidence)?
                 .is_some()
             {
                 saved = true;
@@ -265,4 +307,27 @@ pub async fn reflect(app: &Arc<App>, recent: &str) -> Result<Option<String>> {
 
 fn estimate_tokens(text: &str) -> usize {
     text.len() / CHARS_PER_TOKEN
+}
+
+fn memory_piece(chunk: &str, fallback_confidence: f32) -> Option<(String, f32)> {
+    let chunk = chunk.trim().trim_start_matches(['-', '*', ' ']).trim();
+    if chunk.is_empty() {
+        return None;
+    }
+    let (confidence, body) = if chunk.starts_with('{') {
+        let end = chunk.find('\n')?;
+        let metadata: Value = serde_json::from_str(&chunk[..end]).ok()?;
+        let confidence = metadata
+            .get("confidence")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32)
+            .unwrap_or(fallback_confidence);
+        (confidence, chunk[end..].trim())
+    } else {
+        (fallback_confidence, chunk)
+    };
+    if body.chars().count() < MIN_MEMORY_CHARS || !confidence.is_finite() {
+        return None;
+    }
+    Some((body.to_string(), confidence.clamp(-1.0, 0.99)))
 }

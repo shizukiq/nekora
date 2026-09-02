@@ -32,7 +32,9 @@ use inspect_user for a person's profile and avatar; copy their name, username, a
 from the message into that call. Use inspect_message_media when you
 want to look closely at a recent photo or sticker. Use get_current_time when the exact
 time matters; it asks Telegram for its server time in UTC+04:00.
-and stay_quiet when nothing needs saying.
+For an incoming chat, the visible answer must go through send_message; never leave it
+only in assistant text. Call send_message or stay_quiet when the turn is finished.
+Use stay_quiet when nothing needs saying.
 You have eyes: you see photos. If one is marked as something you couldn't quite make
 out, that is momentary -- say you can't see it clearly right now and ask them to
 resend; never claim you cannot see pictures at all.
@@ -90,14 +92,13 @@ pub fn persona() -> String {
     fs::read_to_string(PROMPT_FILE).unwrap_or_else(|_| DEFAULT_PERSONA.to_string())
 }
 
-/// The one runtime line each turn opens with: the time, who she is, who her
+/// The one runtime line each turn opens with: the time, who she is, and who her
 /// person is. Read fresh every turn because the time is part of it.
 pub fn preamble() -> String {
     format!(
-        "It is {}. You are {}. Your person is {} (chat id {}).",
+        "It is {}. You are {}. Your person is {}.",
         Local::now().format("%Y-%m-%d %H:%M"),
         nekora_name(),
         env_or("PAPIK_NAME", "your person"),
-        env_or("PAPIK_CHAT_ID", "0"),
     )
 }

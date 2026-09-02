@@ -142,23 +142,21 @@ impl App {
 
     /// Keep an incoming message in today's context even when the turn is ignored.
     fn record_event(&self, event: &Incoming) {
-        self.today.lock().unwrap().lines.push(format!(
-            "[{}] {} in chat {} (message id {}) says: {}",
-            now_stamp(),
-            event_identity(event),
-            event.chat_id,
-            event.message_id,
-            event.text,
+        self.today.lock().unwrap().lines.push(message_block(
+            &event.sender,
+            event.username.as_deref(),
+            event.sender_id,
+            &event.text,
         ));
     }
 
     /// Keep a sent answer in today's context.
-    pub fn record_outgoing(&self, chat_id: i64, text: &str) {
-        self.today.lock().unwrap().lines.push(format!(
-            "[{}] {} in chat {chat_id} sent: {text}",
-            now_stamp(),
-            config::nekora_name(),
-        ));
+    pub fn record_outgoing(&self, text: &str) {
+        self.today
+            .lock()
+            .unwrap()
+            .lines
+            .push(message_block(&config::nekora_name(), None, 0, text));
     }
 
     /// Today's timestamped tail, so the turn can reason about elapsed real time.
@@ -215,15 +213,12 @@ async fn respond(app: &Arc<App>, events: &[Incoming], generation: ReplyGeneratio
     }
     let lines = events
         .iter()
-        .enumerate()
-        .map(|(index, event)| {
-            format!(
-                "[{}] {} in chat {} (message id {}) says: {}",
-                index + 1,
-                event_identity(event),
-                event.chat_id,
-                event.message_id,
-                event.text
+        .map(|event| {
+            message_block(
+                &event.sender,
+                event.username.as_deref(),
+                event.sender_id,
+                &event.text,
             )
         })
         .collect::<Vec<_>>()
@@ -231,7 +226,7 @@ async fn respond(app: &Arc<App>, events: &[Incoming], generation: ReplyGeneratio
     let memories = sleep::relevant_memories_context(app, &lines).await;
     let working_memory = sleep::working_memory_context();
     let content = format!(
-        "{}\n{}{}{memories}{context}several messages arrived close together; read them as one thought \
+        "{}\n{}{}{memories}{context}current reply target chat_id: {chat_id}\nseveral messages arrived close together; read them as one thought \
          and answer the whole thing:\n{lines}",
         config::preamble(),
         maybe_tool_reminder(),
@@ -371,16 +366,32 @@ fn to_events(chat_id: i64, messages: Vec<ConversationMessage>) -> Vec<Incoming> 
         .collect()
 }
 
-fn event_identity(event: &Incoming) -> String {
-    let username = event
-        .username
-        .as_deref()
-        .map(|username| format!("@{username}"))
-        .unwrap_or_else(|| "not available".to_string());
-    format!(
-        "name: {}; username: {}; user_id: {}",
-        event.sender, username, event.sender_id
-    )
+fn message_block(sender: &str, username: Option<&str>, sender_id: i64, text: &str) -> String {
+    let mut header = format!(
+        "<message sender=\"{}\" time=\"{}\"",
+        escape_message_attribute(sender),
+        now_stamp(),
+    );
+    if let Some(username) = username
+        .map(str::trim)
+        .filter(|username| !username.is_empty())
+    {
+        header.push_str(" username=\"@");
+        header.push_str(&escape_message_attribute(username.trim_start_matches('@')));
+        header.push('\"');
+    }
+    if sender_id > 0 {
+        header.push_str(&format!(" user_id=\"{sender_id}\""));
+    }
+    format!("{header}>\n{text}\n</message>")
+}
+
+fn escape_message_attribute(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Drain the update stream forever, feeding incoming messages to the core. A

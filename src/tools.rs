@@ -202,7 +202,7 @@ async fn dispatch(
             let text = str_arg(&args, "text")?;
             app.userbot.send(app, chat_id, text, generation).await?;
             if generation.is_none_or(|generation| app.generation_is_current(generation)) {
-                app.record_outgoing(chat_id, text);
+                app.record_outgoing(text);
             }
             Ok("sent".to_string())
         }

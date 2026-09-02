@@ -41,6 +41,12 @@ pub struct ReplyGeneration {
     revision: u64,
 }
 
+impl ReplyGeneration {
+    pub(crate) fn chat_id(self) -> i64 {
+        self.chat_id
+    }
+}
+
 struct Pending {
     messages: Vec<ConversationMessage>,
     first_message_at: i64,
