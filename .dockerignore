@@ -1,0 +1,8 @@
+.git
+.env
+*.session
+*.session-journal
+vault/
+target/
+.venv/
+.idea/

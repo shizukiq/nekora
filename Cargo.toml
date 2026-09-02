@@ -1,0 +1,59 @@
+[package]
+name = "nekora"
+version = "0.1.0"
+edition = "2021"
+description = "An autonomous Telegram userbot that lives on its own clock"
+license = "GPL-3"
+
+# One binary, one Nekora. The old Python "hand" and C++ "core" are now one Rust
+# process: the core modules (heartbeat, conversation, diary, persistence) stay
+# pure-std and never touch the network; the I/O modules (brain, tools, userbot,
+# sleep) do every request through a library, never hand-rolled HTTP.
+[[bin]]
+name = "nekora"
+path = "src/main.rs"
+
+[dependencies]
+# The async runtime that replaces asyncio: the heartbeat loop, timers, the
+# Telegram update stream, and owning the local Ollama child process all live on it.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "sync", "signal", "io-std", "io-util"] }
+
+# The userbot: a real Telegram account over MTProto (never the Bot API). grammers
+# is the Rust equivalent of Telethon -- login, updates, sending, actions, raw TL.
+grammers-client = "0.10"
+grammers-session = "0.10"
+grammers-tl-types = "0.10"
+
+# The brain: DeepSeek over its OpenAI-compatible /v1, tool calls and all, through
+# a typed client instead of hand-rolled HTTP. rustls (not the default native-tls)
+# keeps the build free of a system OpenSSL; only chat + embeddings are pulled in.
+async-openai = { version = "0.41", default-features = false, features = ["rustls", "chat-completion", "embedding"] }
+
+# The local pool: bge-m3 embeddings and the qwen2.5vl vision model on Ollama.
+# Same rustls choice, for the same reason -- its default feature is native-tls.
+ollama-rs = { version = "0.3", default-features = false, features = ["rustls"] }
+
+# JSON is the tool-call wire format the brain reads and writes, and the diary's
+# recall/list payloads. serde covers both.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Incoming photos are captioned by the local vision model, which takes base64.
+base64 = "0.23"
+
+# Local wall-clock formatting for the per-turn preamble and today's timestamps
+# (std has no date formatting; the core itself only ever needs unix seconds).
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# One error type across the async I/O layer so a turn can fail without a match arm
+# for every backend. The pure core modules deliberately avoid it and use std only.
+anyhow = "1"
+
+# The I/O layer's small randomness: the 10% chance she ignores a message, the
+# occasional tool reminder, and the words-per-minute typing jitter. The core has
+# its own std-only PRNG; this is only for the hand.
+rand = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = true

@@ -1,0 +1,475 @@
+//! Nekora's heartbeat loop -- the conductor that lives on a timer.
+//!
+//! The core decides *whether*; the brain decides *what*; this file schedules and,
+//! when the container asks, owns the local Ollama process. Every 27 minutes it
+//! flips the core's coin: on "act" she drifts to a random diary page and
+//! reflects, maybe messaging someone. An incoming burst arrives sooner -- it wakes
+//! her from any nap, waits until the person finishes a thought, then hands the
+//! whole burst to the brain. When the day's talk grows heavy she sleeps: the
+//! context is distilled into the diary and she wakes on a clean slate.
+//!
+//! Nothing here is instant and nothing here is eager -- that is the whole point of
+//! modelling a unit instead of an assistant.
+
+mod brain;
+mod config;
+mod conversation;
+mod diary;
+mod heartbeat;
+mod ollama;
+mod persistence;
+mod sleep;
+mod tools;
+mod userbot;
+
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use anyhow::{bail, Result};
+use chrono::Local;
+use grammers_client::client::UpdatesConfiguration;
+use grammers_client::session::storages::SqliteSession;
+use grammers_client::session::types::PeerId;
+use grammers_client::tl;
+use grammers_client::update::Update;
+use grammers_client::{Client, SenderPool};
+use rand::Rng;
+use tokio::sync::Notify;
+
+use brain::Brain;
+use conversation::{Conversation, ConversationBatch, ConversationMessage, ReplyGeneration};
+use diary::Diary;
+use heartbeat::Heartbeat;
+use userbot::{Incoming, Userbot};
+
+// The core ticks about every 27 minutes -- long enough that she is plainly living
+// on her own clock, not watching the chat.
+const TICK: Duration = Duration::from_secs(27 * 60);
+// Sometimes she reads an incoming message and lets it lie, so she can't be driven
+// purely by whoever texts most.
+const SUGGEST_IGNORE_CHANCE: f64 = 0.1;
+// After a burst goes quiet she still waits this long before answering, in case the
+// person is mid-thought and about to send more. Anything that lands during the
+// grace is folded into the same reply, so she reads the whole thing instead of
+// cutting in -- the same reason she sends more than one message herself.
+const RESPONSE_GRACE: Duration = Duration::from_secs(5);
+// Occasionally re-list her tools so she doesn't forget she can search, remember,
+// or send a photo.
+const TOOL_REMINDER_CHANCE: f64 = 0.02;
+// How much of today she carries into each turn: the recent, timestamped tail of
+// the buffer. Without it every message looks timeless. Bounded so a long day does
+// not resend the whole context on every message.
+const RECENT_LINES: usize = 40;
+
+struct Today {
+    day: String,
+    lines: Vec<String>,
+}
+
+/// Everything shared between the update ingest and the heartbeat loop. One
+/// process, one Nekora: a single instance of each subsystem, guarded where two
+/// tasks touch it.
+pub struct App {
+    pub brain: Arc<Brain>,
+    pub userbot: Arc<Userbot>,
+    pub diary: Mutex<Diary>,
+    heartbeat: Mutex<Heartbeat>,
+    conversation: Mutex<Conversation>,
+    today: Mutex<Today>,
+    // Pulses the heartbeat loop when a message arrives, so it re-checks at once
+    // instead of sleeping out the tick.
+    wake: Notify,
+    // The monotonic origin the conversation's millisecond timers are measured from.
+    started: Instant,
+}
+
+impl App {
+    fn new(brain: Arc<Brain>, userbot: Arc<Userbot>, diary: Diary) -> Self {
+        Self {
+            brain,
+            userbot,
+            diary: Mutex::new(diary),
+            heartbeat: Mutex::new(Heartbeat::new(unix_seconds() as u64)),
+            conversation: Mutex::new(Conversation::default()),
+            today: Mutex::new(Today {
+                day: today_str(),
+                lines: Vec::new(),
+            }),
+            wake: Notify::new(),
+            started: Instant::now(),
+        }
+    }
+
+    fn monotonic_ms(&self) -> i64 {
+        self.started.elapsed().as_millis() as i64
+    }
+
+    pub(crate) fn message_arrived(&self, chat_id: i64) {
+        self.conversation.lock().unwrap().message_arrived(chat_id);
+    }
+
+    pub(crate) fn generation_is_current(&self, generation: ReplyGeneration) -> bool {
+        self.conversation
+            .lock()
+            .unwrap()
+            .generation_is_current(generation)
+    }
+
+    /// Wait for a reply delay, waking early when the chat revision changes.
+    pub(crate) async fn wait_for_generation_delay(
+        &self,
+        generation: ReplyGeneration,
+        delay: Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + delay;
+        loop {
+            if !self.generation_is_current(generation) {
+                return false;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return true;
+            }
+            tokio::select! {
+                biased;
+                _ = self.wake.notified() => {}
+                _ = tokio::time::sleep(remaining) => {
+                    return self.generation_is_current(generation);
+                }
+            }
+        }
+    }
+
+    /// Keep an incoming message in today's context even when the turn is ignored.
+    fn record_event(&self, sender: &str, text: &str) {
+        self.today
+            .lock()
+            .unwrap()
+            .lines
+            .push(format!("[{}] {sender}: {text}", now_stamp()));
+    }
+
+    /// Keep a sent answer in today's context.
+    pub fn record_outgoing(&self, chat_id: i64, text: &str) {
+        self.today.lock().unwrap().lines.push(format!(
+            "[{}] {} in chat {chat_id} sent: {text}",
+            now_stamp(),
+            config::nekora_name(),
+        ));
+    }
+
+    /// Today's timestamped tail, so the turn can reason about elapsed real time.
+    fn recent_context(&self) -> String {
+        let lines = &self.today.lock().unwrap().lines;
+        let start = lines.len().saturating_sub(RECENT_LINES);
+        if start == lines.len() {
+            return String::new();
+        }
+        format!(
+            "recently (real times, today):\n{}\n",
+            lines[start..].join("\n")
+        )
+    }
+}
+
+fn maybe_tool_reminder() -> String {
+    if rand::rng().random::<f64>() < TOOL_REMINDER_CHANCE {
+        "(you can recall_memory, list_memories, remember, send_message, list_chats.)\n".to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// An "act" tick with nobody talking: reflect on an old page, then let her act.
+async fn proactive(app: &Arc<App>) -> Result<()> {
+    let thought = sleep::reflect(app, &app.recent_context()).await?;
+    let drift = match thought {
+        Some(thought) => format!("you just reflected on an old diary page:\n{thought}"),
+        None => "a quiet moment; your diary is still empty".to_string(),
+    };
+    let content = format!(
+        "{}\n{}{}({drift})",
+        config::preamble(),
+        maybe_tool_reminder(),
+        app.recent_context(),
+    );
+    brain::act(app, vec![brain::user(content)], None).await
+}
+
+/// Give one burst of incoming messages to the brain as one conversational turn.
+async fn respond(app: &Arc<App>, events: &[Incoming], generation: ReplyGeneration) -> Result<()> {
+    let chat_id = events[0].chat_id;
+    app.userbot.go_online().await;
+
+    let context = app.recent_context();
+    for event in events {
+        app.record_event(&event.sender, &event.text);
+    }
+    let lines = events
+        .iter()
+        .enumerate()
+        .map(|(index, event)| {
+            let who = match &event.username {
+                Some(username) => format!("{} (@{username})", event.sender),
+                None => event.sender.clone(),
+            };
+            format!(
+                "[{}] {who} in chat {} says: {}",
+                index + 1,
+                event.chat_id,
+                event.text
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = format!(
+        "{}\n{}{context}several messages arrived close together; read them as one thought \
+         and answer the whole thing:\n{lines}",
+        config::preamble(),
+        maybe_tool_reminder(),
+    );
+    // The "typing…" indicator runs for the whole turn -- the generation and the
+    // sending -- so it tracks real thinking time instead of a delay pasted on after.
+    app.userbot
+        .keep_typing(
+            chat_id,
+            brain::act(app, vec![brain::user(content)], Some(generation)),
+        )
+        .await
+}
+
+/// Wait for a ready conversation batch or the autonomous tick, whichever comes
+/// first. `None` means the tick fired with nobody talking.
+async fn wait_for_turn(app: &Arc<App>) -> Option<ConversationBatch> {
+    loop {
+        let now_ms = app.monotonic_ms();
+        if let Some(batch) = app.conversation.lock().unwrap().take_ready(now_ms) {
+            return Some(batch);
+        }
+        let deadline = app.conversation.lock().unwrap().next_deadline(now_ms);
+        let has_conversation = deadline >= 0;
+        let timeout = if has_conversation {
+            TICK.min(Duration::from_millis((deadline - now_ms).max(0) as u64))
+        } else {
+            TICK
+        };
+        tokio::select! {
+            _ = app.wake.notified() => continue,
+            _ = tokio::time::sleep(timeout) => {
+                if has_conversation {
+                    continue; // the batch's window has closed; take it next loop
+                }
+                return None;
+            }
+        }
+    }
+}
+
+/// The loop: wake on a message or every tick, act, then sleep if the day is heavy.
+async fn heartbeat_loop(app: &Arc<App>) {
+    loop {
+        if let Err(error) = run_turn(app).await {
+            // One bad turn -- both LLM endpoints down, a backend blip mid-turn --
+            // must never take the whole unit down. Log it and keep beating.
+            eprintln!("heartbeat: turn failed, continuing: {error:#}");
+        }
+    }
+}
+
+async fn run_turn(app: &Arc<App>) -> Result<()> {
+    let batch = wait_for_turn(app).await;
+
+    let now = unix_seconds();
+    let day = today_str();
+    if app.today.lock().unwrap().day != day {
+        let lines = std::mem::take(&mut app.today.lock().unwrap().lines);
+        match sleep::consolidate(app, lines, true).await {
+            Ok(fresh) => {
+                let mut today = app.today.lock().unwrap();
+                today.lines = fresh;
+                today.day = day;
+            }
+            Err(error) => {
+                // The day rolled over but sleep failed: put the pending burst back
+                // so it is answered next turn rather than lost.
+                if let Some(batch) = &batch {
+                    let mut conversation = app.conversation.lock().unwrap();
+                    for message in &batch.messages {
+                        conversation.push(batch.chat_id, message.clone(), app.monotonic_ms());
+                    }
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    match batch {
+        None => {
+            if app.heartbeat.lock().unwrap().tick(now) {
+                proactive(app).await?;
+            }
+        }
+        Some(batch) => {
+            let chat_id = batch.chat_id;
+            let mut events = to_events(chat_id, batch.messages);
+            app.userbot.mark_read(chat_id).await;
+            if rand::rng().random::<f64>() >= SUGGEST_IGNORE_CHANCE {
+                tokio::time::sleep(RESPONSE_GRACE).await;
+                let (late, generation) = {
+                    let mut conversation = app.conversation.lock().unwrap();
+                    let late = conversation.drain_chat(chat_id);
+                    // Snapshot while holding the same lock as drain_chat. A
+                    // message arriving after this point must invalidate the
+                    // generation instead of being silently omitted from it.
+                    let generation = conversation.start_generation(chat_id);
+                    (late, generation)
+                };
+                events.extend(to_events(chat_id, late));
+                respond(app, &events, generation).await?;
+            } else {
+                for event in &events {
+                    app.record_event(&event.sender, &event.text);
+                }
+            }
+        }
+    }
+
+    let lines = std::mem::take(&mut app.today.lock().unwrap().lines);
+    let fresh = sleep::consolidate(app, lines, false).await?;
+    app.today.lock().unwrap().lines = fresh;
+    Ok(())
+}
+
+fn to_events(chat_id: i64, messages: Vec<ConversationMessage>) -> Vec<Incoming> {
+    messages
+        .into_iter()
+        .map(|message| Incoming {
+            chat_id,
+            sender_id: message.sender_id,
+            message_id: message.message_id,
+            sender: message.sender,
+            username: message.username,
+            text: message.text,
+        })
+        .collect()
+}
+
+/// Drain the update stream forever, feeding incoming messages to the core. A
+/// message pushes into the conversation buffer, wakes her from any nap, and
+/// pulses the heartbeat loop to re-check.
+async fn ingest(app: &Arc<App>, updates: &mut grammers_client::client::UpdateStream) {
+    loop {
+        match updates.next().await {
+            Ok(Update::NewMessage(message)) if !message.outgoing() => {
+                let chat_id = message.peer_id().bot_api_dialog_id_unchecked();
+                // Invalidate a running reply before describe() can await media
+                // download/transcription or vision captioning.
+                app.message_arrived(chat_id);
+                app.heartbeat.lock().unwrap().wake();
+                app.wake.notify_one();
+                let incoming = app.userbot.describe(&message).await;
+                let now_ms = app.monotonic_ms();
+                app.conversation.lock().unwrap().push(
+                    incoming.chat_id,
+                    ConversationMessage {
+                        sender_id: incoming.sender_id,
+                        message_id: incoming.message_id,
+                        sender: incoming.sender,
+                        username: incoming.username,
+                        text: incoming.text,
+                    },
+                    now_ms,
+                );
+                app.heartbeat.lock().unwrap().wake();
+                app.wake.notify_one();
+            }
+            // A "typing…" from someone with a message already pending should hold
+            // the batch open a little longer, so she doesn't cut into a thought
+            // that is still being written.
+            Ok(Update::Raw(raw)) => {
+                if let tl::enums::Update::UserTyping(typing) = &raw.raw {
+                    if let Some(chat_id) =
+                        PeerId::user(typing.user_id).map(PeerId::bot_api_dialog_id_unchecked)
+                    {
+                        let now_ms = app.monotonic_ms();
+                        if app
+                            .conversation
+                            .lock()
+                            .unwrap()
+                            .note_typing(chat_id, chat_id, now_ms)
+                        {
+                            app.wake.notify_one();
+                        }
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("update stream error, retrying: {error:#}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
+async fn run() -> Result<()> {
+    let brain = Arc::new(Brain::from_env()?);
+    // Kept alive for the whole run: dropping this stops a managed Ollama.
+    let _ollama = ollama::start_if_managed(&brain.vision_model).await?;
+
+    let mut diary = Diary::new(config::vault_dir());
+    if !diary.open() {
+        bail!("could not open vault at {:?}", config::vault_dir());
+    }
+
+    let api_id: i32 = config::env_or("TELEGRAM_API_ID", "0").parse().unwrap_or(0);
+    let session_path = format!("{}.session", config::env_or("NEKORA_SESSION", "nekora"));
+    let session = Arc::new(SqliteSession::open(&session_path).await?);
+    let SenderPool {
+        runner,
+        updates,
+        handle,
+    } = SenderPool::new(Arc::clone(&session), api_id);
+    let client = Client::new(handle);
+    let pool_task = tokio::spawn(runner.run());
+
+    userbot::login(&client).await?;
+    let mut update_stream = client
+        .stream_updates(updates, UpdatesConfiguration::default())
+        .await
+        .map_err(|error| anyhow::anyhow!("could not start update stream: {error}"))?;
+
+    let userbot = Arc::new(Userbot::new(client, Arc::clone(&session), brain.clone()));
+    let app = Arc::new(App::new(brain, userbot, diary));
+
+    println!("nekora is up; waiting on her own clock");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => eprintln!("bye"),
+        _ = async {
+            tokio::join!(ingest(&app, &mut update_stream), heartbeat_loop(&app));
+        } => {}
+    }
+    pool_task.abort();
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    config::load_env(".env");
+    run().await
+}
+
+fn unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn today_str() -> String {
+    Local::now().format("%Y-%m-%d").to_string()
+}
+
+fn now_stamp() -> String {
+    Local::now().format("%Y-%m-%d %H:%M").to_string()
+}
