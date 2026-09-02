@@ -155,10 +155,20 @@ impl Brain {
         let caption = self
             .retry(
                 || async {
-                    let message = ChatMessage::user("Describe this image in one sentence.".into())
-                        .with_images(vec![Image::from_base64(base64.as_str())]);
+                    let message = ChatMessage::user(
+                        "Look at this image carefully. First identify the main visible subject \
+                         (person, animal, or object), then mention only details you can actually \
+                         see. Do not guess from a blurry background; if it is unclear, say so. \
+                         Answer in one short sentence."
+                            .into(),
+                    )
+                    .with_images(vec![Image::from_base64(base64.as_str())]);
                     let request = ChatMessageRequest::new(self.vision_model.clone(), vec![message])
-                        .options(ModelOptions::default().num_predict(VISION_NUM_PREDICT));
+                        .options(
+                            ModelOptions::default()
+                                .num_ctx(32_768)
+                                .num_predict(VISION_NUM_PREDICT),
+                        );
                     let response = self.ollama.send_chat_messages(request).await?;
                     Ok(response.message.content.trim().to_string())
                 },

@@ -141,12 +141,15 @@ impl App {
     }
 
     /// Keep an incoming message in today's context even when the turn is ignored.
-    fn record_event(&self, sender: &str, text: &str) {
-        self.today
-            .lock()
-            .unwrap()
-            .lines
-            .push(format!("[{}] {sender}: {text}", now_stamp()));
+    fn record_event(&self, event: &Incoming) {
+        self.today.lock().unwrap().lines.push(format!(
+            "[{}] {} in chat {} (message id {}) says: {}",
+            now_stamp(),
+            event_identity(event),
+            event.chat_id,
+            event.message_id,
+            event.text,
+        ));
     }
 
     /// Keep a sent answer in today's context.
@@ -174,7 +177,10 @@ impl App {
 
 fn maybe_tool_reminder() -> String {
     if rand::rng().random::<f64>() < TOOL_REMINDER_CHANCE {
-        "(you can recall_memory, list_memories, remember, send_message, list_chats.)\n".to_string()
+        "(you can recall_memory, list_memories, remember, inspect_user, inspect_message_media, \
+         get_current_time, \
+         send_message, list_chats.)\n"
+            .to_string()
     } else {
         String::new()
     }
@@ -203,20 +209,18 @@ async fn respond(app: &Arc<App>, events: &[Incoming], generation: ReplyGeneratio
 
     let context = app.recent_context();
     for event in events {
-        app.record_event(&event.sender, &event.text);
+        app.record_event(event);
     }
     let lines = events
         .iter()
         .enumerate()
         .map(|(index, event)| {
-            let who = match &event.username {
-                Some(username) => format!("{} (@{username})", event.sender),
-                None => event.sender.clone(),
-            };
             format!(
-                "[{}] {who} in chat {} says: {}",
+                "[{}] {} in chat {} (message id {}) says: {}",
                 index + 1,
+                event_identity(event),
                 event.chat_id,
+                event.message_id,
                 event.text
             )
         })
@@ -328,7 +332,7 @@ async fn run_turn(app: &Arc<App>) -> Result<()> {
                 respond(app, &events, generation).await?;
             } else {
                 for event in &events {
-                    app.record_event(&event.sender, &event.text);
+                    app.record_event(event);
                 }
             }
         }
@@ -354,6 +358,15 @@ fn to_events(chat_id: i64, messages: Vec<ConversationMessage>) -> Vec<Incoming> 
         .collect()
 }
 
+fn event_identity(event: &Incoming) -> String {
+    let username = event
+        .username
+        .as_deref()
+        .map(|username| format!(" (@{username})"))
+        .unwrap_or_default();
+    format!("{}{} [user id {}]", event.sender, username, event.sender_id)
+}
+
 /// Drain the update stream forever, feeding incoming messages to the core. A
 /// message pushes into the conversation buffer, wakes her from any nap, and
 /// pulses the heartbeat loop to re-check.
@@ -362,12 +375,16 @@ async fn ingest(app: &Arc<App>, updates: &mut grammers_client::client::UpdateStr
         match updates.next().await {
             Ok(Update::NewMessage(message)) if !message.outgoing() => {
                 let chat_id = message.peer_id().bot_api_dialog_id_unchecked();
-                // Invalidate a running reply before describe() can await media
-                // download/transcription or vision captioning.
+                let incoming = app.userbot.describe(&message).await;
+                if app.userbot.is_broadcast_channel(chat_id).await {
+                    app.record_event(&incoming);
+                    continue;
+                }
+                // Invalidate a running reply before putting the described message
+                // in the conversation queue.
                 app.message_arrived(chat_id);
                 app.heartbeat.lock().unwrap().wake();
                 app.wake.notify_one();
-                let incoming = app.userbot.describe(&message).await;
                 let now_ms = app.monotonic_ms();
                 app.conversation.lock().unwrap().push(
                     incoming.chat_id,

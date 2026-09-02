@@ -14,7 +14,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use grammers_client::media::Media;
+use chrono::{DateTime, FixedOffset, Utc};
+use grammers_client::media::{Downloadable, Media};
+use grammers_client::peer::Peer;
 use grammers_client::update::Message;
 use grammers_client::{tl, Client};
 use grammers_session::storages::SqliteSession;
@@ -39,6 +41,7 @@ const BUBBLE_DELAY_PER_WORD_MS: u64 = 220;
 // How many recent chats list_chats shows the model, and how much of each last line.
 const RECENT_CHATS: usize = 20;
 const LAST_LINE_CHARS: usize = 120;
+const TELEGRAM_TIME_OFFSET_SECONDS: i32 = 4 * 60 * 60;
 
 // Telegram's per-message ceiling; the splitter breaks a long reply on this.
 const MAX_BUBBLE_BYTES: usize = 4096;
@@ -71,7 +74,31 @@ pub struct Incoming {
 pub struct ChatSummary {
     pub id: i64,
     pub name: String,
+    pub username: Option<String>,
     pub last: String,
+}
+
+#[derive(Serialize)]
+pub struct UserInspection {
+    pub user_id: i64,
+    pub name: String,
+    pub username: Option<String>,
+    pub avatar_description: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct MediaInspection {
+    pub kind: String,
+    pub emoji: Option<String>,
+    pub description: String,
+}
+
+#[derive(Serialize)]
+pub struct CurrentTime {
+    pub source: &'static str,
+    pub unix: i64,
+    pub utc_offset: &'static str,
+    pub datetime: String,
 }
 
 pub struct Userbot {
@@ -125,19 +152,27 @@ impl Userbot {
             None => caption,
         };
         let sender_peer = message.sender();
+        let sender_id = message
+            .sender_id()
+            .and_then(|id| id.bot_api_dialog_id())
+            .unwrap_or(0);
+        if let Some(peer) = sender_peer {
+            if let Ok(Some(peer_ref)) = peer.to_ref().await {
+                self.peers
+                    .lock()
+                    .unwrap()
+                    .insert(peer.id().bot_api_dialog_id_unchecked(), peer_ref);
+            }
+        }
         let sender = sender_peer
-            .and_then(|peer| peer.name())
-            .unwrap_or("someone")
-            .to_string();
+            .map(display_name)
+            .unwrap_or_else(|| "someone".to_string());
         let username = sender_peer
             .and_then(|peer| peer.username())
             .map(str::to_string);
         Incoming {
             chat_id,
-            sender_id: message
-                .sender_id()
-                .and_then(|id| id.bot_api_dialog_id())
-                .unwrap_or(0),
+            sender_id,
             message_id: message.id() as i64,
             sender,
             username,
@@ -145,9 +180,155 @@ impl Userbot {
         }
     }
 
+    /// Broadcast channels are read-only sources for Nekora. Keep their posts in
+    /// the diary, but never let the reply loop announce typing there.
+    pub async fn is_broadcast_channel(&self, chat_id: i64) -> bool {
+        let Ok(peer_ref) = self.resolve(chat_id).await else {
+            return false;
+        };
+        matches!(
+            self.client.resolve_peer(peer_ref).await,
+            Ok(Peer::Channel(_))
+        )
+    }
+
+    /// Ask Telegram for its server clock and present it in the requested UTC+4
+    /// zone. The server timestamp is more useful here than the machine clock:
+    /// it is the same clock Telegram uses for updates and message dates.
+    pub async fn current_time(&self) -> Result<CurrentTime> {
+        let state = match self
+            .client
+            .invoke(&tl::functions::updates::GetState {})
+            .await?
+        {
+            tl::enums::updates::State::State(state) => state,
+        };
+        let utc = DateTime::<Utc>::from_timestamp_secs(i64::from(state.date))
+            .ok_or_else(|| anyhow!("Telegram returned an invalid server timestamp"))?;
+        let offset = FixedOffset::east_opt(TELEGRAM_TIME_OFFSET_SECONDS)
+            .ok_or_else(|| anyhow!("invalid UTC+4 offset"))?;
+        let datetime = utc
+            .with_timezone(&offset)
+            .format("%Y-%m-%d %H:%M:%S %:z")
+            .to_string();
+        Ok(CurrentTime {
+            source: "telegram",
+            unix: i64::from(state.date),
+            utc_offset: "+04:00",
+            datetime,
+        })
+    }
+
+    /// Fetch a user's current profile and describe the avatar when one exists.
+    /// The lookup is on-demand so ordinary messages do not cause an extra photo
+    /// download or a vision request for every sender.
+    pub async fn inspect_user(
+        &self,
+        user_id: Option<i64>,
+        username: Option<&str>,
+    ) -> Result<UserInspection> {
+        let username = username
+            .map(str::trim)
+            .filter(|username| !username.is_empty())
+            .map(|username| username.trim_start_matches('@'))
+            .filter(|username| !username.is_empty());
+        let peer = if let Some(username) = username {
+            self.client
+                .resolve_username(username)
+                .await?
+                .ok_or_else(|| anyhow!("username not found: @{username}"))?
+        } else {
+            let user_id = user_id.ok_or_else(|| anyhow!("missing user_id or username"))?;
+            if user_id <= 0 {
+                return Err(anyhow!("user_id must be positive"));
+            }
+            let id = PeerId::user_unchecked(user_id).bot_api_dialog_id_unchecked();
+            let peer_ref = self.resolve(id).await?;
+            self.client.resolve_peer(peer_ref).await?
+        };
+
+        let Peer::User(user) = &peer else {
+            return Err(anyhow!("target is not a user"));
+        };
+        let avatar_description = match peer.photo(true).await {
+            Ok(Some(photo)) => match self.download_media(&photo).await {
+                Ok(bytes) => match self.brain.caption_image(&bytes).await {
+                    Ok(description) => Some(description),
+                    Err(error) => {
+                        eprintln!("avatar caption failed: {error:#}");
+                        Some("profile photo exists, but could not be viewed right now".to_string())
+                    }
+                },
+                Err(error) => {
+                    eprintln!("avatar download failed: {error:#}");
+                    Some("profile photo exists, but could not be viewed right now".to_string())
+                }
+            },
+            Ok(None) => None,
+            Err(error) => {
+                eprintln!("profile photo lookup failed: {error:#}");
+                None
+            }
+        };
+        Ok(UserInspection {
+            user_id: peer.id().bot_api_dialog_id_unchecked(),
+            name: user.full_name(),
+            username: user.username().map(str::to_string),
+            avatar_description,
+        })
+    }
+
+    /// Fetch and describe a photo or sticker from a recent Telegram message.
+    /// Animated stickers use their static thumbnail because the vision backend
+    /// accepts images, not Telegram's animated `.tgs` container.
+    pub async fn inspect_message_media(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+    ) -> Result<MediaInspection> {
+        let message_id = i32::try_from(message_id)
+            .map_err(|_| anyhow!("message_id is outside Telegram's range"))?;
+        let peer = self.resolve(chat_id).await?;
+        let message = self
+            .client
+            .get_messages_by_id(peer, &[message_id])
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| anyhow!("message not found"))?;
+        let media = message
+            .media()
+            .ok_or_else(|| anyhow!("message has no inspectable media"))?;
+        let (kind, emoji, bytes) = match &media {
+            Media::Photo(_) => ("photo", None, self.download_media(&media).await?),
+            Media::Sticker(sticker) => {
+                let bytes = if sticker.is_animated() {
+                    let thumbnail = sticker
+                        .document
+                        .thumbs()
+                        .into_iter()
+                        .max_by_key(|thumbnail| thumbnail.size())
+                        .ok_or_else(|| anyhow!("animated sticker has no thumbnail"))?;
+                    self.download_media(&thumbnail).await?
+                } else {
+                    self.download_media(&media).await?
+                };
+                ("sticker", Some(sticker.emoji().to_string()), bytes)
+            }
+            _ => return Err(anyhow!("only photos and stickers can be inspected")),
+        };
+        let description = self.brain.caption_image(&bytes).await?;
+        Ok(MediaInspection {
+            kind: kind.to_string(),
+            emoji,
+            description,
+        })
+    }
+
     async fn describe_photo(&self, message: &Message) -> String {
         let mut label = "[photo]".to_string();
-        match self.download(message).await {
+        match self.download_photo(message).await {
             Ok(bytes) => match self.brain.caption_image(&bytes).await {
                 Ok(caption) => {
                     label.push('\n');
@@ -190,11 +371,15 @@ impl Userbot {
         }
     }
 
-    async fn download(&self, message: &Message) -> Result<Vec<u8>> {
+    async fn download_photo(&self, message: &Message) -> Result<Vec<u8>> {
         let photo = message
             .photo()
             .ok_or_else(|| anyhow!("message has no photo"))?;
-        let mut download = self.client.iter_download(&photo);
+        self.download_media(&photo).await
+    }
+
+    async fn download_media<D: Downloadable>(&self, media: &D) -> Result<Vec<u8>> {
+        let mut download = self.client.iter_download(media);
         let mut bytes = Vec::new();
         while let Some(chunk) = download.next().await? {
             bytes.extend_from_slice(&chunk);
@@ -321,7 +506,8 @@ impl Userbot {
                 .collect();
             out.push(ChatSummary {
                 id,
-                name: dialog.peer.name().unwrap_or("").to_string(),
+                name: display_name(&dialog.peer),
+                username: dialog.peer.username().map(str::to_string),
                 last,
             });
         }
@@ -343,6 +529,18 @@ impl Userbot {
             return Ok(peer);
         }
         Ok(id.to_ambient_ref())
+    }
+}
+
+fn display_name(peer: &Peer) -> String {
+    let name = match peer {
+        Peer::User(user) => user.full_name(),
+        _ => peer.name().unwrap_or_default().to_string(),
+    };
+    if name.is_empty() {
+        "someone".to_string()
+    } else {
+        name
     }
 }
 

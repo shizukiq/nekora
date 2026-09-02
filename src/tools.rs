@@ -49,6 +49,25 @@ pub fn schema() -> Vec<ChatCompletionTools> {
                 "required": ["text"]}),
         ),
         (
+            "inspect_user",
+            "Look up a Telegram user by user_id or @username and inspect their profile avatar when you feel like it.",
+            json!({"type": "object", "properties": {
+                "user_id": {"type": "integer", "description": "Telegram user id from the conversation"},
+                "username": {"type": "string", "description": "public username, with or without @"}}}),
+        ),
+        (
+            "inspect_message_media",
+            "Look closely at a photo or sticker from a recent message using its chat_id and message_id.",
+            json!({"type": "object", "properties": {
+                "chat_id": {"type": "integer"}, "message_id": {"type": "integer"}},
+                "required": ["chat_id", "message_id"]}),
+        ),
+        (
+            "get_current_time",
+            "Ask Telegram for the current server time and return it in UTC+04:00.",
+            json!({"type": "object", "properties": {}}),
+        ),
+        (
             "send_message",
             "Send a text message to a Telegram chat, if you actually want to say something.",
             json!({"type": "object", "properties": {
@@ -145,6 +164,29 @@ async fn dispatch(
                 Some(_) => "noted".to_string(),
             })
         }
+        "inspect_user" => {
+            let user_id = args.get("user_id").and_then(Value::as_i64);
+            let username = args.get("username").and_then(Value::as_str);
+            Ok(serde_json::to_string(
+                &app.userbot.inspect_user(user_id, username).await?,
+            )?)
+        }
+        "inspect_message_media" => {
+            let chat_id = args
+                .get("chat_id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| anyhow!("missing chat_id"))?;
+            let message_id = args
+                .get("message_id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| anyhow!("missing message_id"))?;
+            Ok(serde_json::to_string(
+                &app.userbot
+                    .inspect_message_media(chat_id, message_id)
+                    .await?,
+            )?)
+        }
+        "get_current_time" => Ok(serde_json::to_string(&app.userbot.current_time().await?)?),
         "send_message" => {
             let chat_id = args
                 .get("chat_id")

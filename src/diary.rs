@@ -315,7 +315,18 @@ mod tests {
 
     #[test]
     fn stores_ranks_dedups_and_reloads() {
-        let vault = std::env::temp_dir().join(format!("nekora-diary-{}", unix_nanos()));
+        let configured_vault = std::env::var_os("NEKORA_TEST_VAULT").map(PathBuf::from);
+        let vault = configured_vault
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join(format!("nekora-diary-{}", unix_nanos())));
+        if configured_vault.is_some() && vault.exists() {
+            assert!(
+                persistence::markdown_files(&vault)
+                    .expect("test vault should be readable")
+                    .is_empty(),
+                "NEKORA_TEST_VAULT must not already contain markdown notes"
+            );
+        }
         let mut diary = Diary::new(vault.clone());
         assert!(diary.open());
 
@@ -359,6 +370,12 @@ mod tests {
         assert!(diary.open());
         assert_eq!(diary.list_memories(0).memories.len(), 3);
 
-        std::fs::remove_dir_all(&vault).ok();
+        if configured_vault.is_some() {
+            for path in persistence::markdown_files(&vault).unwrap_or_default() {
+                std::fs::remove_file(path).ok();
+            }
+        } else {
+            std::fs::remove_dir_all(&vault).ok();
+        }
     }
 }
