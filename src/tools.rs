@@ -50,10 +50,12 @@ pub fn schema() -> Vec<ChatCompletionTools> {
         ),
         (
             "inspect_user",
-            "Look up a Telegram user by user_id or @username and inspect their profile avatar when you feel like it.",
+            "Inspect a Telegram user's profile and avatar. Copy all three identity fields from the message: user_id, name, and username. Use 0 or an empty string only when that field is unavailable.",
             json!({"type": "object", "properties": {
                 "user_id": {"type": "integer", "description": "Telegram user id from the conversation"},
-                "username": {"type": "string", "description": "public username, with or without @"}}}),
+                "name": {"type": "string", "description": "the display name shown in the conversation"},
+                "username": {"type": "string", "description": "public username, with or without @; empty if unavailable"}},
+                "required": ["user_id", "name", "username"]}),
         ),
         (
             "inspect_message_media",
@@ -165,10 +167,15 @@ async fn dispatch(
             })
         }
         "inspect_user" => {
-            let user_id = args.get("user_id").and_then(Value::as_i64);
-            let username = args.get("username").and_then(Value::as_str);
+            let user_id = args
+                .get("user_id")
+                .and_then(Value::as_i64)
+                .filter(|user_id| *user_id != 0);
+            let name = str_arg(&args, "name")?;
+            let username = str_arg(&args, "username")?;
+            let username = (!username.trim().is_empty()).then_some(username);
             Ok(serde_json::to_string(
-                &app.userbot.inspect_user(user_id, username).await?,
+                &app.userbot.inspect_user(user_id, name, username).await?,
             )?)
         }
         "inspect_message_media" => {

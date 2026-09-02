@@ -27,6 +27,7 @@ struct DiaryEntry {
     confidence: f32,
     usage: u32,
     last_used: i64,
+    retired: bool,
 }
 
 #[derive(Serialize)]
@@ -122,10 +123,9 @@ impl Diary {
         embedding: &[f32],
         confidence: f32,
     ) -> std::io::Result<Option<usize>> {
-        let too_close = self
-            .entries
-            .iter()
-            .any(|entry| relatedness(embedding, &entry.embedding) > DEDUP_RELATEDNESS);
+        let too_close = self.entries.iter().any(|entry| {
+            !entry.retired && relatedness(embedding, &entry.embedding) > DEDUP_RELATEDNESS
+        });
         if too_close {
             return Ok(None);
         }
@@ -136,6 +136,7 @@ impl Diary {
             confidence,
             usage: 0,
             last_used: 0,
+            retired: false,
         };
         self.write_note(&entry)?;
         self.entries.push(entry);
@@ -150,6 +151,7 @@ impl Diary {
             .entries
             .iter()
             .enumerate()
+            .filter(|(_, entry)| !entry.retired)
             .map(|(index, entry)| (index, relatedness(embedding, &entry.embedding)))
             .collect();
         scored.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -172,7 +174,13 @@ impl Diary {
     /// The most recent memories, newest id first, capped so the answer stays
     /// bounded. `limit` of 0 means "as many as the cap allows".
     pub fn list_memories(&self, limit: usize) -> MemoryList {
-        let mut order: Vec<usize> = (0..self.entries.len()).collect();
+        let mut order: Vec<usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| !entry.retired)
+            .map(|(index, _)| index)
+            .collect();
         order.sort_by(|&a, &b| self.entries[b].id.cmp(&self.entries[a].id));
         let requested = if limit == 0 {
             MAX_LISTED_MEMORIES
@@ -200,13 +208,86 @@ impl Diary {
 
     /// A random note's body, the seed for a "reflect on an old page" tick.
     pub fn random_page(&self) -> Option<String> {
-        if self.entries.is_empty() {
+        let active: Vec<&DiaryEntry> = self.entries.iter().filter(|entry| !entry.retired).collect();
+        if active.is_empty() {
             return None;
         }
         // Reflection happens minutes apart, so the low bits of the wall clock are
         // effectively random for the purpose of picking a page.
-        let index = unix_nanos() as usize % self.entries.len();
-        Some(self.entries[index].body.clone())
+        let index = unix_nanos() as usize % active.len();
+        Some(active[index].body.clone())
+    }
+
+    /// Pick a mutable source for diary sleep: usually the newest active note,
+    /// with an occasional random page so old memories get a chance to merge too.
+    /// Confidence 1.0 notes are anchors and are never rewritten.
+    pub fn sleep_target(&self, excluded: &[String]) -> Option<Memory> {
+        let active: Vec<&DiaryEntry> = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                !entry.retired
+                    && entry.confidence < 1.0
+                    && !excluded.iter().any(|id| id == &entry.id)
+            })
+            .collect();
+        if active.is_empty() {
+            return None;
+        }
+        let entry = if unix_nanos() % 5 == 0 {
+            active.get(unix_nanos() as usize % active.len())?
+        } else {
+            active.iter().max_by(|left, right| left.id.cmp(&right.id))?
+        };
+        Some(Memory {
+            id: entry.id.clone(),
+            confidence: entry.confidence,
+            usage: entry.usage,
+            body: entry.body.clone(),
+        })
+    }
+
+    /// Find active notes close to a sleep target without changing recall stats.
+    pub fn sleep_related(
+        &self,
+        target_id: &str,
+        embedding: &[f32],
+        limit: usize,
+        minimum_relatedness: f64,
+    ) -> Vec<Memory> {
+        let mut scored: Vec<(&DiaryEntry, f64)> = self
+            .entries
+            .iter()
+            .filter(|entry| !entry.retired && entry.id != target_id)
+            .map(|entry| (entry, relatedness(embedding, &entry.embedding)))
+            .filter(|(_, score)| *score >= minimum_relatedness)
+            .collect();
+        scored.sort_by(|left, right| right.1.total_cmp(&left.1));
+        scored.truncate(limit);
+        scored
+            .into_iter()
+            .map(|(entry, _)| Memory {
+                id: entry.id.clone(),
+                confidence: entry.confidence,
+                usage: entry.usage,
+                body: entry.body.clone(),
+            })
+            .collect()
+    }
+
+    /// Archive source notes after a replacement memory was successfully saved.
+    /// The markdown stays on disk for recovery, but normal recall ignores it.
+    pub fn retire(&mut self, ids: &[String]) -> std::io::Result<usize> {
+        let directory = self.directory.clone();
+        let mut retired = 0;
+        for entry in &mut self.entries {
+            if ids.iter().any(|id| id == &entry.id) && !entry.retired {
+                entry.retired = true;
+                write_note_to(&directory, entry)?;
+                retired += 1;
+            }
+        }
+        Ok(retired)
     }
 
     fn touch(&mut self, index: usize, now: i64) {
@@ -242,6 +323,9 @@ fn write_note_to(directory: &Path, entry: &DiaryEntry) -> std::io::Result<()> {
         text.push(' ');
         text.push_str(&value.to_string());
     }
+    if entry.retired {
+        text.push_str("\nretired: true");
+    }
     text.push_str("\n---\n");
     text.push_str(&entry.body);
     text.push('\n');
@@ -263,6 +347,7 @@ fn parse_note(id: &str, raw: &str) -> Option<DiaryEntry> {
         confidence: 0.0,
         usage: 0,
         last_used: 0,
+        retired: false,
     };
     for line in header.lines() {
         let Some((key, value)) = line.split_once(':') else {
@@ -273,6 +358,7 @@ fn parse_note(id: &str, raw: &str) -> Option<DiaryEntry> {
             "confidence" => entry.confidence = parse_finite(value)?,
             "usage" => entry.usage = value.parse().ok()?,
             "last_used" => entry.last_used = value.parse().ok()?,
+            "retired" => entry.retired = value == "true",
             "embedding" => {
                 for token in value.split_whitespace() {
                     entry.embedding.push(parse_finite(token)?);

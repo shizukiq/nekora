@@ -188,16 +188,18 @@ fn maybe_tool_reminder() -> String {
 
 /// An "act" tick with nobody talking: reflect on an old page, then let her act.
 async fn proactive(app: &Arc<App>) -> Result<()> {
-    let thought = sleep::reflect(app, &app.recent_context()).await?;
+    let recent = app.recent_context();
+    let thought = sleep::reflect(app, &recent).await?;
     let drift = match thought {
         Some(thought) => format!("you just reflected on an old diary page:\n{thought}"),
         None => "a quiet moment; your diary is still empty".to_string(),
     };
+    let working_memory = sleep::working_memory_context();
     let content = format!(
-        "{}\n{}{}({drift})",
+        "{}\n{}{}{recent}({drift})",
         config::preamble(),
         maybe_tool_reminder(),
-        app.recent_context(),
+        working_memory,
     );
     brain::act(app, vec![brain::user(content)], None).await
 }
@@ -226,11 +228,14 @@ async fn respond(app: &Arc<App>, events: &[Incoming], generation: ReplyGeneratio
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let memories = sleep::relevant_memories_context(app, &lines).await;
+    let working_memory = sleep::working_memory_context();
     let content = format!(
-        "{}\n{}{context}several messages arrived close together; read them as one thought \
+        "{}\n{}{}{memories}{context}several messages arrived close together; read them as one thought \
          and answer the whole thing:\n{lines}",
         config::preamble(),
         maybe_tool_reminder(),
+        working_memory,
     );
     // The "typing…" indicator runs for the whole turn -- the generation and the
     // sending -- so it tracks real thinking time instead of a delay pasted on after.
@@ -287,6 +292,7 @@ async fn run_turn(app: &Arc<App>) -> Result<()> {
     let day = today_str();
     if app.today.lock().unwrap().day != day {
         let lines = std::mem::take(&mut app.today.lock().unwrap().lines);
+        let backup = lines.clone();
         match sleep::consolidate(app, lines, true).await {
             Ok(fresh) => {
                 let mut today = app.today.lock().unwrap();
@@ -294,6 +300,7 @@ async fn run_turn(app: &Arc<App>) -> Result<()> {
                 today.day = day;
             }
             Err(error) => {
+                app.today.lock().unwrap().lines = backup;
                 // The day rolled over but sleep failed: put the pending burst back
                 // so it is answered next turn rather than lost.
                 if let Some(batch) = &batch {
@@ -339,8 +346,14 @@ async fn run_turn(app: &Arc<App>) -> Result<()> {
     }
 
     let lines = std::mem::take(&mut app.today.lock().unwrap().lines);
-    let fresh = sleep::consolidate(app, lines, false).await?;
-    app.today.lock().unwrap().lines = fresh;
+    let backup = lines.clone();
+    match sleep::consolidate(app, lines, false).await {
+        Ok(fresh) => app.today.lock().unwrap().lines = fresh,
+        Err(error) => {
+            app.today.lock().unwrap().lines = backup;
+            return Err(error);
+        }
+    }
     Ok(())
 }
 
@@ -362,9 +375,12 @@ fn event_identity(event: &Incoming) -> String {
     let username = event
         .username
         .as_deref()
-        .map(|username| format!(" (@{username})"))
-        .unwrap_or_default();
-    format!("{}{} [user id {}]", event.sender, username, event.sender_id)
+        .map(|username| format!("@{username}"))
+        .unwrap_or_else(|| "not available".to_string());
+    format!(
+        "name: {}; username: {}; user_id: {}",
+        event.sender, username, event.sender_id
+    )
 }
 
 /// Drain the update stream forever, feeding incoming messages to the core. A

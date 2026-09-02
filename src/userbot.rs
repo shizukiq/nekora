@@ -225,23 +225,37 @@ impl Userbot {
     pub async fn inspect_user(
         &self,
         user_id: Option<i64>,
+        display_name: &str,
         username: Option<&str>,
     ) -> Result<UserInspection> {
+        if let Some(user_id) = user_id {
+            if user_id <= 0 {
+                return Err(anyhow!("user_id must be positive"));
+            }
+        }
         let username = username
             .map(str::trim)
             .filter(|username| !username.is_empty())
             .map(|username| username.trim_start_matches('@'))
             .filter(|username| !username.is_empty());
         let peer = if let Some(username) = username {
-            self.client
+            let peer = self
+                .client
                 .resolve_username(username)
                 .await?
-                .ok_or_else(|| anyhow!("username not found: @{username}"))?
+                .ok_or_else(|| anyhow!("username not found: @{username}"))?;
+            if let Some(expected_id) = user_id {
+                let actual_id = match &peer {
+                    Peer::User(user) => user.id().bot_api_dialog_id_unchecked(),
+                    _ => return Err(anyhow!("target is not a user")),
+                };
+                if actual_id != expected_id {
+                    return Err(anyhow!("user_id and username refer to different users"));
+                }
+            }
+            peer
         } else {
             let user_id = user_id.ok_or_else(|| anyhow!("missing user_id or username"))?;
-            if user_id <= 0 {
-                return Err(anyhow!("user_id must be positive"));
-            }
             let id = PeerId::user_unchecked(user_id).bot_api_dialog_id_unchecked();
             let peer_ref = self.resolve(id).await?;
             self.client.resolve_peer(peer_ref).await?
@@ -249,6 +263,12 @@ impl Userbot {
 
         let Peer::User(user) = &peer else {
             return Err(anyhow!("target is not a user"));
+        };
+        let actual_name = user.full_name();
+        let name = if actual_name.is_empty() && !display_name.trim().is_empty() {
+            display_name.trim().to_string()
+        } else {
+            actual_name
         };
         let avatar_description = match peer.photo(true).await {
             Ok(Some(photo)) => match self.download_media(&photo).await {
@@ -272,7 +292,7 @@ impl Userbot {
         };
         Ok(UserInspection {
             user_id: peer.id().bot_api_dialog_id_unchecked(),
-            name: user.full_name(),
+            name,
             username: user.username().map(str::to_string),
             avatar_description,
         })
