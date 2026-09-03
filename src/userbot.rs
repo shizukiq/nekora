@@ -195,23 +195,76 @@ impl Userbot {
         }
     }
 
+    /// Match Telegram's Contacts chat category for private messages. Groups and
+    /// channels stay in scope; a missing private peer is rejected closed.
+    pub fn accepts_incoming(&self, message: &Message) -> bool {
+        if message.peer_id().kind() != PeerKind::User {
+            return true;
+        }
+        message.peer().is_some_and(peer_is_in_contact_scope)
+    }
+
+    /// Check a chat before a delayed or autonomous action reaches Telegram.
+    pub async fn chat_is_in_contact_scope(&self, chat_id: i64) -> bool {
+        if chat_id < 0 {
+            return true;
+        }
+        self.resolve_contact_scoped_peer(chat_id).await.is_ok()
+    }
+
     /// Turn a later reaction update into durable context without starting a new
     /// conversational turn. The next message or heartbeat can then see that an
     /// earlier message's social signal changed after it was received.
-    pub fn describe_reaction_update(
+    pub async fn describe_reaction_update(
         &self,
         update: &tl::types::UpdateMessageReactions,
     ) -> Option<Incoming> {
         let peer_id = PeerId::from(&update.peer);
         let chat_id = peer_id.bot_api_dialog_id()?;
+        let (target, reactions, reaction_list) = if let Ok(peer_ref) = self.resolve(chat_id).await {
+            let target = self
+                .client
+                .get_messages_by_id(peer_ref, &[update.msg_id])
+                .await
+                .ok()
+                .and_then(|mut messages| messages.pop().flatten());
+            let reactions = if message_reactions_is_min(&update.reactions) {
+                self.fetch_full_message_reactions(peer_ref, update.msg_id)
+                    .await
+                    .unwrap_or_else(|| update.reactions.clone())
+            } else {
+                update.reactions.clone()
+            };
+            let reaction_list = self.fetch_reaction_list(peer_ref, update.msg_id).await;
+            (target, reactions, reaction_list)
+        } else {
+            (None, update.reactions.clone(), None)
+        };
+        let reaction_summary =
+            reaction_summary_with_actors(&reactions, reaction_list.as_deref(), chat_id);
         let mut metadata = format!(
-            "telegram_context:\ntelegram_chat_type={}\ntelegram_message_reaction_update=true\ntelegram_reaction_message_id={}\ntelegram_reactions={}\n",
+            "telegram_context:\ntelegram_chat_type={}\ntelegram_message_reaction_update=true\ntelegram_reaction_message_id={}\ntelegram_reactions={reaction_summary}\n",
             chat_type_for_peer(peer_id),
             update.msg_id,
-            reaction_summary_raw(&update.reactions),
         );
         if let Some(top_message_id) = update.top_msg_id {
             metadata.push_str(&format!("telegram_reaction_topic_id={top_message_id}\n"));
+        }
+        metadata.push_str(&format!("telegram_reaction_target_chat_id={chat_id}\n"));
+        if let Some(target) = target.as_ref() {
+            let target_text = compact_context_text(target.text());
+            if !target_text.is_empty() {
+                metadata.push_str(&format!("telegram_reaction_target_text={target_text}\n"));
+            }
+            if target.outgoing() {
+                metadata.push_str("telegram_reaction_target_outgoing=true\n");
+            }
+            if let Some(sender) = target.sender() {
+                metadata.push_str(&format!(
+                    "telegram_reaction_target_sender={}\n",
+                    compact_context_text(&display_name(sender))
+                ));
+            }
         }
         Some(Incoming {
             chat_id,
@@ -221,8 +274,73 @@ impl Userbot {
             username: None,
             timestamp: Utc::now().to_rfc3339(),
             metadata,
-            text: format!("[reaction update on message_id={}]", update.msg_id),
+            text: format!("[Telegram reaction update on message_id={}]", update.msg_id),
         })
+    }
+
+    async fn describe_message_reactions(&self, message: &TelegramMessage) -> Option<String> {
+        let reactions = message_reactions(message)?.clone();
+        let peer_ref = message.peer_ref().await.ok()??;
+        let reactions = if message_reactions_is_min(&reactions) {
+            self.fetch_full_message_reactions(peer_ref, message.id())
+                .await
+                .unwrap_or(reactions)
+        } else {
+            reactions
+        };
+        let reaction_list = self.fetch_reaction_list(peer_ref, message.id()).await;
+        Some(reaction_summary_with_actors(
+            &reactions,
+            reaction_list.as_deref(),
+            message.peer_id().bot_api_dialog_id_unchecked(),
+        ))
+    }
+
+    async fn fetch_full_message_reactions(
+        &self,
+        peer: PeerRef,
+        message_id: i32,
+    ) -> Option<tl::enums::MessageReactions> {
+        let response = self
+            .client
+            .invoke(&tl::functions::messages::GetMessagesReactions {
+                peer: peer.into(),
+                id: vec![message_id],
+            })
+            .await
+            .ok()?;
+        let updates = match response {
+            tl::enums::Updates::Updates(updates) => updates.updates,
+            tl::enums::Updates::Combined(updates) => updates.updates,
+            tl::enums::Updates::UpdateShort(update) => vec![update.update],
+            _ => return None,
+        };
+        updates.into_iter().find_map(|update| match update {
+            tl::enums::Update::MessageReactions(update) if update.msg_id == message_id => {
+                Some(update.reactions)
+            }
+            _ => None,
+        })
+    }
+
+    async fn fetch_reaction_list(
+        &self,
+        peer: PeerRef,
+        message_id: i32,
+    ) -> Option<Vec<tl::enums::MessagePeerReaction>> {
+        let response = self
+            .client
+            .invoke(&tl::functions::messages::GetMessageReactionsList {
+                peer: peer.into(),
+                id: message_id,
+                reaction: None,
+                offset: None,
+                limit: MAX_CONTEXT_ITEMS as i32,
+            })
+            .await
+            .ok()?;
+        let tl::enums::messages::MessageReactionsList::List(response) = response;
+        Some(response.reactions)
     }
 
     /// Gather Telegram-native relationship data once, at the update boundary,
@@ -265,10 +383,13 @@ impl Userbot {
                 tokio::time::timeout(REPLY_LOOKUP_TIMEOUT, message.get_reply()).await
             {
                 append_reply_target(&mut lines, &reply);
+                if let Some(reactions) = self.describe_message_reactions(&reply).await {
+                    lines.push(format!("telegram_reply_target_reactions={reactions}"));
+                }
             }
         }
 
-        if let Some(reactions) = reaction_summary(message) {
+        if let Some(reactions) = self.describe_message_reactions(message).await {
             lines.push(format!("telegram_reactions={reactions}"));
         }
         if let Some(reply_count) = message.reply_count() {
@@ -424,7 +545,7 @@ impl Userbot {
     ) -> Result<MediaInspection> {
         let message_id = i32::try_from(message_id)
             .map_err(|_| anyhow!("message_id is outside Telegram's range"))?;
-        let peer = self.resolve(chat_id).await?;
+        let peer = self.resolve_contact_scoped_peer(chat_id).await?;
         let message = self
             .client
             .get_messages_by_id(peer, &[message_id])
@@ -633,7 +754,7 @@ impl Userbot {
     /// instead of a fixed delay tacked on afterwards. If the peer can't be
     /// resolved the work still runs, just without the indicator.
     pub async fn keep_typing<T>(&self, chat_id: i64, fut: impl Future<Output = T>) -> T {
-        let Ok(peer) = self.resolve(chat_id).await else {
+        let Ok(peer) = self.resolve_contact_scoped_peer(chat_id).await else {
             return fut.await;
         };
         // repeat() wants an Unpin future; boxing pins it.
@@ -656,13 +777,10 @@ impl Userbot {
         reply_to_message_id: Option<i64>,
         generation: Option<ReplyGeneration>,
     ) -> Result<()> {
-        if !crate::config::chat_allowed(chat_id) {
-            return Err(anyhow!("private chat is outside the configured user pool"));
-        }
         if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
             return Ok(());
         }
-        let peer = self.resolve(chat_id).await?;
+        let peer = self.resolve_contact_scoped_peer(chat_id).await?;
         let reply_to_message_id = reply_to_message_id
             .map(|message_id| {
                 i32::try_from(message_id)
@@ -720,15 +838,12 @@ impl Userbot {
         reaction: &str,
         generation: Option<ReplyGeneration>,
     ) -> Result<bool> {
-        if !crate::config::chat_allowed(chat_id) {
-            return Err(anyhow!("private chat is outside the configured user pool"));
-        }
         if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
             return Ok(false);
         }
         let message_id = i32::try_from(message_id)
             .map_err(|_| anyhow!("message_id is outside Telegram's range"))?;
-        let peer = self.resolve(chat_id).await?;
+        let peer = self.resolve_contact_scoped_peer(chat_id).await?;
         let reaction = reaction.trim();
         if reaction.is_empty() {
             self.client
@@ -745,7 +860,7 @@ impl Userbot {
     /// Mark the sender's chat read up to its latest message. Cosmetic, so a
     /// failure is swallowed rather than allowed to kill the turn.
     pub async fn mark_read(&self, chat_id: i64) {
-        if let Ok(peer) = self.resolve(chat_id).await {
+        if let Ok(peer) = self.resolve_contact_scoped_peer(chat_id).await {
             let _ = self.client.mark_as_read(peer).await;
         }
     }
@@ -757,7 +872,7 @@ impl Userbot {
         let mut out = Vec::new();
         while let Some(dialog) = dialogs.next().await? {
             let id = dialog.peer.id().bot_api_dialog_id_unchecked();
-            if !crate::config::chat_allowed(id) {
+            if !peer_is_in_contact_scope(&dialog.peer) {
                 continue;
             }
             self.peers.lock().unwrap().insert(id, dialog.peer_ref());
@@ -777,6 +892,17 @@ impl Userbot {
             });
         }
         Ok(out)
+    }
+
+    async fn resolve_contact_scoped_peer(&self, chat_id: i64) -> Result<PeerRef> {
+        let peer_ref = self.resolve(chat_id).await?;
+        if chat_id > 0 {
+            let peer = self.client.resolve_peer(peer_ref).await?;
+            if !peer_is_in_contact_scope(&peer) {
+                return Err(anyhow!("private chat is outside Telegram contacts"));
+            }
+        }
+        Ok(peer_ref)
     }
 
     async fn resolve(&self, chat_id: i64) -> Result<PeerRef> {
@@ -805,6 +931,13 @@ fn chat_type(message: &Message) -> &'static str {
             Some(Peer::Channel(_)) => "broadcast_channel",
             _ => "supergroup_or_channel",
         },
+    }
+}
+
+fn peer_is_in_contact_scope(peer: &Peer) -> bool {
+    match peer {
+        Peer::User(user) => user.contact(),
+        Peer::Group(_) | Peer::Channel(_) => true,
     }
 }
 
@@ -930,13 +1063,66 @@ fn utf16_slice(text: &str, offset: i32, length: i32) -> Option<&str> {
     text.get(start_byte..end_byte)
 }
 
-fn reaction_summary(message: &TelegramMessage) -> Option<String> {
+fn message_reactions(message: &TelegramMessage) -> Option<&tl::enums::MessageReactions> {
     let reactions = match &message.raw {
         tl::enums::Message::Message(message) => message.reactions.as_ref(),
         tl::enums::Message::Service(message) => message.reactions.as_ref(),
         tl::enums::Message::Empty(_) => None,
     }?;
-    Some(reaction_summary_raw(reactions))
+    Some(reactions)
+}
+
+fn message_reactions_is_min(reactions: &tl::enums::MessageReactions) -> bool {
+    let tl::enums::MessageReactions::Reactions(reactions) = reactions;
+    reactions.min
+}
+
+fn reaction_summary_with_actors(
+    reactions: &tl::enums::MessageReactions,
+    reaction_list: Option<&[tl::enums::MessagePeerReaction]>,
+    chat_id: i64,
+) -> String {
+    let mut summary = reaction_summary_raw(reactions);
+    let reactions = reaction_list
+        .filter(|reactions| !reactions.is_empty())
+        .or_else(|| match reactions {
+            tl::enums::MessageReactions::Reactions(reactions) => {
+                reactions.recent_reactions.as_deref()
+            }
+        });
+    let Some(reactions) = reactions else {
+        return summary;
+    };
+    let actors: Vec<_> = reactions
+        .iter()
+        .take(MAX_CONTEXT_ITEMS)
+        .map(|reaction| match reaction {
+            tl::enums::MessagePeerReaction::Reaction(reaction) => {
+                let actor = if reaction.my {
+                    "self".to_string()
+                } else {
+                    PeerId::from(&reaction.peer_id)
+                        .bot_api_dialog_id()
+                        .map(|id| {
+                            if id == chat_id && chat_id > 0 {
+                                "chat_partner".to_string()
+                            } else {
+                                format!("user_id={id}")
+                            }
+                        })
+                        .unwrap_or_else(|| "unknown".to_string())
+                };
+                format!(
+                    "from={actor} reaction={}",
+                    reaction_label(&reaction.reaction)
+                )
+            }
+        })
+        .collect();
+    if !actors.is_empty() {
+        summary.push_str(&format!("; reactors=[{}]", actors.join(", ")));
+    }
+    summary
 }
 
 fn reaction_summary_raw(reactions: &tl::enums::MessageReactions) -> String {

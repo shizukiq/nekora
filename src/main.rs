@@ -551,7 +551,7 @@ async fn ingest(app: &Arc<App>, updates: &mut grammers_client::client::UpdateStr
                 if !message.outgoing() =>
             {
                 let chat_id = message.peer_id().bot_api_dialog_id_unchecked();
-                if !config::chat_allowed(chat_id) {
+                if !app.userbot.accepts_incoming(&message) {
                     continue;
                 }
                 let incoming = app.userbot.describe(&message).await;
@@ -586,9 +586,13 @@ async fn ingest(app: &Arc<App>, updates: &mut grammers_client::client::UpdateStr
             // that is still being written.
             Ok(Update::Raw(raw)) => {
                 if let tl::enums::Update::MessageReactions(reactions) = &raw.raw {
-                    if let Some(event) = app.userbot.describe_reaction_update(reactions) {
-                        if config::chat_allowed(event.chat_id) {
-                            app.record_event(&event);
+                    if let Some(chat_id) = PeerId::from(&reactions.peer).bot_api_dialog_id() {
+                        if app.userbot.chat_is_in_contact_scope(chat_id).await {
+                            if let Some(event) =
+                                app.userbot.describe_reaction_update(reactions).await
+                            {
+                                app.record_event(&event);
+                            }
                         }
                     }
                 }
@@ -596,14 +600,16 @@ async fn ingest(app: &Arc<App>, updates: &mut grammers_client::client::UpdateStr
                     if let Some(chat_id) =
                         PeerId::user(typing.user_id).map(PeerId::bot_api_dialog_id_unchecked)
                     {
-                        let now_ms = app.monotonic_ms();
-                        if app
-                            .conversation
-                            .lock()
-                            .unwrap()
-                            .note_typing(chat_id, chat_id, now_ms)
-                        {
-                            app.wake.notify_one();
+                        if app.userbot.chat_is_in_contact_scope(chat_id).await {
+                            let now_ms = app.monotonic_ms();
+                            if app
+                                .conversation
+                                .lock()
+                                .unwrap()
+                                .note_typing(chat_id, chat_id, now_ms)
+                            {
+                                app.wake.notify_one();
+                            }
                         }
                     }
                 }
