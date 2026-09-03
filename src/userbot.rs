@@ -197,11 +197,15 @@ impl Userbot {
 
     /// Match Telegram's Contacts chat category for private messages. Groups and
     /// channels stay in scope; a missing private peer is rejected closed.
-    pub fn accepts_incoming(&self, message: &Message) -> bool {
+    pub async fn accepts_incoming(&self, message: &Message) -> bool {
         if message.peer_id().kind() != PeerKind::User {
             return true;
         }
-        message.peer().is_some_and(peer_is_in_contact_scope)
+        let chat_id = message.peer_id().bot_api_dialog_id_unchecked();
+        if let Ok(Some(peer_ref)) = message.peer_ref().await {
+            self.peers.lock().unwrap().insert(chat_id, peer_ref);
+        }
+        self.chat_is_in_contact_scope(chat_id).await
     }
 
     /// Check a chat before a delayed or autonomous action reaches Telegram.
@@ -280,7 +284,8 @@ impl Userbot {
 
     async fn describe_message_reactions(&self, message: &TelegramMessage) -> Option<String> {
         let reactions = message_reactions(message)?.clone();
-        let peer_ref = message.peer_ref().await.ok()??;
+        let chat_id = message.peer_id().bot_api_dialog_id()?;
+        let peer_ref = self.resolve_contact_scoped_peer(chat_id).await.ok()?;
         let reactions = if message_reactions_is_min(&reactions) {
             self.fetch_full_message_reactions(peer_ref, message.id())
                 .await
@@ -293,6 +298,44 @@ impl Userbot {
             &reactions,
             reaction_list.as_deref(),
             message.peer_id().bot_api_dialog_id_unchecked(),
+        ))
+    }
+
+    async fn fetch_reply_target_reactions(&self, message: &TelegramMessage) -> Option<String> {
+        let chat_id = message.peer_id().bot_api_dialog_id()?;
+        let peer_ref = self.resolve_contact_scoped_peer(chat_id).await.ok()?;
+        self.fetch_message_reaction_summary(peer_ref, message.id(), chat_id)
+            .await
+    }
+
+    async fn fetch_reply_target_reactions_by_id(
+        &self,
+        message: &Message,
+        message_id: i32,
+    ) -> Option<String> {
+        let chat_id = message.peer_id().bot_api_dialog_id()?;
+        let peer_ref = self.resolve_contact_scoped_peer(chat_id).await.ok()?;
+        self.fetch_message_reaction_summary(peer_ref, message_id, chat_id)
+            .await
+    }
+
+    async fn fetch_message_reaction_summary(
+        &self,
+        peer: PeerRef,
+        message_id: i32,
+        chat_id: i64,
+    ) -> Option<String> {
+        let reactions = self.fetch_full_message_reactions(peer, message_id).await?;
+        let reaction_list = self.fetch_reaction_list(peer, message_id).await;
+        if !message_reactions_have_any(&reactions)
+            && !reaction_list.as_ref().is_some_and(|list| !list.is_empty())
+        {
+            return None;
+        }
+        Some(reaction_summary_with_actors(
+            &reactions,
+            reaction_list.as_deref(),
+            chat_id,
         ))
     }
 
@@ -378,12 +421,22 @@ impl Userbot {
             append_reply_header_context(&mut lines, &header);
         }
 
-        if message.reply_to_message_id().is_some() {
+        if let Some(reply_message_id) = message.reply_to_message_id() {
+            let mut reply_reactions_loaded = false;
             if let Ok(Ok(Some(reply))) =
                 tokio::time::timeout(REPLY_LOOKUP_TIMEOUT, message.get_reply()).await
             {
                 append_reply_target(&mut lines, &reply);
-                if let Some(reactions) = self.describe_message_reactions(&reply).await {
+                if let Some(reactions) = self.fetch_reply_target_reactions(&reply).await {
+                    lines.push(format!("telegram_reply_target_reactions={reactions}"));
+                    reply_reactions_loaded = true;
+                }
+            }
+            if !reply_reactions_loaded {
+                if let Some(reactions) = self
+                    .fetch_reply_target_reactions_by_id(message, reply_message_id)
+                    .await
+                {
                     lines.push(format!("telegram_reply_target_reactions={reactions}"));
                 }
             }
@@ -1075,6 +1128,19 @@ fn message_reactions(message: &TelegramMessage) -> Option<&tl::enums::MessageRea
 fn message_reactions_is_min(reactions: &tl::enums::MessageReactions) -> bool {
     let tl::enums::MessageReactions::Reactions(reactions) = reactions;
     reactions.min
+}
+
+fn message_reactions_have_any(reactions: &tl::enums::MessageReactions) -> bool {
+    let tl::enums::MessageReactions::Reactions(reactions) = reactions;
+    !reactions.results.is_empty()
+        || reactions
+            .recent_reactions
+            .as_ref()
+            .is_some_and(|reactions| !reactions.is_empty())
+        || reactions
+            .top_reactors
+            .as_ref()
+            .is_some_and(|reactors| !reactors.is_empty())
 }
 
 fn reaction_summary_with_actors(

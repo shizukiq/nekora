@@ -551,7 +551,7 @@ async fn ingest(app: &Arc<App>, updates: &mut grammers_client::client::UpdateStr
                 if !message.outgoing() =>
             {
                 let chat_id = message.peer_id().bot_api_dialog_id_unchecked();
-                if !app.userbot.accepts_incoming(&message) {
+                if !app.userbot.accepts_incoming(&message).await {
                     continue;
                 }
                 let incoming = app.userbot.describe(&message).await;
