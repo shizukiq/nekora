@@ -2,9 +2,10 @@
 //! Bot API).
 //!
 //! Purely hands — it receives, sends, and reports; it never decides. Incoming
-//! media is flattened to text the brain can read (a photo becomes a caption, a
-//! voice note a transcription), always keeping at least a label so nothing
-//! arrives as empty text. Outgoing text is paced like a person typing, not a bot
+//! media is flattened to text the brain can read (photos, stickers, GIFs, and
+//! video previews become captions; a voice note can become a transcription),
+//! always keeping at least a label so nothing arrives as empty text. Outgoing text
+//! is paced like a person typing, not a bot
 //! blasting: a short "typing…" and a delay drawn from a words-per-minute band, so
 //! a long line takes longer to land than a short one.
 
@@ -15,7 +16,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, FixedOffset, Utc};
-use grammers_client::media::{Document, Downloadable, Media};
+use grammers_client::media::{Document, Downloadable, Media, PhotoSize, Sticker};
 use grammers_client::peer::Peer;
 use grammers_client::update::Message;
 use grammers_client::{tl, Client};
@@ -51,7 +52,7 @@ const MAX_BUBBLE_BYTES: usize = 4096;
 // The markers we wrap incoming media in. A caption or a transcription is
 // attacker-controlled text: it must not be able to forge these and smuggle
 // instructions past the brain as if they were our labels.
-const MEDIA_TOKENS: [&str; 8] = [
+const MEDIA_TOKENS: [&str; 11] = [
     "[photo]",
     "[voice message]",
     "[voice transcription]:",
@@ -60,6 +61,9 @@ const MEDIA_TOKENS: [&str; 8] = [
     "[video note]",
     "[audio]",
     "[file]",
+    "[gif]",
+    "[image]",
+    "[preview frame]",
 ];
 
 /// One incoming message, flattened to what the brain and the core need.
@@ -140,7 +144,7 @@ impl Userbot {
         let caption = clean(message.text());
         let media = match message.media() {
             Some(Media::Photo(_)) => Some(self.describe_photo(message).await),
-            Some(Media::Sticker(_)) => Some("[sticker]".to_string()),
+            Some(Media::Sticker(sticker)) => Some(self.describe_sticker(&sticker).await),
             Some(Media::Document(document)) => {
                 Some(self.describe_document(message, &document).await)
             }
@@ -297,9 +301,9 @@ impl Userbot {
         })
     }
 
-    /// Fetch and describe a photo or sticker from a recent Telegram message.
-    /// Animated stickers use their static thumbnail because the vision backend
-    /// accepts images, not Telegram's animated `.tgs` container.
+    /// Fetch and describe visual media from a recent Telegram message. Videos and
+    /// animations use Telegram's best available preview frame because the current
+    /// Ollama vision request accepts images, not moving-media containers.
     pub async fn inspect_message_media(
         &self,
         chat_id: i64,
@@ -320,22 +324,18 @@ impl Userbot {
             .media()
             .ok_or_else(|| anyhow!("message has no inspectable media"))?;
         let (kind, emoji, bytes) = match &media {
-            Media::Photo(_) => ("photo", None, self.download_media(&media).await?),
+            Media::Photo(photo) => ("photo", None, self.download_media(photo).await?),
             Media::Sticker(sticker) => {
-                let bytes = if sticker.is_animated() {
-                    let thumbnail = sticker
-                        .document
-                        .thumbs()
-                        .into_iter()
-                        .max_by_key(|thumbnail| thumbnail.size())
-                        .ok_or_else(|| anyhow!("animated sticker has no thumbnail"))?;
-                    self.download_media(&thumbnail).await?
-                } else {
-                    self.download_media(&media).await?
-                };
+                let bytes = self.download_sticker_image(sticker).await?;
                 ("sticker", Some(sticker.emoji().to_string()), bytes)
             }
-            _ => return Err(anyhow!("only photos and stickers can be inspected")),
+            Media::Document(document) => {
+                let kind = visual_document_kind(document)
+                    .ok_or_else(|| anyhow!("document has no inspectable visual content"))?;
+                let bytes = self.download_visual_document(document, kind).await?;
+                (kind, None, bytes)
+            }
+            _ => return Err(anyhow!("message has no inspectable visual content")),
         };
         let description = self.brain.caption_image(&bytes).await?;
         Ok(MediaInspection {
@@ -346,30 +346,33 @@ impl Userbot {
     }
 
     async fn describe_photo(&self, message: &Message) -> String {
-        let mut label = "[photo]".to_string();
-        match self.download_photo(message).await {
-            Ok(bytes) => match self.brain.caption_image(&bytes).await {
-                Ok(caption) => {
-                    label.push('\n');
-                    label.push_str(&caption);
-                }
-                Err(error) => {
-                    eprintln!("caption failed: {error:#}");
-                    label.push_str(" (you glance at it but can't quite make it out right now)");
-                }
-            },
-            Err(error) => {
-                eprintln!("photo download failed: {error:#}");
-                label.push_str(" (you glance at it but can't quite make it out right now)");
-            }
+        let Some(photo) = message.photo() else {
+            return "[photo] (you glance at it but can't quite make it out right now)".to_string();
+        };
+        self.describe_image_source("[photo]", &photo).await
+    }
+
+    async fn describe_sticker(&self, sticker: &Sticker) -> String {
+        let emoji = clean(sticker.emoji());
+        let label = if emoji.is_empty() {
+            "[sticker]".to_string()
+        } else {
+            format!("[sticker] emoji: {emoji}")
+        };
+        if let Some(thumbnail) = largest_thumbnail(&sticker.document) {
+            self.describe_image_source(&label, &thumbnail).await
+        } else {
+            self.describe_image_source(&label, &sticker.document).await
         }
-        label
     }
 
     // Voice notes are audio/ogg and can be transcribed with Premium; text files are
-    // read in full up to the same scale as one context dump. Other documents stay
-    // as labels so a large binary never gets loaded into memory.
+    // read in full up to the same scale as one context dump. Non-visual documents
+    // stay as labels so a large binary never gets loaded into memory.
     async fn describe_document(&self, message: &Message, document: &Document) -> String {
+        if let Some(kind) = visual_document_kind(document) {
+            return self.describe_visual_document(document, kind).await;
+        }
         let mime = document.mime_type().unwrap_or("");
         let extension = document
             .name()
@@ -426,11 +429,54 @@ impl Userbot {
         }
     }
 
-    async fn download_photo(&self, message: &Message) -> Result<Vec<u8>> {
-        let photo = message
-            .photo()
-            .ok_or_else(|| anyhow!("message has no photo"))?;
-        self.download_media(&photo).await
+    async fn describe_visual_document(&self, document: &Document, kind: &str) -> String {
+        let label = visual_label(document, kind);
+        if matches!(kind, "gif" | "video") {
+            let Some(thumbnail) = largest_thumbnail(document) else {
+                return format!("{label}\n(no preview frame was attached)");
+            };
+            return self.describe_image_source(&label, &thumbnail).await;
+        }
+        self.describe_image_source(&label, document).await
+    }
+
+    async fn describe_image_source<D: Downloadable>(&self, label: &str, source: &D) -> String {
+        let mut label = label.to_string();
+        match self.download_media(source).await {
+            Ok(bytes) => match self.brain.caption_image(&bytes).await {
+                Ok(caption) => {
+                    label.push('\n');
+                    label.push_str(&caption);
+                }
+                Err(error) => {
+                    eprintln!("caption failed: {error:#}");
+                    label.push_str(" (you glance at it but can't quite make it out right now)");
+                }
+            },
+            Err(error) => {
+                eprintln!("media download failed: {error:#}");
+                label.push_str(" (you glance at it but can't quite make it out right now)");
+            }
+        }
+        label
+    }
+
+    async fn download_sticker_image(&self, sticker: &Sticker) -> Result<Vec<u8>> {
+        if let Some(thumbnail) = largest_thumbnail(&sticker.document) {
+            self.download_media(&thumbnail).await
+        } else {
+            self.download_media(&sticker.document).await
+        }
+    }
+
+    async fn download_visual_document(&self, document: &Document, kind: &str) -> Result<Vec<u8>> {
+        if matches!(kind, "gif" | "video") {
+            let thumbnail = largest_thumbnail(document)
+                .ok_or_else(|| anyhow!("visual document has no preview thumbnail"))?;
+            self.download_media(&thumbnail).await
+        } else {
+            self.download_media(document).await
+        }
     }
 
     async fn download_media<D: Downloadable>(&self, media: &D) -> Result<Vec<u8>> {
@@ -600,6 +646,56 @@ fn display_name(peer: &Peer) -> String {
     } else {
         name
     }
+}
+
+fn visual_document_kind(document: &Document) -> Option<&'static str> {
+    let mime = document.mime_type().unwrap_or("");
+    if mime.eq_ignore_ascii_case("image/gif") || document_has_extension(document, &["gif"]) {
+        return Some("gif");
+    }
+    if mime.starts_with("video/")
+        || document_has_extension(document, &["mp4", "mov", "webm", "mkv", "avi"])
+    {
+        return Some("video");
+    }
+    mime.starts_with("image/").then_some("image")
+}
+
+fn document_has_extension(document: &Document, extensions: &[&str]) -> bool {
+    document
+        .name()
+        .and_then(|name| name.rsplit_once('.'))
+        .is_some_and(|(_, extension)| {
+            extensions
+                .iter()
+                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+        })
+}
+
+fn largest_thumbnail(document: &Document) -> Option<PhotoSize> {
+    document
+        .thumbs()
+        .into_iter()
+        .max_by_key(|thumbnail| thumbnail.size())
+}
+
+fn visual_label(document: &Document, kind: &str) -> String {
+    let mut details = Vec::new();
+    if let Some((width, height)) = document.resolution() {
+        details.push(format!("{width}x{height}"));
+    }
+    if let Some(duration) = document.duration() {
+        details.push(format!("{duration:.1}s"));
+    }
+    let suffix = if details.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", details.join(", "))
+    };
+    let preview = matches!(kind, "gif" | "video")
+        .then_some("\n[preview frame]")
+        .unwrap_or("");
+    format!("[{kind}]{suffix}{preview}")
 }
 
 fn clean(text: &str) -> String {

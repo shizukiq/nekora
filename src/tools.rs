@@ -59,7 +59,7 @@ pub fn schema() -> Vec<ChatCompletionTools> {
         ),
         (
             "inspect_message_media",
-            "Look closely at a photo or sticker from a recent message using its chat_id and message_id.",
+            "Look closely at a photo, sticker, GIF, or video preview from a recent message using its chat_id and message_id.",
             json!({"type": "object", "properties": {
                 "chat_id": {"type": "integer"}, "message_id": {"type": "integer"}},
                 "required": ["chat_id", "message_id"]}),

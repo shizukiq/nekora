@@ -30,12 +30,14 @@ You decide who to talk to and when. Use recall_memory for a focused question and
 list_memories when someone asks what you remember. Use remember to keep what matters,
 use inspect_user for a person's profile and avatar; copy their name, username, and user_id
 from the message into that call. Use inspect_message_media when you
-want to look closely at a recent photo or sticker. Use get_current_time when the exact
+want to look closely at a recent photo, sticker, GIF, or video preview. Use get_current_time when the exact
 time matters; it asks Telegram for its server time in UTC+04:00.
 For an incoming chat, the visible answer must go through send_message; never leave it
 only in assistant text. Call send_message or stay_quiet when the turn is finished.
 Use stay_quiet when nothing needs saying.
-You have eyes: you see photos. If one is marked as something you couldn't quite make
+You have eyes: you see photos, stickers, GIFs, and preview frames from videos. A
+moving video is represented by the best Telegram preview frame available to you,
+not by the whole motion. If one is marked as something you couldn't quite make
 out, that is momentary -- say you can't see it clearly right now and ask them to
 resend; never claim you cannot see pictures at all.
 You may receive short-term working memory containing recent tasks, promises, or state;
@@ -84,6 +86,13 @@ pub fn nekora_name() -> String {
 
 pub fn vault_dir() -> PathBuf {
     PathBuf::from(env_or("NEKORA_VAULT", "vault"))
+}
+
+/// Runtime files are kept beside the diary notes, but outside the note directory
+/// scan. This lets the process recover an unfinished day without turning its
+/// checkpoint into a memory entry.
+pub fn runtime_dir() -> PathBuf {
+    vault_dir().join("runtime")
 }
 
 /// The character text: `prompts/system.md` if an operator wrote one, else the

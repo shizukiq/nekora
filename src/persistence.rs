@@ -32,6 +32,12 @@ pub fn read_file(path: &Path) -> Option<String> {
 /// over the target, so a reader never sees a partial note. The rename is atomic
 /// within a filesystem, which the vault always is.
 pub fn write_file_atomic(path: &Path, contents: &str) -> io::Result<()> {
+    if let Some(directory) = path
+        .parent()
+        .filter(|directory| !directory.as_os_str().is_empty())
+    {
+        fs::create_dir_all(directory)?;
+    }
     let temporary = path.with_extension("md.tmp");
     {
         let mut file = fs::File::create(&temporary)?;

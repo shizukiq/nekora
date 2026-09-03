@@ -35,7 +35,7 @@ use crate::{tools, App};
 
 // The brain is on DeepSeek; vision and embeddings are local. bge-m3 is fixed for
 // the life of a vault: swap it and the stored vectors stop comparing.
-const DEEPSEEK_URL: &str = "https://api.deepseek.com/v1/";
+const DEFAULT_MAIN_API_BASE: &str = "https://api.deepseek.com/v1/";
 const EMBED_MODEL: &str = "bge-m3";
 
 // Low temperature keeps her in character rather than loose.
@@ -74,7 +74,7 @@ pub struct Brain {
 impl Brain {
     pub fn from_env() -> Result<Self> {
         let openai_config = OpenAIConfig::new()
-            .with_api_base(DEEPSEEK_URL)
+            .with_api_base(env_or("NEKORA_MAIN_API_BASE", DEFAULT_MAIN_API_BASE))
             .with_api_key(env_or("DEEPSEEK_API_KEY", ""));
         let timeout_secs: u64 = env_or("NEKORA_REQUEST_TIMEOUT", "120").parse()?;
         Ok(Self {

@@ -22,10 +22,11 @@ mod sleep;
 mod tools;
 mod userbot;
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use chrono::Local;
 use grammers_client::client::UpdatesConfiguration;
 use grammers_client::session::storages::SqliteSession;
@@ -34,6 +35,7 @@ use grammers_client::tl;
 use grammers_client::update::Update;
 use grammers_client::{Client, SenderPool};
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
 use brain::Brain;
@@ -60,10 +62,94 @@ const TOOL_REMINDER_CHANCE: f64 = 0.02;
 // the buffer. Without it every message looks timeless. Bounded so a long day does
 // not resend the whole context on every message.
 const RECENT_LINES: usize = 40;
+const TODAY_FILE: &str = "today.json";
 
 struct Today {
     day: String,
     lines: Vec<String>,
+    path: PathBuf,
+}
+
+#[derive(Deserialize, Serialize)]
+struct SavedToday {
+    day: String,
+    lines: Vec<String>,
+}
+
+struct TodaySnapshot {
+    day: String,
+    lines: Vec<String>,
+}
+
+impl Today {
+    fn open() -> Result<Self> {
+        let path = config::runtime_dir().join(TODAY_FILE);
+        let saved = if path.exists() {
+            let raw = persistence::read_file(&path)
+                .ok_or_else(|| anyhow!("could not read today's journal at {path:?}"))?;
+            if raw.trim().is_empty() {
+                None
+            } else {
+                Some(serde_json::from_str::<SavedToday>(&raw)?)
+            }
+        } else {
+            None
+        };
+        let today = Self {
+            day: saved
+                .as_ref()
+                .map(|saved| saved.day.clone())
+                .unwrap_or_else(today_str),
+            lines: saved.map(|saved| saved.lines).unwrap_or_default(),
+            path,
+        };
+        if !today.path.exists() {
+            today.persist()?;
+        }
+        Ok(today)
+    }
+
+    fn snapshot(&self) -> TodaySnapshot {
+        TodaySnapshot {
+            day: self.day.clone(),
+            lines: self.lines.clone(),
+        }
+    }
+
+    fn append(&mut self, line: String) -> Result<()> {
+        self.lines.push(line);
+        self.persist()
+    }
+
+    /// Remove exactly the lines that were handed to sleep. Messages arriving
+    /// while the model is working stay at the front of the next day/turn.
+    fn finish(&mut self, snapshot: &TodaySnapshot, next_day: Option<String>) -> Result<()> {
+        if self.day != snapshot.day || self.lines.len() < snapshot.lines.len() {
+            return Err(anyhow!(
+                "today journal changed while it was being consolidated"
+            ));
+        }
+        let removed: Vec<_> = self.lines.drain(..snapshot.lines.len()).collect();
+        let previous_day = self.day.clone();
+        if let Some(next_day) = next_day {
+            self.day = next_day;
+        }
+        if let Err(error) = self.persist() {
+            self.day = previous_day;
+            self.lines.splice(0..0, removed);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn persist(&self) -> Result<()> {
+        let contents = serde_json::to_string(&SavedToday {
+            day: self.day.clone(),
+            lines: self.lines.clone(),
+        })?;
+        persistence::write_file_atomic(&self.path, &contents)?;
+        Ok(())
+    }
 }
 
 /// Everything shared between the update ingest and the heartbeat loop. One
@@ -84,17 +170,14 @@ pub struct App {
 }
 
 impl App {
-    fn new(brain: Arc<Brain>, userbot: Arc<Userbot>, diary: Diary) -> Self {
+    fn new(brain: Arc<Brain>, userbot: Arc<Userbot>, diary: Diary, today: Today) -> Self {
         Self {
             brain,
             userbot,
             diary: Mutex::new(diary),
             heartbeat: Mutex::new(Heartbeat::new(unix_seconds() as u64)),
             conversation: Mutex::new(Conversation::default()),
-            today: Mutex::new(Today {
-                day: today_str(),
-                lines: Vec::new(),
-            }),
+            today: Mutex::new(today),
             wake: Notify::new(),
             started: Instant::now(),
         }
@@ -142,21 +225,31 @@ impl App {
 
     /// Keep an incoming message in today's context even when the turn is ignored.
     fn record_event(&self, event: &Incoming) {
-        self.today.lock().unwrap().lines.push(message_block(
+        let line = message_block(
             &event.sender,
             event.username.as_deref(),
             event.sender_id,
             &event.text,
-        ));
+        );
+        if let Err(error) = self.today.lock().unwrap().append(line) {
+            eprintln!("today journal write failed: {error:#}");
+        }
     }
 
     /// Keep a sent answer in today's context.
     pub fn record_outgoing(&self, text: &str) {
-        self.today
-            .lock()
-            .unwrap()
-            .lines
-            .push(message_block(&config::nekora_name(), None, 0, text));
+        let line = message_block(&config::nekora_name(), None, 0, text);
+        if let Err(error) = self.today.lock().unwrap().append(line) {
+            eprintln!("today journal write failed: {error:#}");
+        }
+    }
+
+    fn today_snapshot(&self) -> TodaySnapshot {
+        self.today.lock().unwrap().snapshot()
+    }
+
+    fn finish_today(&self, snapshot: &TodaySnapshot, next_day: Option<String>) -> Result<()> {
+        self.today.lock().unwrap().finish(snapshot, next_day)
     }
 
     /// Today's timestamped tail, so the turn can reason about elapsed real time.
@@ -208,9 +301,6 @@ async fn respond(app: &Arc<App>, events: &[Incoming], generation: ReplyGeneratio
     app.userbot.go_online().await;
 
     let context = app.recent_context();
-    for event in events {
-        app.record_event(event);
-    }
     let lines = events
         .iter()
         .map(|event| {
@@ -286,16 +376,13 @@ async fn run_turn(app: &Arc<App>) -> Result<()> {
     let now = unix_seconds();
     let day = today_str();
     if app.today.lock().unwrap().day != day {
-        let lines = std::mem::take(&mut app.today.lock().unwrap().lines);
-        let backup = lines.clone();
-        match sleep::consolidate(app, lines, true).await {
-            Ok(fresh) => {
-                let mut today = app.today.lock().unwrap();
-                today.lines = fresh;
-                today.day = day;
+        let snapshot = app.today_snapshot();
+        match sleep::consolidate(app, snapshot.lines.clone(), true).await {
+            Ok(fresh) if fresh.is_empty() => {
+                app.finish_today(&snapshot, Some(day.clone()))?;
             }
+            Ok(_) => {}
             Err(error) => {
-                app.today.lock().unwrap().lines = backup;
                 // The day rolled over but sleep failed: put the pending burst back
                 // so it is answered next turn rather than lost.
                 if let Some(batch) = &batch {
@@ -332,22 +419,17 @@ async fn run_turn(app: &Arc<App>) -> Result<()> {
                 };
                 events.extend(to_events(chat_id, late));
                 respond(app, &events, generation).await?;
-            } else {
-                for event in &events {
-                    app.record_event(event);
-                }
             }
         }
     }
 
-    let lines = std::mem::take(&mut app.today.lock().unwrap().lines);
-    let backup = lines.clone();
-    match sleep::consolidate(app, lines, false).await {
-        Ok(fresh) => app.today.lock().unwrap().lines = fresh,
-        Err(error) => {
-            app.today.lock().unwrap().lines = backup;
-            return Err(error);
+    let snapshot = app.today_snapshot();
+    match sleep::consolidate(app, snapshot.lines.clone(), false).await {
+        Ok(fresh) if fresh.is_empty() => {
+            app.finish_today(&snapshot, None)?;
         }
+        Ok(_) => {}
+        Err(error) => return Err(error),
     }
     Ok(())
 }
@@ -484,7 +566,8 @@ async fn run() -> Result<()> {
         .map_err(|error| anyhow::anyhow!("could not start update stream: {error}"))?;
 
     let userbot = Arc::new(Userbot::new(client, Arc::clone(&session), brain.clone()));
-    let app = Arc::new(App::new(brain, userbot, diary));
+    let today = Today::open()?;
+    let app = Arc::new(App::new(brain, userbot, diary, today));
 
     println!("nekora is up; waiting on her own clock");
     tokio::select! {
