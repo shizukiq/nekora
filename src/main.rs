@@ -226,9 +226,13 @@ impl App {
     /// Keep an incoming message in today's context even when the turn is ignored.
     fn record_event(&self, event: &Incoming) {
         let line = message_block(
+            event.chat_id,
             &event.sender,
             event.username.as_deref(),
             event.sender_id,
+            event.message_id,
+            &event.timestamp,
+            &event.metadata,
             &event.text,
         );
         if let Err(error) = self.today.lock().unwrap().append(line) {
@@ -237,8 +241,45 @@ impl App {
     }
 
     /// Keep a sent answer in today's context.
-    pub fn record_outgoing(&self, text: &str) {
-        let line = message_block(&config::nekora_name(), None, 0, text);
+    pub fn record_outgoing(&self, chat_id: i64, text: &str, reply_to_message_id: Option<i64>) {
+        let metadata = reply_to_message_id.map_or_else(String::new, |message_id| {
+            format!("telegram_context:\ntelegram_reply_to_message_id={message_id}\n")
+        });
+        let line = message_block(
+            chat_id,
+            &config::nekora_name(),
+            None,
+            0,
+            0,
+            &now_stamp(),
+            &metadata,
+            text,
+        );
+        if let Err(error) = self.today.lock().unwrap().append(line) {
+            eprintln!("today journal write failed: {error:#}");
+        }
+    }
+
+    /// Keep a reaction Nekora sent in today's context, including its target.
+    pub fn record_reaction(&self, chat_id: i64, message_id: i64, reaction: &str) {
+        let reaction = reaction.trim();
+        let action = if reaction.is_empty() {
+            "removed reaction".to_string()
+        } else {
+            format!("reacted with {reaction}")
+        };
+        let metadata =
+            format!("telegram_context:\ntelegram_reaction_target_message_id={message_id}\n");
+        let line = message_block(
+            chat_id,
+            &config::nekora_name(),
+            None,
+            0,
+            0,
+            &now_stamp(),
+            &metadata,
+            &format!("[{action} to message_id={message_id}]"),
+        );
         if let Err(error) = self.today.lock().unwrap().append(line) {
             eprintln!("today journal write failed: {error:#}");
         }
@@ -270,7 +311,7 @@ fn maybe_tool_reminder() -> String {
     if rand::rng().random::<f64>() < TOOL_REMINDER_CHANCE {
         "(you can recall_memory, list_memories, remember, inspect_user, inspect_message_media, \
          get_current_time, \
-         send_message, list_chats.)\n"
+         send_message, react_to_message, list_chats.)\n"
             .to_string()
     } else {
         String::new()
@@ -305,9 +346,13 @@ async fn respond(app: &Arc<App>, events: &[Incoming], generation: ReplyGeneratio
         .iter()
         .map(|event| {
             message_block(
+                event.chat_id,
                 &event.sender,
                 event.username.as_deref(),
                 event.sender_id,
+                event.message_id,
+                &event.timestamp,
+                &event.metadata,
                 &event.text,
             )
         })
@@ -443,16 +488,27 @@ fn to_events(chat_id: i64, messages: Vec<ConversationMessage>) -> Vec<Incoming> 
             message_id: message.message_id,
             sender: message.sender,
             username: message.username,
+            timestamp: message.timestamp,
+            metadata: message.metadata,
             text: message.text,
         })
         .collect()
 }
 
-fn message_block(sender: &str, username: Option<&str>, sender_id: i64, text: &str) -> String {
+fn message_block(
+    chat_id: i64,
+    sender: &str,
+    username: Option<&str>,
+    sender_id: i64,
+    message_id: i64,
+    timestamp: &str,
+    metadata: &str,
+    text: &str,
+) -> String {
     let mut header = format!(
-        "<message sender=\"{}\" time=\"{}\"",
+        "<message chat_id=\"{chat_id}\" sender=\"{}\" time=\"{}\"",
         escape_message_attribute(sender),
-        now_stamp(),
+        escape_message_attribute(timestamp),
     );
     if let Some(username) = username
         .map(str::trim)
@@ -465,7 +521,16 @@ fn message_block(sender: &str, username: Option<&str>, sender_id: i64, text: &st
     if sender_id > 0 {
         header.push_str(&format!(" user_id=\"{sender_id}\""));
     }
-    format!("{header}>\n{text}\n</message>")
+    if message_id > 0 {
+        header.push_str(&format!(" message_id=\"{message_id}\""));
+    }
+    let metadata = metadata.trim_end();
+    let body = if metadata.is_empty() {
+        text.to_string()
+    } else {
+        format!("{metadata}\n{text}")
+    };
+    format!("{header}>\n{body}\n</message>")
 }
 
 fn escape_message_attribute(value: &str) -> String {
@@ -482,11 +547,16 @@ fn escape_message_attribute(value: &str) -> String {
 async fn ingest(app: &Arc<App>, updates: &mut grammers_client::client::UpdateStream) {
     loop {
         match updates.next().await {
-            Ok(Update::NewMessage(message)) if !message.outgoing() => {
+            Ok(Update::NewMessage(message) | Update::MessageEdited(message))
+                if !message.outgoing() =>
+            {
                 let chat_id = message.peer_id().bot_api_dialog_id_unchecked();
+                if !config::chat_allowed(chat_id) {
+                    continue;
+                }
                 let incoming = app.userbot.describe(&message).await;
+                app.record_event(&incoming);
                 if app.userbot.is_broadcast_channel(chat_id).await {
-                    app.record_event(&incoming);
                     continue;
                 }
                 // Invalidate a running reply before putting the described message
@@ -502,6 +572,8 @@ async fn ingest(app: &Arc<App>, updates: &mut grammers_client::client::UpdateStr
                         message_id: incoming.message_id,
                         sender: incoming.sender,
                         username: incoming.username,
+                        timestamp: incoming.timestamp,
+                        metadata: incoming.metadata,
                         text: incoming.text,
                     },
                     now_ms,
@@ -513,6 +585,13 @@ async fn ingest(app: &Arc<App>, updates: &mut grammers_client::client::UpdateStr
             // the batch open a little longer, so she doesn't cut into a thought
             // that is still being written.
             Ok(Update::Raw(raw)) => {
+                if let tl::enums::Update::MessageReactions(reactions) = &raw.raw {
+                    if let Some(event) = app.userbot.describe_reaction_update(reactions) {
+                        if config::chat_allowed(event.chat_id) {
+                            app.record_event(&event);
+                        }
+                    }
+                }
                 if let tl::enums::Update::UserTyping(typing) = &raw.raw {
                     if let Some(chat_id) =
                         PeerId::user(typing.user_id).map(PeerId::bot_api_dialog_id_unchecked)

@@ -134,6 +134,13 @@ The result is a memory model with a short-term layer and a durable layer:
 working memory carries near-term obligations, while the diary keeps facts,
 events, relationships, uncertainty, and useful emotional context.
 
+Incoming Telegram messages also keep their platform context: the original
+message ID and timestamp, chat type, replies and quoted text, explicit mentions,
+whether Nekora was addressed, reactions and reactors, forwards, and media-group
+membership. The model can use that metadata to choose a visible Telegram reply
+(`reply_to_message_id`) or a reaction. Private replies are restricted to the
+positive user IDs in `PAPIK_CHAT_ID`; group conversations remain available.
+
 ## Capabilities
 
 The tool set is intentionally small:
@@ -146,7 +153,8 @@ The tool set is intentionally small:
 | `inspect_user` | inspect a Telegram profile and avatar |
 | `inspect_message_media` | look closely at recent media |
 | `get_current_time` | ask Telegram for its server time in UTC+04:00 |
-| `send_message` | send a visible Telegram reply or a proactive message |
+| `send_message` | send a visible Telegram reply or a proactive message; optionally reply to a message ID |
+| `react_to_message` | add or remove Nekora's reaction on a message |
 | `list_chats` | inspect recent chats before choosing someone to contact |
 | `stay_quiet` | choose silence deliberately |
 
@@ -196,6 +204,7 @@ DEEPSEEK_API_KEY=your_deepseek_api_key
 
 PAPIK_NAME=your name
 NEKORA_NAME=Nekora
+PAPIK_CHAT_ID=123456789
 ```
 
 `TELEGRAM_PHONE` is optional; if it is absent, Nekora asks for it interactively.
@@ -251,6 +260,7 @@ but already-exported environment variables win over it.
 | `NEKORA_REQUEST_TIMEOUT` | `120` | seconds allowed for a model request |
 | `NEKORA_NAME` | `Nekora` | name used in the character preamble |
 | `PAPIK_NAME` | `your person` | the person's name used in the character preamble |
+| `PAPIK_CHAT_ID` | `0` | comma/semicolon/space-separated user IDs allowed to receive private replies; groups remain allowed |
 | `NEKORA_VAULT` | `vault` | directory for Markdown memories and runtime state |
 | `NEKORA_SESSION` | `nekora` | session path base; `.session` is appended |
 

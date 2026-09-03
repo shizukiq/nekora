@@ -27,6 +27,8 @@ pub struct ConversationMessage {
     pub message_id: i64,
     pub sender: String,
     pub username: Option<String>,
+    pub timestamp: String,
+    pub metadata: String,
     pub text: String,
 }
 
@@ -246,6 +248,8 @@ mod tests {
             message_id: 1,
             sender: "someone".into(),
             username: None,
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            metadata: String::new(),
             text: text.into(),
         }
     }

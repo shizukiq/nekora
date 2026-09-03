@@ -71,10 +71,21 @@ pub fn schema() -> Vec<ChatCompletionTools> {
         ),
         (
             "send_message",
-            "Send a text message to a Telegram chat, if you actually want to say something.",
+            "Send a text message to a Telegram chat, if you actually want to say something. Set reply_to_message_id when this should be a Telegram reply to one specific message.",
             json!({"type": "object", "properties": {
-                "chat_id": {"type": "integer"}, "text": {"type": "string"}},
+                "chat_id": {"type": "integer"},
+                "text": {"type": "string"},
+                "reply_to_message_id": {"type": "integer", "description": "message_id from Telegram context; omit for a normal message"}},
                 "required": ["chat_id", "text"]}),
+        ),
+        (
+            "react_to_message",
+            "Add one Telegram reaction to a message. Pass an empty reaction to remove Nekora's reaction.",
+            json!({"type": "object", "properties": {
+                "chat_id": {"type": "integer"},
+                "message_id": {"type": "integer"},
+                "reaction": {"type": "string", "description": "one emoji, or empty to remove your reaction"}},
+                "required": ["chat_id", "message_id", "reaction"]}),
         ),
         (
             "list_chats",
@@ -200,11 +211,37 @@ async fn dispatch(
                 .and_then(Value::as_i64)
                 .ok_or_else(|| anyhow!("missing chat_id"))?;
             let text = str_arg(&args, "text")?;
-            app.userbot.send(app, chat_id, text, generation).await?;
+            let reply_to_message_id = optional_message_id(&args, "reply_to_message_id")?;
+            app.userbot
+                .send(app, chat_id, text, reply_to_message_id, generation)
+                .await?;
             if generation.is_none_or(|generation| app.generation_is_current(generation)) {
-                app.record_outgoing(text);
+                app.record_outgoing(chat_id, text, reply_to_message_id);
             }
             Ok("sent".to_string())
+        }
+        "react_to_message" => {
+            let chat_id = args
+                .get("chat_id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| anyhow!("missing chat_id"))?;
+            let message_id = args
+                .get("message_id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| anyhow!("missing message_id"))?;
+            let reaction = str_arg(&args, "reaction")?;
+            if app
+                .userbot
+                .react(app, chat_id, message_id, reaction, generation)
+                .await?
+            {
+                if generation.is_none_or(|generation| app.generation_is_current(generation)) {
+                    app.record_reaction(chat_id, message_id, reaction);
+                }
+                Ok("reacted".to_string())
+            } else {
+                Ok("turn became outdated before the reaction was sent".to_string())
+            }
         }
         "list_chats" => Ok(serde_json::to_string(&app.userbot.recent_chats().await?)?),
         "stay_quiet" => Ok("stayed quiet".to_string()),
@@ -216,4 +253,17 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
     args.get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("missing {key}"))
+}
+
+fn optional_message_id(args: &Value, key: &str) -> Result<Option<i64>> {
+    let Some(value) = args.get(key) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_i64()
+        .ok_or_else(|| anyhow!("{key} must be an integer"))
+        .map(Some)
 }
