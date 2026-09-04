@@ -1394,6 +1394,7 @@ dependencies = [
  "grammers-tl-types",
  "ollama-rs",
  "rand 0.9.5",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "tokio",

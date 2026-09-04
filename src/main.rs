@@ -21,6 +21,7 @@ mod persistence;
 mod sleep;
 mod tools;
 mod userbot;
+mod websearch;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -43,6 +44,7 @@ use conversation::{Conversation, ConversationBatch, ConversationMessage, ReplyGe
 use diary::Diary;
 use heartbeat::Heartbeat;
 use userbot::{Incoming, Userbot};
+use websearch::ProviderChain;
 
 // The core ticks about every 27 minutes -- long enough that she is plainly living
 // on her own clock, not watching the chat.
@@ -158,6 +160,7 @@ impl Today {
 pub struct App {
     pub brain: Arc<Brain>,
     pub userbot: Arc<Userbot>,
+    pub(crate) web_search: ProviderChain,
     pub diary: Mutex<Diary>,
     heartbeat: Mutex<Heartbeat>,
     conversation: Mutex<Conversation>,
@@ -170,10 +173,17 @@ pub struct App {
 }
 
 impl App {
-    fn new(brain: Arc<Brain>, userbot: Arc<Userbot>, diary: Diary, today: Today) -> Self {
+    fn new(
+        brain: Arc<Brain>,
+        userbot: Arc<Userbot>,
+        web_search: ProviderChain,
+        diary: Diary,
+        today: Today,
+    ) -> Self {
         Self {
             brain,
             userbot,
+            web_search,
             diary: Mutex::new(diary),
             heartbeat: Mutex::new(Heartbeat::new(unix_seconds() as u64)),
             conversation: Mutex::new(Conversation::default()),
@@ -309,7 +319,7 @@ impl App {
 
 fn maybe_tool_reminder() -> String {
     if rand::rng().random::<f64>() < TOOL_REMINDER_CHANCE {
-        "(you can recall_memory, list_memories, remember, inspect_user, inspect_message_media, \
+        "(you can recall_memory, web_search, list_memories, remember, inspect_user, inspect_message_media, \
          get_current_time, \
          send_message, react_to_message, list_chats.)\n"
             .to_string()
@@ -628,6 +638,7 @@ async fn ingest(app: &Arc<App>, updates: &mut grammers_client::client::UpdateStr
 
 async fn run() -> Result<()> {
     let brain = Arc::new(Brain::from_env()?);
+    let web_search = ProviderChain::from_env()?;
     // Kept alive for the whole run: dropping this stops a managed Ollama.
     let _ollama = ollama::start_if_managed(&brain.vision_model).await?;
 
@@ -655,7 +666,7 @@ async fn run() -> Result<()> {
 
     let userbot = Arc::new(Userbot::new(client, Arc::clone(&session), brain.clone()));
     let today = Today::open()?;
-    let app = Arc::new(App::new(brain, userbot, diary, today));
+    let app = Arc::new(App::new(brain, userbot, web_search, diary, today));
 
     println!("nekora is up; waiting on her own clock");
     tokio::select! {

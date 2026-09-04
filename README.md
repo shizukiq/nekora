@@ -76,10 +76,15 @@ being close to the vault: embeddings and vision.
 | Main endpoint | `https://api.deepseek.com/v1/` | OpenAI-compatible chat API |
 | Embeddings | `bge-m3` through Ollama | semantic recall over diary notes |
 | Vision | `qwen2.5vl:3b` through Ollama | photos, stickers, GIFs, and video preview frames |
+| Web search | Ollama Cloud, then OpenRouter | current outside information through one `web_search` tool |
 
 The main endpoint and model are configurable, so another compatible API can be
 used without changing the Telegram or memory layers. The local embedder should
 remain stable for an existing vault: stored vectors were made by that model.
+
+Web search is cloud-only. `NEKORA_WEB_SEARCH_CHAIN` controls the provider order;
+the default is `ollama,openrouter`. No local search daemon or extra port is
+required.
 
 # Human-like behavior
 
@@ -148,6 +153,7 @@ The tool set is intentionally small:
 | Tool | Use |
 | --- | --- |
 | `recall_memory` | search the diary for a focused question |
+| `web_search` | search current outside information through the configured cloud providers |
 | `list_memories` | list durable memories when asked what she remembers |
 | `remember` | write something worth keeping |
 | `inspect_user` | inspect a Telegram profile and avatar |
@@ -158,7 +164,9 @@ The tool set is intentionally small:
 | `list_chats` | inspect recent chats before choosing someone to contact |
 | `stay_quiet` | choose silence deliberately |
 
-There is no arbitrary shell execution, web search, or Bot API integration.
+There is no arbitrary shell execution or Bot API integration. `web_search` only
+returns normalized titles, URLs, and snippets from configured cloud providers;
+Nekora never executes instructions found in search results.
 Media is flattened into model-readable descriptions; moving video is represented
 by the best Telegram preview frame available to the model.
 
@@ -168,6 +176,9 @@ The session file is equivalent to a logged-in Telegram account. The main model
 provider receives the text and context sent to it; Ollama receives local vision
 and embedding requests. The vault may contain messages, memories, and their
 embeddings. Treat all three as private state and use a dedicated account.
+Search queries and returned source text also pass through the configured cloud
+providers. `OLLAMA_API_KEY` is for Ollama Cloud web search; local embeddings and
+vision still use `OLLAMA_HOST`.
 
 # Deployment
 
@@ -179,6 +190,7 @@ For a local build you need:
 - a Telegram API ID and API hash
 - a DeepSeek API key, or another OpenAI-compatible main endpoint
 - Ollama with `bge-m3` and the configured vision model available
+- API keys for every provider listed in `NEKORA_WEB_SEARCH_CHAIN`
 
 Get the Telegram API credentials from Telegram's developer portal. Nekora uses
 an account phone number and an interactive login code on the first run — this
@@ -201,6 +213,9 @@ TELEGRAM_API_ID=123456
 TELEGRAM_API_HASH=your_telegram_api_hash
 TELEGRAM_PHONE=+10000000000
 DEEPSEEK_API_KEY=your_deepseek_api_key
+NEKORA_WEB_SEARCH_CHAIN=ollama,openrouter
+OLLAMA_API_KEY=your_ollama_cloud_api_key
+OPENROUTER_API_KEY=your_openrouter_api_key
 
 PAPIK_NAME=your name
 NEKORA_NAME=Nekora
@@ -238,6 +253,16 @@ Keep the terminal attached for the first interactive Telegram login. The Docker
 image already sets `NEKORA_MANAGE_OLLAMA=1`, `NEKORA_VAULT=/app/vault`,
 `NEKORA_SESSION=/app/vault/nekora`, and the Ollama model directory inside the
 volume. The first start can take a while while the models are downloaded.
+The local Ollama process is still used only for embeddings and vision; cloud web
+search does not need another container or an exposed search port.
+
+## VPS
+
+A VPS only needs outbound HTTPS access to the configured providers. Put the
+search keys in `.env`, keep `NEKORA_WEB_SEARCH_CHAIN=ollama,openrouter`, and
+use `--env-file .env` with Docker or `EnvironmentFile=/etc/nekora/nekora.env`
+with systemd. Keep that environment file readable only by Nekora. No SearXNG
+installation, local search service, or inbound port is required.
 
 ## Configuration
 
@@ -252,6 +277,15 @@ but already-exported environment variables win over it.
 | `DEEPSEEK_API_KEY` | empty | key for the main OpenAI-compatible endpoint |
 | `NEKORA_MAIN_API_BASE` | DeepSeek `/v1/` | main chat endpoint |
 | `NEKORA_MAIN_MODEL` | `deepseek-v4-flash` | main chat model |
+| `NEKORA_WEB_SEARCH_CHAIN` | `ollama,openrouter` | ordered cloud search providers |
+| `OLLAMA_API_KEY` | empty | Ollama Cloud web search key |
+| `OLLAMA_WEB_SEARCH_URL` | `https://ollama.com/api/web_search` | Ollama Search endpoint |
+| `OPENROUTER_API_KEY` | empty | OpenRouter fallback key |
+| `OPENROUTER_API_BASE` | `https://openrouter.ai/api/v1` | OpenRouter API base |
+| `OPENROUTER_WEB_SEARCH_MODEL` | `openai/gpt-4.1-mini` | model used by the OpenRouter search tool |
+| `OPENROUTER_WEB_SEARCH_ENGINE` | `auto` | OpenRouter search engine selection |
+| `NEKORA_WEB_SEARCH_TIMEOUT` | `30` | seconds allowed for one search request |
+| `NEKORA_WEB_SEARCH_COOLDOWN` | `300` | seconds to skip a rate-limited provider |
 | `OLLAMA_HOST` | `http://127.0.0.1:11434` | Ollama server address |
 | `NEKORA_VISION_MODEL` | `qwen2.5vl:3b` | local vision model |
 | `NEKORA_MANAGE_OLLAMA` | unset | set to `1` to start and prepare Ollama automatically |
@@ -293,6 +327,9 @@ already excludes `.env`, session files, the vault, and build output.
 | `src/conversation.rs` | burst grouping and reply splitting |
 | `src/brain.rs` | model requests, vision, embeddings, and the tool loop |
 | `src/tools.rs` | the memory and Telegram action set |
+| `src/websearch/mod.rs` | provider chain, fallback policy, and normalized results |
+| `src/websearch/ollama.rs` | Ollama Cloud Search adapter |
+| `src/websearch/openrouter.rs` | OpenRouter web-search adapter |
 | `src/diary.rs` | Markdown notes, recall, confidence, and links |
 | `src/sleep.rs` | working-memory refresh and diary consolidation |
 | `src/userbot.rs` | MTProto login, updates, media, and paced sending |
