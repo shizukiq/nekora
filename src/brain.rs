@@ -130,21 +130,37 @@ impl Brain {
         if let Some(name) = force_tool {
             builder.tool_choice(force_choice(name));
         }
-        let request = builder.build()?;
+        let mut request = builder.build()?;
+        loop {
+            let result = self
+                .retry(
+                    || async {
+                        let response = self.openai.chat().create(request.clone()).await?;
+                        response
+                            .choices
+                            .into_iter()
+                            .next()
+                            .map(|choice| choice.message)
+                            .ok_or_else(|| anyhow!("brain returned no choices"))
+                    },
+                    |_| true,
+                )
+                .await;
 
-        self.retry(
-            || async {
-                let response = self.openai.chat().create(request.clone()).await?;
-                response
-                    .choices
-                    .into_iter()
-                    .next()
-                    .map(|choice| choice.message)
-                    .ok_or_else(|| anyhow!("brain returned no choices"))
-            },
-            |_| true,
-        )
-        .await
+            // Some reasoning backends accept tools but reject a named tool choice.
+            // Keep the strict request for compatible backends, then let that one
+            // turn fall back to the provider's normal automatic tool selection.
+            if request.tool_choice.is_some()
+                && result
+                    .as_ref()
+                    .err()
+                    .is_some_and(is_unsupported_thinking_tool_choice)
+            {
+                request.tool_choice = None;
+                continue;
+            }
+            return result;
+        }
     }
 
     /// Describe an incoming image so the text-only turn can "see" it, on the local
@@ -235,6 +251,11 @@ fn is_transient(error: &anyhow::Error) -> bool {
     ]
     .iter()
     .any(|needle| haystack.contains(needle))
+}
+
+fn is_unsupported_thinking_tool_choice(error: &anyhow::Error) -> bool {
+    let haystack = format!("{error:#}").to_ascii_lowercase();
+    haystack.contains("thinking mode") && haystack.contains("tool_choice")
 }
 
 fn force_choice(name: &str) -> ChatCompletionToolChoiceOption {

@@ -904,7 +904,7 @@ impl Userbot {
                 .await?;
         } else {
             self.client
-                .send_reactions(peer, message_id, reaction)
+                .send_reactions(peer, message_id, reaction_input(reaction)?)
                 .await?;
         }
         Ok(true)
@@ -992,6 +992,20 @@ fn peer_is_in_contact_scope(peer: &Peer) -> bool {
         Peer::User(user) => user.contact(),
         Peer::Group(_) | Peer::Channel(_) => true,
     }
+}
+
+fn reaction_input(reaction: &str) -> Result<InputReactions> {
+    if let Some(document_id) = reaction.strip_prefix("custom_emoji:") {
+        let document_id = document_id
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| anyhow!("custom emoji reaction must contain a document id"))?;
+        if document_id <= 0 {
+            return Err(anyhow!("custom emoji document id must be positive"));
+        }
+        return Ok(InputReactions::custom_emoji(document_id));
+    }
+    Ok(InputReactions::emoticon(reaction))
 }
 
 fn chat_type_for_peer(peer_id: PeerId) -> &'static str {

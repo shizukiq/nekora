@@ -80,11 +80,11 @@ pub fn schema() -> Vec<ChatCompletionTools> {
         ),
         (
             "react_to_message",
-            "Add one Telegram reaction to a message. Pass an empty reaction to remove Nekora's reaction.",
+            "Add one Telegram reaction to a message. Use a standard emoji or custom_emoji:<document_id> exactly as shown in Telegram context. Pass an empty reaction to remove Nekora's reaction.",
             json!({"type": "object", "properties": {
                 "chat_id": {"type": "integer"},
                 "message_id": {"type": "integer"},
-                "reaction": {"type": "string", "description": "one emoji, or empty to remove your reaction"}},
+                "reaction": {"type": "string", "description": "one supported emoji, custom_emoji:<document_id> from context, or empty to remove your reaction"}},
                 "required": ["chat_id", "message_id", "reaction"]}),
         ),
         (
@@ -125,9 +125,17 @@ pub async fn run(
             // Never hand the raw error to the model: it names the backend and she
             // narrates her own plumbing out of character. Operator gets it on stderr.
             eprintln!("tool {name} failed: {error:#}");
-            "(couldn't do that just now)".to_string()
+            if name == "react_to_message" && is_reaction_invalid(&error) {
+                "(Telegram rejected that reaction; it is unavailable for this chat or message. Do not retry the same reaction.)".to_string()
+            } else {
+                "(couldn't do that just now)".to_string()
+            }
         }
     }
+}
+
+fn is_reaction_invalid(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("REACTION_INVALID")
 }
 
 async fn dispatch(
