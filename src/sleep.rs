@@ -30,6 +30,24 @@ const MAX_RECALL_QUERY_CHARS: usize = 12_000;
 const MAX_MEMORY_CONTEXT_CHARS: usize = 4_000;
 const RAG_TIMEOUT: Duration = Duration::from_secs(8);
 
+const WORKING_MEMORY_SYSTEM: &str =
+    "You are Nekora's private working-memory clerk. This is internal maintenance, not a \
+Telegram conversation. Extract useful short-term state without imitating her chat voice. Never \
+address the person, mention prompts or models, invent facts, or turn guesses into facts. Follow \
+the requested output format exactly and output only the memory text.";
+
+const DISTIL_SYSTEM: &str =
+    "You are Nekora's private diary archivist. Turn the supplied event stream into durable \
+memory candidates; do not reply to a person. Preserve concrete details and uncertainty, ignore \
+explicitly synthetic material, and never invent facts. Output only the requested memory pieces, \
+without greetings, analysis, or commentary about this task.";
+
+const SLEEP_SYSTEM: &str =
+    "You are Nekora's private diary editor. Reconcile existing notes for reliable future \
+retrieval, preserving factual cores and making uncertainty visible. This is internal data \
+maintenance, not a conversation. Never address the person, imitate chat, invent facts, or \
+explain your process. Output only the requested replacement pieces.";
+
 const DISTIL_INSTRUCTION: &str =
     "It's time to open the diary and preserve what actually happened while you were awake. \
 Write shortly, but do not lose details that will matter later. The input is a notification stream, \
@@ -51,8 +69,8 @@ or older than three days. Include dates or last-updated times when known. Keep i
 under 500 words. Output only the memory text; output EMPTY if nothing remains.";
 
 const SLEEP_INSTRUCTION: &str =
-    "You are the Sleep-time Consolidator. Restructure the supplied diary pieces for reliable future \
-retrieval. Each input piece begins with a JSON object containing confidence, followed by its text. \
+    "Restructure the supplied diary pieces for reliable future retrieval. Each input piece begins \
+with a JSON object containing confidence, followed by its text. \
 confidence=1 is an immutable anchor: do not rewrite or archive it. Mutable pieces with confidence<1 \
 may be merged, split, renamed, shortened, or dropped. Sanity-check lower-confidence claims against \
 higher-confidence pieces, preserve factual cores, and make speculation or contradictions explicit. \
@@ -155,7 +173,7 @@ pub async fn consolidate(
         .brain
         .chat(
             vec![
-                system(config::persona()),
+                system(DISTIL_SYSTEM),
                 user(format!("{DISTIL_INSTRUCTION}\n\n{joined}")),
             ],
             &[],
@@ -186,7 +204,7 @@ async fn refresh_working_memory(app: &Arc<App>, joined: &str) -> Result<()> {
     );
     let reply = app
         .brain
-        .chat(vec![system(config::persona()), user(prompt)], &[], None)
+        .chat(vec![system(WORKING_MEMORY_SYSTEM), user(prompt)], &[], None)
         .await?;
     let body = reply.content.unwrap_or_default().trim().to_string();
     if body.is_empty() {
@@ -234,7 +252,7 @@ async fn consolidate_diary(app: &Arc<App>) -> Result<()> {
             .brain
             .chat(
                 vec![
-                    system(config::persona()),
+                    system(SLEEP_SYSTEM),
                     user(format!("{SLEEP_INSTRUCTION}\n\n{}", pieces.join("\n---\n"))),
                 ],
                 &[],
@@ -283,10 +301,12 @@ pub async fn reflect(app: &Arc<App>, recent: &str) -> Result<Option<String>> {
         recent
     };
     let prompt = format!(
-        "This is an old note from your diary:\n\n{page}\n\n\
+        "This is a private reflection, not a Telegram message. Do not address anyone or explain \
+         that you are reflecting.\n\nOld note from your diary:\n\n{page}\n\n\
          And this is what's been on your mind lately:\n\n{recent}\n\n\
-         Reflect: in 1-3 sentences, first person, notice something that connects them \
-         or something new. If nothing connects, say so in one line."
+         Reflect in 1-3 specific first-person sentences. Notice a real connection, a changed \
+         feeling, or something you now see differently. If nothing connects, say so plainly in \
+         one line. Do not write a generic life lesson."
     );
 
     let reply = app

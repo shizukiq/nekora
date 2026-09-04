@@ -38,8 +38,8 @@ use crate::{tools, App};
 const DEFAULT_MAIN_API_BASE: &str = "https://api.deepseek.com/v1/";
 const EMBED_MODEL: &str = "bge-m3";
 
-// Low temperature keeps her in character rather than loose.
-const TEMPERATURE: f32 = 0.2;
+// Keep tool selection stable while leaving enough room for a non-identical voice.
+const TEMPERATURE: f32 = 0.35;
 // A turn may chain at most this many tool calls before we force it to conclude,
 // the guard against a model that keeps calling tools forever.
 const MAX_TOOL_ITERS: usize = 8;
@@ -172,10 +172,11 @@ impl Brain {
             .retry(
                 || async {
                     let message = ChatMessage::user(
-                        "Look at this image carefully. First identify the main visible subject \
-                         (person, animal, or object), then mention only details you can actually \
-                         see. Do not guess from a blurry background; if it is unclear, say so. \
-                         Answer in one short sentence."
+                        "Look at this image carefully. Describe the main visible subject first, \
+                         then one or two details that are actually clear. Use plain natural \
+                         wording with no preamble such as 'the image shows'. Do not guess from \
+                         a blurry background; if something is unclear, say so in one short \
+                         sentence."
                             .into(),
                     )
                     .with_images(vec![Image::from_base64(base64.as_str())]);
