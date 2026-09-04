@@ -24,15 +24,15 @@ grammers-client = "0.10"
 grammers-session = "0.10"
 grammers-tl-types = "0.10"
 
-# The brain: DeepSeek over its OpenAI-compatible /v1, tool calls and all, through
-# a typed client instead of hand-rolled HTTP. rustls (not the default native-tls)
-# keeps the build free of a system OpenSSL; only chat + embeddings are pulled in.
+# DeepSeek chat and OpenRouter vision use their OpenAI-compatible endpoints
+# through a typed client. rustls (not the default native-tls) keeps the build
+# free of a system OpenSSL; only chat + embeddings are pulled in.
 async-openai = { version = "0.41", default-features = false, features = ["rustls", "chat-completion", "embedding"] }
 
 # Cloud web search adapters use the same rustls-only HTTP transport.
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 
-# The local pool: bge-m3 embeddings and the qwen2.5vl vision model on Ollama.
+# The local pool: bge-m3 embeddings and the fallback vision model on Ollama.
 # Same rustls choice, for the same reason -- its default feature is native-tls.
 ollama-rs = { version = "0.3", default-features = false, features = ["rustls"] }
 

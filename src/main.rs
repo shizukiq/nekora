@@ -640,7 +640,7 @@ async fn run() -> Result<()> {
     let brain = Arc::new(Brain::from_env()?);
     let web_search = ProviderChain::from_env()?;
     // Kept alive for the whole run: dropping this stops a managed Ollama.
-    let _ollama = ollama::start_if_managed(&brain.vision_model).await?;
+    let _ollama = ollama::start_if_managed(&brain.local_vision_model).await?;
 
     let mut diary = Diary::new(config::vault_dir());
     if !diary.open() {

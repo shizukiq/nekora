@@ -1,11 +1,10 @@
 //! Every request Nekora makes, and the agentic turn that strings them together.
 //!
-//! The split pool from the Python build, unchanged: the main brain is DeepSeek
-//! over its OpenAI-compatible `/v1`, while vision (qwen2.5vl) and the bge-m3
-//! embedder stay LOCAL on Ollama — free, offline, and the vault's vectors must
-//! never change embedder once written. The core already decided *whether* to
-//! act; [`act`] decides *what*, letting the model reach for tools until it has
-//! nothing left to do.
+//! The main brain is DeepSeek over its OpenAI-compatible `/v1`. Vision prefers
+//! OpenRouter and falls back to local Ollama; the bge-m3 embedder always stays
+//! local because the vault's vectors must never change embedder once written.
+//! The core already decided *whether* to act; [`act`] decides *what*, letting
+//! the model reach for tools until it has nothing left to do.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -15,10 +14,11 @@ use anyhow::{anyhow, Result};
 use async_openai::config::OpenAIConfig;
 use async_openai::types::chat::{
     ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessage,
-    ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
+    ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
+    ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage,
     ChatCompletionRequestToolMessage, ChatCompletionRequestUserMessage,
-    ChatCompletionResponseMessage, ChatCompletionToolChoiceOption, ChatCompletionTools,
-    CreateChatCompletionRequestArgs,
+    ChatCompletionRequestUserMessageContent, ChatCompletionResponseMessage,
+    ChatCompletionToolChoiceOption, ChatCompletionTools, CreateChatCompletionRequestArgs, ImageUrl,
 };
 use async_openai::Client;
 use base64::Engine;
@@ -33,9 +33,12 @@ use crate::config::{self, env_or};
 use crate::conversation::ReplyGeneration;
 use crate::{tools, App};
 
-// The brain is on DeepSeek; vision and embeddings are local. bge-m3 is fixed for
-// the life of a vault: swap it and the stored vectors stop comparing.
-const DEFAULT_MAIN_API_BASE: &str = "https://api.deepseek.com/v1/";
+// bge-m3 is fixed for the life of a vault: swap it and the stored vectors stop
+// comparing. OpenRouter and Ollama use different names for the same vision model.
+const DEFAULT_MAIN_API_BASE: &str = "https://api.deepseek.com/v1";
+const DEFAULT_OPENROUTER_API_BASE: &str = "https://openrouter.ai/api/v1";
+const DEFAULT_VISION_MODEL: &str = "qwen/qwen3-vl-32b-instruct";
+const DEFAULT_LOCAL_VISION_MODEL: &str = "qwen3-vl:32b-instruct";
 const EMBED_MODEL: &str = "bge-m3";
 
 // Low temperature keeps her in character rather than loose.
@@ -46,6 +49,11 @@ const MAX_TOOL_ITERS: usize = 8;
 // Cap the vision model's output so it can't run away reasoning instead of just
 // describing the picture.
 const VISION_NUM_PREDICT: i32 = 300;
+const VISION_PROMPT: &str =
+    "Look at this image carefully. Describe the main visible subject first, then one or two \
+     details that are actually clear. Use plain natural wording with no preamble such as \
+     'the image shows'. Do not guess from a blurry background; if something is unclear, say so \
+     in one short sentence.";
 
 // A local backend stumbles — a model still cold-loading under memory pressure, a
 // connection blip — and we retry rather than surface it, or she reads the failure
@@ -62,30 +70,46 @@ pub fn required_ollama_models(vision_model: &str) -> [String; 2] {
 
 pub struct Brain {
     openai: Client<OpenAIConfig>,
+    vision_openrouter: Option<Client<OpenAIConfig>>,
     ollama: Ollama,
     main_model: String,
-    pub vision_model: String,
+    vision_model: String,
+    pub local_vision_model: String,
     // Every request is capped here so a slow backend can't wedge the heartbeat.
     // DeepSeek is fast, but a local vision model can cold-load for tens of
     // seconds, so the default is generous and env-overridable.
     request_timeout: Duration,
+    vision_api_timeout: Duration,
 }
 
 impl Brain {
     pub fn from_env() -> Result<Self> {
         let openai_config = OpenAIConfig::new()
-            .with_api_base(env_or("NEKORA_MAIN_API_BASE", DEFAULT_MAIN_API_BASE))
+            .with_api_base(api_base("NEKORA_MAIN_API_BASE", DEFAULT_MAIN_API_BASE))
             .with_api_key(env_or("DEEPSEEK_API_KEY", ""));
+        let openrouter_api_key = env_or("OPENROUTER_API_KEY", "");
+        let vision_openrouter = if openrouter_api_key.trim().is_empty() {
+            None
+        } else {
+            let config = OpenAIConfig::new()
+                .with_api_base(api_base("OPENROUTER_API_BASE", DEFAULT_OPENROUTER_API_BASE))
+                .with_api_key(openrouter_api_key);
+            Some(Client::with_config(config))
+        };
         let timeout_secs: u64 = env_or("NEKORA_REQUEST_TIMEOUT", "120").parse()?;
+        let vision_api_timeout_secs: u64 = env_or("NEKORA_VISION_API_TIMEOUT", "30").parse()?;
         Ok(Self {
             openai: Client::with_config(openai_config),
+            vision_openrouter,
             ollama: crate::ollama::client_from_host(&env_or(
                 "OLLAMA_HOST",
                 "http://127.0.0.1:11434",
             )),
             main_model: env_or("NEKORA_MAIN_MODEL", "deepseek-v4-flash"),
-            vision_model: env_or("NEKORA_VISION_MODEL", "qwen2.5vl:3b"),
+            vision_model: env_or("NEKORA_VISION_MODEL", DEFAULT_VISION_MODEL),
+            local_vision_model: env_or("NEKORA_LOCAL_VISION_MODEL", DEFAULT_LOCAL_VISION_MODEL),
             request_timeout: Duration::from_secs(timeout_secs),
+            vision_api_timeout: Duration::from_secs(vision_api_timeout_secs),
         })
     }
 
@@ -163,29 +187,88 @@ impl Brain {
         }
     }
 
-    /// Describe an incoming image so the text-only turn can "see" it, on the local
-    /// vision model. Retries transient load failures and an empty caption — a local
-    /// model that overflows its reasoning returns nothing.
+    /// Describe an incoming image so the text-only turn can "see" it. OpenRouter
+    /// gets one bounded attempt; any failure falls back to the local model.
     pub async fn caption_image(&self, image_bytes: &[u8]) -> Result<String> {
         let base64 = base64::engine::general_purpose::STANDARD.encode(image_bytes);
+        let openrouter_error = if let Some(client) = &self.vision_openrouter {
+            match self
+                .caption_image_openrouter(client, image_bytes, &base64)
+                .await
+            {
+                Ok(caption) => return Ok(caption),
+                Err(error) => Some(error),
+            }
+        } else {
+            None
+        };
+
+        match self.caption_image_local(&base64).await {
+            Ok(caption) => Ok(caption),
+            Err(local_error) => match openrouter_error {
+                Some(openrouter_error) => Err(anyhow!(
+                    "openrouter vision failed: {openrouter_error:#}; \
+                     local vision fallback failed: {local_error:#}"
+                )),
+                None => Err(local_error),
+            },
+        }
+    }
+
+    #[allow(deprecated)] // OpenRouter documents max_tokens for this model.
+    async fn caption_image_openrouter(
+        &self,
+        client: &Client<OpenAIConfig>,
+        image_bytes: &[u8],
+        base64: &str,
+    ) -> Result<String> {
+        let media_type = image_media_type(image_bytes)
+            .ok_or_else(|| anyhow!("unsupported image format for OpenRouter vision"))?;
+        let image_url = format!("data:{media_type};base64,{base64}");
+        let content = ChatCompletionRequestUserMessageContent::Array(vec![
+            ChatCompletionRequestMessageContentPartText {
+                text: VISION_PROMPT.to_string(),
+            }
+            .into(),
+            ChatCompletionRequestMessageContentPartImage {
+                image_url: ImageUrl::from(image_url),
+            }
+            .into(),
+        ]);
+        let request = CreateChatCompletionRequestArgs::default()
+            .model(self.vision_model.as_str())
+            .temperature(TEMPERATURE)
+            .max_tokens(VISION_NUM_PREDICT as u32)
+            .messages(vec![ChatCompletionRequestUserMessage::from(content).into()])
+            .build()?;
+        let response = tokio::time::timeout(self.vision_api_timeout, client.chat().create(request))
+            .await
+            .map_err(|_| anyhow!("openrouter vision timed out"))??;
+        response
+            .choices
+            .into_iter()
+            .next()
+            .and_then(|choice| choice.message.content)
+            .map(|caption| caption.trim().to_string())
+            .filter(|caption| !caption.is_empty())
+            .ok_or_else(|| anyhow!("openrouter vision returned no caption"))
+    }
+
+    /// A cold local model may need retries, unlike the cloud attempt where a
+    /// quick fallback is more useful.
+    async fn caption_image_local(&self, base64: &str) -> Result<String> {
         let caption = self
             .retry(
                 || async {
-                    let message = ChatMessage::user(
-                        "Look at this image carefully. Describe the main visible subject first, \
-                         then one or two details that are actually clear. Use plain natural \
-                         wording with no preamble such as 'the image shows'. Do not guess from \
-                         a blurry background; if something is unclear, say so in one short \
-                         sentence."
-                            .into(),
-                    )
-                    .with_images(vec![Image::from_base64(base64.as_str())]);
-                    let request = ChatMessageRequest::new(self.vision_model.clone(), vec![message])
-                        .options(
-                            ModelOptions::default()
-                                .num_ctx(32_768)
-                                .num_predict(VISION_NUM_PREDICT),
-                        );
+                    let message = ChatMessage::user(VISION_PROMPT.into())
+                        .with_images(vec![Image::from_base64(base64)]);
+                    let request =
+                        ChatMessageRequest::new(self.local_vision_model.clone(), vec![message])
+                            .options(
+                                ModelOptions::default()
+                                    .num_ctx(32_768)
+                                    .num_predict(VISION_NUM_PREDICT),
+                            );
                     let response = self.ollama.send_chat_messages(request).await?;
                     Ok(response.message.content.trim().to_string())
                 },
@@ -226,6 +309,27 @@ impl Brain {
             }
         }
         Err(last_error.unwrap_or_else(|| anyhow!("backend rejected the result after retries")))
+    }
+}
+
+fn api_base(key: &str, default: &str) -> String {
+    env_or(key, default)
+        .trim()
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP".as_slice()) {
+        Some("image/webp")
+    } else {
+        None
     }
 }
 

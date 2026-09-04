@@ -67,20 +67,22 @@ Questions, updates, and the living Nekora instance:
 ## Technical details
 
 The main model handles conversation and tool calls through an OpenAI-compatible
-API. Ollama stays local and provides the two things that benefit most from
-being close to the vault: embeddings and vision.
+API. Vision prefers OpenRouter and falls back to Ollama; embeddings stay local
+so an existing vault always uses the same vector space.
 
 | Part | Default | Role |
 | --- | --- | --- |
 | Main model | `deepseek-v4-flash` | conversation, reflection, memory distillation, tool loop |
-| Main endpoint | `https://api.deepseek.com/v1/` | OpenAI-compatible chat API |
+| Main endpoint | `https://api.deepseek.com/v1` | OpenAI-compatible chat API |
 | Embeddings | `bge-m3` through Ollama | semantic recall over diary notes |
-| Vision | `qwen2.5vl:3b` through Ollama | photos, stickers, GIFs, and video preview frames |
+| Vision | `qwen/qwen3-vl-32b-instruct` through OpenRouter | primary image understanding |
+| Vision fallback | `qwen3-vl:32b-instruct` through Ollama | local recovery when OpenRouter fails or is not configured |
 | Web search | Ollama Cloud, then OpenRouter | current outside information through one `web_search` tool |
 
 The main endpoint and model are configurable, so another compatible API can be
-used without changing the Telegram or memory layers. The local embedder should
-remain stable for an existing vault: stored vectors were made by that model.
+used without changing the Telegram or memory layers. OpenRouter vision has its
+own short timeout before local fallback. The local embedder should remain stable
+for an existing vault: stored vectors were made by that model.
 
 Web search is cloud-only. `NEKORA_WEB_SEARCH_CHAIN` controls the provider order;
 the default is `ollama,openrouter`. No local search daemon or extra port is
@@ -172,13 +174,14 @@ by the best Telegram preview frame available to the model.
 
 ## Security concerns
 
-The session file is equivalent to a logged-in Telegram account. The main model
-provider receives the text and context sent to it; Ollama receives local vision
-and embedding requests. The vault may contain messages, memories, and their
+The session file is equivalent to a logged-in Telegram account. DeepSeek
+receives text and context sent to the main model; OpenRouter receives images
+sent for cloud vision. Ollama receives fallback vision and embedding requests.
+The vault may contain messages, memories, and their
 embeddings. Treat all three as private state and use a dedicated account.
 Search queries and returned source text also pass through the configured cloud
 providers. `OLLAMA_API_KEY` is for Ollama Cloud web search; local embeddings and
-vision still use `OLLAMA_HOST`.
+fallback vision still use `OLLAMA_HOST`.
 
 # Deployment
 
@@ -189,7 +192,8 @@ For a local build you need:
 - Rust and Cargo
 - a Telegram API ID and API hash
 - a DeepSeek API key, or another OpenAI-compatible main endpoint
-- Ollama with `bge-m3` and the configured vision model available
+- an OpenRouter API key for primary cloud vision
+- Ollama 0.12.7 or newer with `bge-m3` and the configured local fallback vision model available
 - API keys for every provider listed in `NEKORA_WEB_SEARCH_CHAIN`
 
 Get the Telegram API credentials from Telegram's developer portal. Nekora uses
@@ -203,7 +207,7 @@ Start Ollama separately and pull the two default local models:
 ```sh
 ollama serve
 ollama pull bge-m3
-ollama pull qwen2.5vl:3b
+ollama pull qwen3-vl:32b-instruct
 ```
 
 Create a `.env` in the current working directory, normally the repository root:
@@ -213,9 +217,11 @@ TELEGRAM_API_ID=123456
 TELEGRAM_API_HASH=your_telegram_api_hash
 TELEGRAM_PHONE=+10000000000
 DEEPSEEK_API_KEY=your_deepseek_api_key
+OPENROUTER_API_KEY=your_openrouter_api_key
 NEKORA_WEB_SEARCH_CHAIN=ollama,openrouter
 OLLAMA_API_KEY=your_ollama_cloud_api_key
-OPENROUTER_API_KEY=your_openrouter_api_key
+NEKORA_VISION_MODEL=qwen/qwen3-vl-32b-instruct
+NEKORA_LOCAL_VISION_MODEL=qwen3-vl:32b-instruct
 
 PAPIK_NAME=your name
 NEKORA_NAME=Nekora
@@ -253,8 +259,9 @@ Keep the terminal attached for the first interactive Telegram login. The Docker
 image already sets `NEKORA_MANAGE_OLLAMA=1`, `NEKORA_VAULT=/app/vault`,
 `NEKORA_SESSION=/app/vault/nekora`, and the Ollama model directory inside the
 volume. The first start can take a while while the models are downloaded.
-The local Ollama process is still used only for embeddings and vision; cloud web
-search does not need another container or an exposed search port.
+The local Ollama process is used for embeddings and vision fallback; cloud web
+search does not need another container or an exposed search port. The default
+32B fallback download is about 21 GB, so the first managed start can be long.
 
 ## VPS
 
@@ -275,19 +282,21 @@ but already-exported environment variables win over it.
 | `TELEGRAM_API_HASH` | empty | Telegram application hash; required for login |
 | `TELEGRAM_PHONE` | prompt | account phone in international format |
 | `DEEPSEEK_API_KEY` | empty | key for the main OpenAI-compatible endpoint |
-| `NEKORA_MAIN_API_BASE` | DeepSeek `/v1/` | main chat endpoint |
+| `NEKORA_MAIN_API_BASE` | `https://api.deepseek.com/v1` | main chat endpoint |
 | `NEKORA_MAIN_MODEL` | `deepseek-v4-flash` | main chat model |
 | `NEKORA_WEB_SEARCH_CHAIN` | `ollama,openrouter` | ordered cloud search providers |
 | `OLLAMA_API_KEY` | empty | Ollama Cloud web search key |
 | `OLLAMA_WEB_SEARCH_URL` | `https://ollama.com/api/web_search` | Ollama Search endpoint |
-| `OPENROUTER_API_KEY` | empty | OpenRouter fallback key |
+| `OPENROUTER_API_KEY` | empty | primary vision and OpenRouter web-search key |
 | `OPENROUTER_API_BASE` | `https://openrouter.ai/api/v1` | OpenRouter API base |
 | `OPENROUTER_WEB_SEARCH_MODEL` | `openai/gpt-4.1-mini` | model used by the OpenRouter search tool |
 | `OPENROUTER_WEB_SEARCH_ENGINE` | `auto` | OpenRouter search engine selection |
+| `NEKORA_VISION_MODEL` | `qwen/qwen3-vl-32b-instruct` | primary OpenRouter vision model |
+| `NEKORA_LOCAL_VISION_MODEL` | `qwen3-vl:32b-instruct` | local Ollama vision fallback |
+| `NEKORA_VISION_API_TIMEOUT` | `30` | seconds before cloud vision falls back to Ollama |
 | `NEKORA_WEB_SEARCH_TIMEOUT` | `30` | seconds allowed for one search request |
 | `NEKORA_WEB_SEARCH_COOLDOWN` | `300` | seconds to skip a rate-limited provider |
 | `OLLAMA_HOST` | `http://127.0.0.1:11434` | Ollama server address |
-| `NEKORA_VISION_MODEL` | `qwen2.5vl:3b` | local vision model |
 | `NEKORA_MANAGE_OLLAMA` | unset | set to `1` to start and prepare Ollama automatically |
 | `NEKORA_OLLAMA_START_TIMEOUT` | `120` | seconds to wait for managed Ollama |
 | `NEKORA_REQUEST_TIMEOUT` | `120` | seconds allowed for a model request |
