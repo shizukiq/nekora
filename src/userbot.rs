@@ -1165,7 +1165,7 @@ fn reaction_summary_with_actors(
     let mut summary = reaction_summary_raw(reactions);
     let reactions = reaction_list
         .filter(|reactions| !reactions.is_empty())
-        .or_else(|| match reactions {
+        .or(match reactions {
             tl::enums::MessageReactions::Reactions(reactions) => {
                 reactions.recent_reactions.as_deref()
             }

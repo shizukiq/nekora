@@ -76,7 +76,7 @@ so an existing vault always uses the same vector space.
 | Main endpoint | `https://api.deepseek.com/v1` | OpenAI-compatible chat API |
 | Embeddings | `bge-m3` through Ollama | semantic recall over diary notes |
 | Vision | `qwen/qwen3-vl-32b-instruct` through OpenRouter | primary image understanding |
-| Vision fallback | `qwen3-vl:32b-instruct` through Ollama | local recovery when OpenRouter fails or is not configured |
+| Vision fallback | `qwen2.5vl:3b` through Ollama | local recovery when OpenRouter fails or is not configured |
 | Web search | Ollama Cloud, then OpenRouter | current outside information through one `web_search` tool |
 
 The main endpoint and model are configurable, so another compatible API can be
@@ -207,7 +207,7 @@ Start Ollama separately and pull the two default local models:
 ```sh
 ollama serve
 ollama pull bge-m3
-ollama pull qwen3-vl:32b-instruct
+ollama pull qwen2.5vl:3b
 ```
 
 Create a `.env` in the current working directory, normally the repository root:
@@ -221,7 +221,7 @@ OPENROUTER_API_KEY=your_openrouter_api_key
 NEKORA_WEB_SEARCH_CHAIN=ollama,openrouter
 OLLAMA_API_KEY=your_ollama_cloud_api_key
 NEKORA_VISION_MODEL=qwen/qwen3-vl-32b-instruct
-NEKORA_LOCAL_VISION_MODEL=qwen3-vl:32b-instruct
+NEKORA_LOCAL_VISION_MODEL=qwen2.5vl:3b
 
 PAPIK_NAME=your name
 NEKORA_NAME=Nekora
@@ -261,7 +261,7 @@ image already sets `NEKORA_MANAGE_OLLAMA=1`, `NEKORA_VAULT=/app/vault`,
 volume. The first start can take a while while the models are downloaded.
 The local Ollama process is used for embeddings and vision fallback; cloud web
 search does not need another container or an exposed search port. The default
-32B fallback download is about 21 GB, so the first managed start can be long.
+3B fallback download is about 3 GB, so the first managed start can still take a bit.
 
 ## VPS
 
@@ -292,7 +292,7 @@ but already-exported environment variables win over it.
 | `OPENROUTER_WEB_SEARCH_MODEL` | `openai/gpt-4.1-mini` | model used by the OpenRouter search tool |
 | `OPENROUTER_WEB_SEARCH_ENGINE` | `auto` | OpenRouter search engine selection |
 | `NEKORA_VISION_MODEL` | `qwen/qwen3-vl-32b-instruct` | primary OpenRouter vision model |
-| `NEKORA_LOCAL_VISION_MODEL` | `qwen3-vl:32b-instruct` | local Ollama vision fallback |
+| `NEKORA_LOCAL_VISION_MODEL` | `qwen2.5vl:3b` | local Ollama vision fallback |
 | `NEKORA_VISION_API_TIMEOUT` | `30` | seconds before cloud vision falls back to Ollama |
 | `NEKORA_WEB_SEARCH_TIMEOUT` | `30` | seconds allowed for one search request |
 | `NEKORA_WEB_SEARCH_COOLDOWN` | `300` | seconds to skip a rate-limited provider |

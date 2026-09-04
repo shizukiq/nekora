@@ -329,7 +329,7 @@ impl Diary {
         if active.is_empty() {
             return None;
         }
-        let entry = if unix_nanos() % 5 == 0 {
+        let entry = if unix_nanos().is_multiple_of(5) {
             active.get(unix_nanos() as usize % active.len())?
         } else {
             active.iter().max_by(|left, right| left.id.cmp(&right.id))?

@@ -34,11 +34,12 @@ use crate::conversation::ReplyGeneration;
 use crate::{tools, App};
 
 // bge-m3 is fixed for the life of a vault: swap it and the stored vectors stop
-// comparing. OpenRouter and Ollama use different names for the same vision model.
+// comparing. Vision prefers OpenRouter's 32B; the local Ollama fallback is a small
+// 3B so a host without a GPU can still caption when the cloud path is down.
 const DEFAULT_MAIN_API_BASE: &str = "https://api.deepseek.com/v1";
 const DEFAULT_OPENROUTER_API_BASE: &str = "https://openrouter.ai/api/v1";
 const DEFAULT_VISION_MODEL: &str = "qwen/qwen3-vl-32b-instruct";
-const DEFAULT_LOCAL_VISION_MODEL: &str = "qwen3-vl:32b-instruct";
+const DEFAULT_LOCAL_VISION_MODEL: &str = "qwen2.5vl:3b";
 const EMBED_MODEL: &str = "bge-m3";
 
 // Low temperature keeps her in character rather than loose.
