@@ -217,6 +217,7 @@ async fn dispatch(
             let chat_id = args
                 .get("chat_id")
                 .and_then(Value::as_i64)
+                .or_else(|| generation.map(|generation| generation.chat_id()))
                 .ok_or_else(|| anyhow!("missing chat_id"))?;
             let text = str_arg(&args, "text")?;
             let reply_to_message_id = optional_message_id(&args, "reply_to_message_id")?;

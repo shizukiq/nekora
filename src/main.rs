@@ -30,7 +30,7 @@ use anyhow::{anyhow, bail, Result};
 use chrono::Local;
 use grammers_client::client::UpdatesConfiguration;
 use grammers_client::session::storages::SqliteSession;
-use grammers_client::session::types::PeerId;
+use grammers_client::session::types::{PeerId, PeerKind};
 use grammers_client::tl;
 use grammers_client::update::Update;
 use grammers_client::{Client, SenderPool};
@@ -559,9 +559,12 @@ async fn ingest(app: &Arc<App>, updates: &mut grammers_client::client::UpdateStr
                 if app.userbot.is_broadcast_channel(chat_id).await {
                     continue;
                 }
-                // Invalidate a running reply before putting the described message
-                // in the conversation queue.
-                app.message_arrived(chat_id);
+                // A new private message supersedes a reply that is still being
+                // generated. Group messages stay queued for the next batch, so a
+                // busy chat does not repeatedly cancel the current answer.
+                if message.peer_id().kind() == PeerKind::User {
+                    app.message_arrived(chat_id);
+                }
                 app.heartbeat.lock().unwrap().wake();
                 app.wake.notify_one();
                 let now_ms = app.monotonic_ms();
