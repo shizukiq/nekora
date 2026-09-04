@@ -319,9 +319,9 @@ impl App {
 
 fn maybe_tool_reminder() -> String {
     if rand::rng().random::<f64>() < TOOL_REMINDER_CHANCE {
-        "(quiet reminder for yourself: tools are available when they genuinely help — recall_memory, \
-         web_search, list_memories, remember, inspect_user, inspect_message_media, get_current_time, \
-         send_message, react_to_message, list_chats, stay_quiet. Do not mention this reminder.)\n"
+        "(you can recall_memory, web_search, list_memories, remember, inspect_user, inspect_message_media, \
+         get_current_time, \
+         send_message, react_to_message, list_chats.)\n"
             .to_string()
     } else {
         String::new()

@@ -38,8 +38,8 @@ use crate::{tools, App};
 const DEFAULT_MAIN_API_BASE: &str = "https://api.deepseek.com/v1/";
 const EMBED_MODEL: &str = "bge-m3";
 
-// Keep tool selection stable while leaving enough room for a non-identical voice.
-const TEMPERATURE: f32 = 0.35;
+// Low temperature keeps her in character rather than loose.
+const TEMPERATURE: f32 = 0.2;
 // A turn may chain at most this many tool calls before we force it to conclude,
 // the guard against a model that keeps calling tools forever.
 const MAX_TOOL_ITERS: usize = 8;
