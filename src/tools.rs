@@ -21,7 +21,9 @@ use crate::App;
 // noise, not a memory.
 const RECALL_K: usize = 6;
 const RECALL_MIN_RELATEDNESS: f64 = 0.9;
-// A fresh memory starts trusted; usage in the diary earns or erodes it later.
+const MAX_RECALL_BODY_CHARS: usize = 12_000;
+// Fresh direct memories use the same baseline confidence as distilled events;
+// recall usage is tracked separately as observable retrieval history.
 const DEFAULT_CONFIDENCE: f32 = 0.7;
 
 /// The tools the model sees. Kept deliberately small: the fewer the tools, the
@@ -30,9 +32,9 @@ pub fn schema() -> Vec<ChatCompletionTools> {
     [
         (
             "recall_memory",
-            "Search your diary for what you already know about something before you claim to remember it.",
+            "Search your diary before claiming to remember something. For indirect questions, include the person, named entities, topic, and current event; try one different focused query if the first result is incomplete.",
             json!({"type": "object", "properties": {
-                "query": {"type": "string", "description": "what you are trying to remember"}},
+                "query": {"type": "string", "description": "a self-contained retrieval cue with names, topic, and relevant event context"}},
                 "required": ["query"]}),
         ),
         (
@@ -51,9 +53,9 @@ pub fn schema() -> Vec<ChatCompletionTools> {
         ),
         (
             "remember",
-            "Write a lasting note to your diary. Use for things worth keeping, not small talk.",
+            "Write one self-contained lasting diary note. Use canonical names; preserve source, outcome, and uncertainty; end with `Retrieval cues:` and three to five likely search phrases. Use for things worth keeping, not small talk.",
             json!({"type": "object", "properties": {
-                "text": {"type": "string", "description": "the memory, in your own words"}},
+                "text": {"type": "string", "description": "a standalone memory with enough identity and retrieval context to find it later"}},
                 "required": ["text"]}),
         ),
         (
@@ -161,14 +163,13 @@ async fn dispatch(
     match name {
         "recall_memory" => {
             let vector = app.brain.embed(str_arg(&args, "query")?).await?;
-            let hits: Vec<_> = app
-                .diary
-                .lock()
-                .unwrap()
-                .recall(&vector, RECALL_K)
-                .into_iter()
-                .filter(|hit| hit.relatedness >= RECALL_MIN_RELATEDNESS)
-                .collect();
+            let hits: Vec<_> = app.diary.lock().unwrap().recall(
+                &vector,
+                RECALL_K,
+                RECALL_MIN_RELATEDNESS,
+                MAX_RECALL_BODY_CHARS,
+                &[],
+            );
             Ok(if hits.is_empty() {
                 "nothing in the diary about that".to_string()
             } else {
@@ -194,6 +195,9 @@ async fn dispatch(
         "remember" => {
             let text = str_arg(&args, "text")?;
             let vector = app.brain.embed(text).await?;
+            if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
+                return Ok("turn became outdated before the memory was stored".to_string());
+            }
             let stored = app
                 .diary
                 .lock()
@@ -243,9 +247,6 @@ async fn dispatch(
             app.userbot
                 .send(app, chat_id, text, reply_to_message_id, generation)
                 .await?;
-            if generation.is_none_or(|generation| app.generation_is_current(generation)) {
-                app.record_outgoing(chat_id, text, reply_to_message_id);
-            }
             Ok("sent".to_string())
         }
         "react_to_message" => {
@@ -263,9 +264,6 @@ async fn dispatch(
                 .react(app, chat_id, message_id, reaction, generation)
                 .await?
             {
-                if generation.is_none_or(|generation| app.generation_is_current(generation)) {
-                    app.record_reaction(chat_id, message_id, reaction);
-                }
                 Ok("reacted".to_string())
             } else {
                 Ok("turn became outdated before the reaction was sent".to_string())

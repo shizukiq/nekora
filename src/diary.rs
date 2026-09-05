@@ -1,7 +1,7 @@
 //! Long-term memory: the markdown vault and the cosine recall over it.
 //!
 //! Each memory is one `.md` note — a frontmatter block (confidence, usage,
-//! last_used, and the raw embedding) over a first-person body. Recall is a plain
+//! last_used, and the raw embedding) over a memory body. Recall is a plain
 //! linear cosine scan; the vault is small enough that a note is a page she flips
 //! to, not a row in a database. The embeddings are handed in from outside — the
 //! diary never decides what a vector means, only which stored ones are nearest.
@@ -21,6 +21,7 @@ const DEDUP_RELATEDNESS: f64 = 0.95;
 // The ceiling on a single `list_memories` answer, so "what do you remember" can
 // never dump an unbounded wall of notes.
 const MAX_LISTED_MEMORIES: usize = 100;
+const MAX_LISTED_MEMORY_CHARS: usize = 12_000;
 const MAX_GRAPH_LINKS: usize = 4;
 const GRAPH_RELATEDNESS: f64 = 0.78;
 const WORKING_MEMORY_FILE: &str = "working_memory";
@@ -42,6 +43,7 @@ struct DiaryEntry {
 pub struct Recall {
     pub id: String,
     pub relatedness: f64,
+    pub confidence: f32,
     pub body: String,
 }
 
@@ -169,16 +171,40 @@ impl Diary {
     }
 
     /// File a memory, unless it is a near-duplicate of one already held. Returns
-    /// the new note's index, or `None` when it was dropped as a duplicate; `Err`
+    /// the new note's id, or `None` when it was dropped as a duplicate; `Err`
     /// only when the note could not be written to disk.
     pub fn remember(
         &mut self,
         body: &str,
         embedding: &[f32],
         confidence: f32,
-    ) -> std::io::Result<Option<usize>> {
+    ) -> std::io::Result<Option<String>> {
+        self.remember_excluding(body, embedding, confidence, &[])
+    }
+
+    /// Store a consolidation result without rejecting it merely because it is
+    /// close to the source notes it is meant to replace.
+    pub fn remember_replacement(
+        &mut self,
+        body: &str,
+        embedding: &[f32],
+        confidence: f32,
+        source_ids: &[String],
+    ) -> std::io::Result<Option<String>> {
+        self.remember_excluding(body, embedding, confidence, source_ids)
+    }
+
+    fn remember_excluding(
+        &mut self,
+        body: &str,
+        embedding: &[f32],
+        confidence: f32,
+        excluded_ids: &[String],
+    ) -> std::io::Result<Option<String>> {
         let too_close = self.entries.iter().any(|entry| {
-            !entry.retired && relatedness(embedding, &entry.embedding) > DEDUP_RELATEDNESS
+            !entry.retired
+                && !excluded_ids.iter().any(|id| id == &entry.id)
+                && relatedness(embedding, &entry.embedding) > DEDUP_RELATEDNESS
         });
         if too_close {
             return Ok(None);
@@ -190,7 +216,7 @@ impl Diary {
             .map(|entry| entry.file_name.clone())
             .collect::<HashSet<_>>();
         let file_name = unique_file_name(&title, &occupied);
-        let links = self.graph_links(embedding, None);
+        let links = self.graph_links(embedding, None, excluded_ids);
         let id = self.next_id();
         let entry = DiaryEntry {
             id,
@@ -205,6 +231,7 @@ impl Diary {
             links,
         };
         self.write_note(&entry)?;
+        let id = entry.id.clone();
         for existing in &mut self.entries {
             if entry.links.iter().any(|link| link == &existing.file_name)
                 && !existing.links.contains(&entry.file_name)
@@ -214,33 +241,53 @@ impl Diary {
             }
         }
         self.entries.push(entry);
-        Ok(Some(self.entries.len() - 1))
+        Ok(Some(id))
     }
 
-    /// The `limit` nearest memories to `embedding`, most related first. Each one
-    /// returned is touched — usage up, last_used now — so heavily recalled notes
-    /// can be told apart from dead weight later.
-    pub fn recall(&mut self, embedding: &[f32], limit: usize) -> Vec<Recall> {
+    /// The `limit` nearest memories above `minimum_relatedness`, most related
+    /// first. Only returned notes are touched, so usage reflects context the
+    /// model actually received.
+    pub fn recall(
+        &mut self,
+        embedding: &[f32],
+        limit: usize,
+        minimum_relatedness: f64,
+        max_body_chars: usize,
+        excluded: &[String],
+    ) -> Vec<Recall> {
         let mut scored: Vec<(usize, f64)> = self
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| !entry.retired)
+            .filter(|(_, entry)| !entry.retired && !excluded.iter().any(|id| id == &entry.id))
             .map(|(index, entry)| (index, relatedness(embedding, &entry.embedding)))
+            .filter(|(_, score)| *score >= minimum_relatedness)
             .collect();
         scored.sort_by(|a, b| b.1.total_cmp(&a.1));
         scored.truncate(limit);
 
         let now = unix_seconds();
+        let mut remaining = max_body_chars;
         scored
             .into_iter()
-            .map(|(index, score)| {
+            .filter_map(|(index, score)| {
+                if remaining == 0 {
+                    return None;
+                }
+                let mut chars = self.entries[index].body.chars();
+                let mut body: String = chars.by_ref().take(remaining).collect();
+                remaining -= body.chars().count();
+                if chars.next().is_some() {
+                    body.pop();
+                    body.push('…');
+                }
                 self.touch(index, now);
-                Recall {
+                Some(Recall {
                     id: self.entries[index].id.clone(),
                     relatedness: score,
-                    body: self.entries[index].body.clone(),
-                }
+                    confidence: self.entries[index].confidence,
+                    body,
+                })
             })
             .collect()
     }
@@ -261,22 +308,28 @@ impl Diary {
         } else {
             limit
         };
-        let count = requested.min(MAX_LISTED_MEMORIES).min(order.len());
-        let memories = order[..count]
-            .iter()
-            .map(|&index| {
-                let entry = &self.entries[index];
-                Memory {
-                    id: entry.id.clone(),
-                    confidence: entry.confidence,
-                    usage: entry.usage,
-                    body: entry.body.clone(),
-                }
-            })
-            .collect();
+        let mut remaining_chars = MAX_LISTED_MEMORY_CHARS;
+        let mut body_truncated = false;
+        let mut memories = Vec::new();
+        for &index in order.iter().take(requested.min(MAX_LISTED_MEMORIES)) {
+            if remaining_chars == 0 {
+                break;
+            }
+            let entry = &self.entries[index];
+            let mut chars = entry.body.chars();
+            let body: String = chars.by_ref().take(remaining_chars).collect();
+            body_truncated |= chars.next().is_some();
+            remaining_chars -= body.chars().count();
+            memories.push(Memory {
+                id: entry.id.clone(),
+                confidence: entry.confidence,
+                usage: entry.usage,
+                body,
+            });
+        }
         MemoryList {
+            truncated: body_truncated || memories.len() < order.len(),
             memories,
-            truncated: count < order.len(),
         }
     }
 
@@ -349,11 +402,16 @@ impl Diary {
         embedding: &[f32],
         limit: usize,
         minimum_relatedness: f64,
+        excluded: &[String],
     ) -> Vec<Memory> {
         let mut scored: Vec<(&DiaryEntry, f64)> = self
             .entries
             .iter()
-            .filter(|entry| !entry.retired && entry.id != target_id)
+            .filter(|entry| {
+                !entry.retired
+                    && entry.id != target_id
+                    && !excluded.iter().any(|id| id == &entry.id)
+            })
             .map(|entry| (entry, relatedness(embedding, &entry.embedding)))
             .filter(|(_, score)| *score >= minimum_relatedness)
             .collect();
@@ -398,7 +456,12 @@ impl Diary {
         write_note_to(&self.directory, entry)
     }
 
-    fn graph_links(&self, embedding: &[f32], excluded_file_name: Option<&str>) -> Vec<String> {
+    fn graph_links(
+        &self,
+        embedding: &[f32],
+        excluded_file_name: Option<&str>,
+        excluded_ids: &[String],
+    ) -> Vec<String> {
         if embedding.is_empty() {
             return Vec::new();
         }
@@ -408,6 +471,7 @@ impl Diary {
             .filter(|entry| {
                 !entry.retired
                     && Some(entry.file_name.as_str()) != excluded_file_name
+                    && !excluded_ids.iter().any(|id| id == &entry.id)
                     && !entry.embedding.is_empty()
             })
             .map(|entry| {
@@ -440,7 +504,7 @@ impl Diary {
             }
             let file_name = self.entries[index].file_name.clone();
             let embedding = self.entries[index].embedding.clone();
-            for link in self.graph_links(&embedding, Some(&file_name)) {
+            for link in self.graph_links(&embedding, Some(&file_name), &[]) {
                 if self.entries[index].links.len() >= MAX_GRAPH_LINKS {
                     break;
                 }
@@ -544,8 +608,11 @@ fn parse_note(id: &str, raw: &str) -> Option<DiaryEntry> {
     let raw_body = rest[separator + "\n---\n".len()..]
         .trim_matches(|c| c == '\n' || c == '\r')
         .to_string();
-    let (body, body_links) = match raw_body.split_once("\n\nRelated notes:\n") {
-        Some((body, links)) => (body.to_string(), parse_links(links)),
+    let (body, body_links) = match raw_body
+        .rsplit_once("\n\nRelated notes:\n")
+        .and_then(|(body, links)| related_note_links(links).map(|links| (body, links)))
+    {
+        Some((body, links)) => (body.to_string(), links),
         None => (raw_body, Vec::new()),
     };
 
@@ -616,6 +683,22 @@ fn parse_links(value: &str) -> Vec<String> {
         .map(|link| link.split('|').next().unwrap_or(link).trim().to_string())
         .filter(|link| !link.is_empty())
         .collect()
+}
+
+fn related_note_links(value: &str) -> Option<Vec<String>> {
+    let lines = value
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if lines.is_empty()
+        || lines
+            .iter()
+            .any(|line| !line.starts_with("- [[") || !line.ends_with("]]"))
+    {
+        return None;
+    }
+    Some(parse_links(value))
 }
 
 fn memory_title(body: &str) -> String {
@@ -749,28 +832,26 @@ mod tests {
         let mut diary = Diary::new(vault.clone());
         assert!(diary.open());
 
-        assert_eq!(
-            diary.remember("apple", &[1.0, 0.0, 0.0, 0.0], 0.0).unwrap(),
-            Some(0)
-        );
-        assert_eq!(
-            diary
-                .remember("banana", &[0.0, 1.0, 0.0, 0.0], 0.0)
-                .unwrap(),
-            Some(1)
-        );
+        assert!(diary
+            .remember("apple", &[1.0, 0.0, 0.0, 0.0], 0.0)
+            .unwrap()
+            .is_some());
+        assert!(diary
+            .remember("banana", &[0.0, 1.0, 0.0, 0.0], 0.0)
+            .unwrap()
+            .is_some());
         let escaped = "cherry \"red\"\nline";
-        assert_eq!(
-            diary.remember(escaped, &[0.0, 0.0, 1.0, 0.0], 0.0).unwrap(),
-            Some(2)
-        );
+        assert!(diary
+            .remember(escaped, &[0.0, 0.0, 1.0, 0.0], 0.0)
+            .unwrap()
+            .is_some());
 
-        let hits = diary.recall(&[0.9, 0.1, 0.0, 0.0], 2);
+        let hits = diary.recall(&[0.9, 0.1, 0.0, 0.0], 2, 0.0, 12_000, &[]);
         assert_eq!(hits[0].body, "apple");
         assert!(hits[0].relatedness > hits[1].relatedness);
 
         // A body with quotes and a newline round-trips through the vault intact.
-        let escaped_hits = diary.recall(&[0.0, 0.0, 1.0, 0.0], 1);
+        let escaped_hits = diary.recall(&[0.0, 0.0, 1.0, 0.0], 1, 0.0, 12_000, &[]);
         assert_eq!(escaped_hits[0].body, escaped);
 
         // A near-copy of apple is refused as a duplicate.

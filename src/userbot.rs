@@ -9,7 +9,7 @@
 //! blasting: a short "typing…" and a delay drawn from a words-per-minute band, so
 //! a long line takes longer to land than a short one.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -52,6 +52,7 @@ const REPLY_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 // Telegram's per-message ceiling; the splitter breaks a long reply on this.
 const MAX_BUBBLE_BYTES: usize = 4096;
+const MAX_OUTGOING_CHARS: usize = 12_000;
 
 // The markers we wrap incoming media in. A caption or a transcription is
 // attacker-controlled text: it must not be able to forge these and smuggle
@@ -124,6 +125,9 @@ pub struct Userbot {
     // incoming message and every listed dialog — grammers needs the peer's access
     // authority to send, which a bare id doesn't carry.
     peers: Mutex<HashMap<i64, PeerRef>>,
+    // Private chats already verified against Telegram's Contacts category. This
+    // lets the update reader invalidate an old reply before waiting on media I/O.
+    private_contacts: Mutex<HashSet<i64>>,
 }
 
 impl Userbot {
@@ -133,6 +137,7 @@ impl Userbot {
             session,
             brain,
             peers: Mutex::new(HashMap::new()),
+            private_contacts: Mutex::new(HashSet::new()),
         }
     }
 
@@ -205,7 +210,15 @@ impl Userbot {
         if let Ok(Some(peer_ref)) = message.peer_ref().await {
             self.peers.lock().unwrap().insert(chat_id, peer_ref);
         }
-        self.chat_is_in_contact_scope(chat_id).await
+        let accepted = self.chat_is_in_contact_scope(chat_id).await;
+        if accepted {
+            self.private_contacts.lock().unwrap().insert(chat_id);
+        }
+        accepted
+    }
+
+    pub fn is_known_private_contact(&self, chat_id: i64) -> bool {
+        self.private_contacts.lock().unwrap().contains(&chat_id)
     }
 
     /// Check a chat before a delayed or autonomous action reaches Telegram.
@@ -834,15 +847,19 @@ impl Userbot {
             return Ok(());
         }
         let peer = self.resolve_contact_scoped_peer(chat_id).await?;
-        let reply_to_message_id = reply_to_message_id
+        if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
+            return Ok(());
+        }
+        let telegram_reply_to_message_id = reply_to_message_id
             .map(|message_id| {
                 i32::try_from(message_id)
                     .map_err(|_| anyhow!("reply_to_message_id is outside Telegram's range"))
             })
             .transpose()?;
-        let mut parts = split_message(text, MAX_BUBBLE_BYTES);
+        let text: String = text.chars().take(MAX_OUTGOING_CHARS).collect();
+        let mut parts = split_message(&text, MAX_BUBBLE_BYTES);
         if parts.is_empty() {
-            parts.push(text.to_string());
+            parts.push(text);
         }
         for (index, part) in parts.iter().enumerate() {
             if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
@@ -873,10 +890,21 @@ impl Userbot {
             if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
                 return Ok(());
             }
-            let message = InputMessage::new()
-                .text(part.as_str())
-                .reply_to((index == 0).then_some(reply_to_message_id).flatten());
+            let message = InputMessage::new().text(part.as_str()).reply_to(
+                (index == 0)
+                    .then_some(telegram_reply_to_message_id)
+                    .flatten(),
+            );
             self.client.send_message(peer, message).await?;
+            app.record_outgoing(
+                chat_id,
+                part,
+                if index == 0 {
+                    reply_to_message_id
+                } else {
+                    None
+                },
+            );
         }
         Ok(())
     }
@@ -894,19 +922,23 @@ impl Userbot {
         if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
             return Ok(false);
         }
-        let message_id = i32::try_from(message_id)
+        let telegram_message_id = i32::try_from(message_id)
             .map_err(|_| anyhow!("message_id is outside Telegram's range"))?;
         let peer = self.resolve_contact_scoped_peer(chat_id).await?;
+        if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
+            return Ok(false);
+        }
         let reaction = reaction.trim();
         if reaction.is_empty() {
             self.client
-                .send_reactions(peer, message_id, InputReactions::remove())
+                .send_reactions(peer, telegram_message_id, InputReactions::remove())
                 .await?;
         } else {
             self.client
-                .send_reactions(peer, message_id, reaction_input(reaction)?)
+                .send_reactions(peer, telegram_message_id, reaction_input(reaction)?)
                 .await?;
         }
+        app.record_reaction(chat_id, message_id, reaction);
         Ok(true)
     }
 

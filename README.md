@@ -109,9 +109,10 @@ context while the underlying model stays untouched.
 ## Sleeping
 
 Sleep is the maintenance pass for memory. When the current day's context grows
-large, Nekora updates working memory, distils the day's events into durable
-notes, finds related entries, and asks the model to merge, refine, or retire
-redundant pieces. At a day boundary she performs the same consolidation before
+large, Nekora stages bounded chunks while updating working memory, distils the
+day's events into durable notes, then asks the model to merge, refine, or retire
+existing related entries. Newly distilled notes are eligible for that merge on
+the next maintenance pass. At a day boundary she performs the same work before
 moving on to the new day.
 
 ## Thoughts
@@ -133,7 +134,7 @@ There are three kinds of context:
 
 | Context | Lifetime | Purpose |
 | --- | --- | --- |
-| Recent conversation | current process | the last messages needed for a natural reply |
+| Recent conversation | until successful consolidation (across restarts) | the bounded recent tail of the current chat; autonomous reflection may use all chats |
 | Working memory | across turns | short-term tasks, promises, and state |
 | Diary notes | long-term | facts and experiences worth keeping |
 
@@ -306,8 +307,16 @@ but already-exported environment variables win over it.
 | `NEKORA_SESSION` | `nekora` | session path base; `.session` is appended |
 
 To change her personality, create `prompts/system.md`. When that file is not
-present, the built-in Nekora persona is used. The prompt is read relative to
+present, the built-in Nekora persona is used. This file supplies the character
+profile; the core Telegram, context, and tool workflow remains built in so a
+personality edit cannot remove it accidentally. The prompt is read relative to
 the current working directory.
+
+Conversational requests keep only the core workflow and character profile in the
+stable system prefix. Working memory is runtime-derived data and follows in its
+own untrusted user-role block, before per-turn time, recalled diary notes, recent
+events, and incoming messages. Providers with automatic prefix caching can
+therefore reuse the stable part even when working memory changes.
 
 ## Data and state
 
@@ -343,7 +352,7 @@ already excludes `.env`, session files, the vault, and build output.
 | `src/sleep.rs` | working-memory refresh and diary consolidation |
 | `src/userbot.rs` | MTProto login, updates, media, and paced sending |
 | `src/persistence.rs` | atomic filesystem operations for the vault |
-| `src/config.rs` | environment, identity, and persona loading |
+| `src/config.rs` | environment, identity, core prompt, and character profile loading |
 
 ## Development
 

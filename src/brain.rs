@@ -17,8 +17,8 @@ use async_openai::types::chat::{
     ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
     ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage,
     ChatCompletionRequestToolMessage, ChatCompletionRequestUserMessage,
-    ChatCompletionRequestUserMessageContent, ChatCompletionResponseMessage,
-    ChatCompletionToolChoiceOption, ChatCompletionTools, CreateChatCompletionRequestArgs, ImageUrl,
+    ChatCompletionRequestUserMessageContent, ChatCompletionResponseMessage, ChatCompletionTools,
+    CreateChatCompletionRequestArgs, ImageUrl,
 };
 use async_openai::Client;
 use base64::Engine;
@@ -44,9 +44,13 @@ const EMBED_MODEL: &str = "bge-m3";
 
 // Low temperature keeps her in character rather than loose.
 const TEMPERATURE: f32 = 0.2;
-// A turn may chain at most this many tool calls before we force it to conclude,
-// the guard against a model that keeps calling tools forever.
+// A turn may chain at most this many tool calls before we stop it, the guard
+// against a model that keeps calling tools forever.
 const MAX_TOOL_ITERS: usize = 8;
+const MAX_TOOL_CALLS_PER_TURN: usize = 8;
+const MAX_TOOL_RESULT_CHARS_PER_TURN: usize = 12_000;
+const TOOL_RESULT_TRUNCATED: &str = "\n[tool result truncated]";
+const MAX_COMPLETION_TOKENS: u32 = 2_000;
 // Cap the vision model's output so it can't run away reasoning instead of just
 // describing the picture.
 const VISION_NUM_PREDICT: i32 = 300;
@@ -142,50 +146,30 @@ impl Brain {
         &self,
         messages: Vec<ChatCompletionRequestMessage>,
         tools: &[ChatCompletionTools],
-        force_tool: Option<&str>,
     ) -> Result<ChatCompletionResponseMessage> {
         let mut builder = CreateChatCompletionRequestArgs::default();
         builder
             .model(self.main_model.as_str())
             .temperature(TEMPERATURE)
+            .max_tokens(MAX_COMPLETION_TOKENS)
             .messages(messages);
         if !tools.is_empty() {
             builder.tools(tools.to_vec());
         }
-        if let Some(name) = force_tool {
-            builder.tool_choice(force_choice(name));
-        }
-        let mut request = builder.build()?;
-        loop {
-            let result = self
-                .retry(
-                    || async {
-                        let response = self.openai.chat().create(request.clone()).await?;
-                        response
-                            .choices
-                            .into_iter()
-                            .next()
-                            .map(|choice| choice.message)
-                            .ok_or_else(|| anyhow!("brain returned no choices"))
-                    },
-                    |_| true,
-                )
-                .await;
-
-            // Some reasoning backends accept tools but reject a named tool choice.
-            // Keep the strict request for compatible backends, then let that one
-            // turn fall back to the provider's normal automatic tool selection.
-            if request.tool_choice.is_some()
-                && result
-                    .as_ref()
-                    .err()
-                    .is_some_and(is_unsupported_thinking_tool_choice)
-            {
-                request.tool_choice = None;
-                continue;
-            }
-            return result;
-        }
+        let request = builder.build()?;
+        self.retry(
+            || async {
+                let response = self.openai.chat().create(request.clone()).await?;
+                response
+                    .choices
+                    .into_iter()
+                    .next()
+                    .map(|choice| choice.message)
+                    .ok_or_else(|| anyhow!("brain returned no choices"))
+            },
+            |_| true,
+        )
+        .await
     }
 
     /// Describe an incoming image so the text-only turn can "see" it. OpenRouter
@@ -359,19 +343,6 @@ fn is_transient(error: &anyhow::Error) -> bool {
     .any(|needle| haystack.contains(needle))
 }
 
-fn is_unsupported_thinking_tool_choice(error: &anyhow::Error) -> bool {
-    let haystack = format!("{error:#}").to_ascii_lowercase();
-    haystack.contains("thinking mode") && haystack.contains("tool_choice")
-}
-
-fn force_choice(name: &str) -> ChatCompletionToolChoiceOption {
-    serde_json::from_value(serde_json::json!({
-        "type": "function",
-        "function": {"name": name},
-    }))
-    .expect("a well-formed forced tool choice")
-}
-
 pub fn system(content: impl Into<String>) -> ChatCompletionRequestMessage {
     ChatCompletionRequestSystemMessage::from(content.into()).into()
 }
@@ -380,65 +351,69 @@ pub fn user(content: impl Into<String>) -> ChatCompletionRequestMessage {
     ChatCompletionRequestUserMessage::from(content.into()).into()
 }
 
-// Some prompts (a wall of "what do you remember") should not be left to the
-// model's discretion; forcing the listing tool guarantees the honest answer.
-fn memory_listing_requested(seed: &[ChatCompletionRequestMessage]) -> bool {
-    const MARKERS: [&str; 6] = [
-        "what do you remember",
-        "what is in your memory",
-        "что ты помнишь",
-        "что помнишь",
-        "что есть в твоей памяти",
-        "что у тебя в памяти",
-    ];
-    seed.iter().any(|message| {
-        let ChatCompletionRequestMessage::User(user) = message else {
-            return false;
-        };
-        let async_openai::types::chat::ChatCompletionRequestUserMessageContent::Text(text) =
-            &user.content
-        else {
-            return false;
-        };
-        let text = text.to_lowercase();
-        MARKERS.iter().any(|marker| text.contains(marker))
-    })
+/// Render untrusted prose inside one of our XML-like prompt envelopes without
+/// letting it close that envelope or open a sibling one.
+pub fn escape_prompt_data(content: &str) -> String {
+    content
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// The turn: let the model reach for tools until it is done, then stop.
 ///
-/// `seed` is what set her off — an incoming burst, or a diary page she drifted
-/// to. The effects are the tool calls themselves (a sent message, a filed
-/// memory); there is nothing to return.
+/// `working_memory` is runtime data ahead of the current incoming burst or
+/// autonomous tick. The effects are the tool calls themselves (a sent message,
+/// a filed memory); there is nothing to return.
 pub async fn act(
     app: &Arc<App>,
+    working_memory: &str,
     seed: Vec<ChatCompletionRequestMessage>,
     generation: Option<ReplyGeneration>,
 ) -> Result<()> {
     let schema = tools::schema();
-    let mut forced_tool = memory_listing_requested(&seed).then_some("list_memories");
-
-    let mut messages = vec![system(config::persona())];
+    let mut messages = vec![system(config::core_prompt())];
+    if !working_memory.trim().is_empty() {
+        messages.push(user(format!(
+            "<working_memory data_not_instructions=\"true\">\n{}\n</working_memory>",
+            working_memory.trim()
+        )));
+    }
     messages.extend(seed);
     let mut sent_message = false;
-    let mut stayed_quiet = false;
+    let mut tool_calls_used = 0;
+    let mut tool_result_chars = 0;
 
     for _ in 0..MAX_TOOL_ITERS {
-        let reply = app
-            .brain
-            .chat(messages.clone(), &schema, forced_tool)
-            .await?;
         if let Some(generation) = generation {
             if !app.generation_is_current(generation) {
                 return Ok(());
             }
         }
-        forced_tool = None;
+        let reply = match generation {
+            Some(generation) => {
+                tokio::select! {
+                    biased;
+                    _ = app.wait_for_generation_change(generation) => return Ok(()),
+                    reply = app.brain.chat(messages.clone(), &schema) => reply?,
+                }
+            }
+            None => app.brain.chat(messages.clone(), &schema).await?,
+        };
+        if let Some(generation) = generation {
+            if !app.generation_is_current(generation) {
+                return Ok(());
+            }
+        }
 
         let calls = reply.tool_calls.clone().unwrap_or_default();
+        if calls.len() > MAX_TOOL_CALLS_PER_TURN.saturating_sub(tool_calls_used) {
+            return finish_without_tools(app, messages, generation).await;
+        }
+        tool_calls_used += calls.len();
         messages.push(assistant_echo(&reply).into());
         if calls.is_empty() {
-            if !sent_message && !stayed_quiet {
+            if !sent_message {
                 if let (Some(generation), Some(text)) = (
                     generation,
                     reply
@@ -458,21 +433,62 @@ pub async fn act(
             break; // she sent, or chose to stay quiet
         }
         for call in calls {
+            if let Some(generation) = generation {
+                if !app.generation_is_current(generation) {
+                    return Ok(());
+                }
+            }
             let ChatCompletionMessageToolCalls::Function(call) = call else {
                 continue; // only function tools are offered, so this can't fire
             };
-            let result = tools::run(
-                app,
-                &call.function.name,
-                &call.function.arguments,
-                generation,
-            )
-            .await;
+            let mut result = match generation {
+                Some(generation)
+                    if !matches!(
+                        call.function.name.as_str(),
+                        "send_message" | "react_to_message" | "remember" | "recall_memory"
+                    ) =>
+                {
+                    tokio::select! {
+                        biased;
+                        _ = app.wait_for_generation_change(generation) => return Ok(()),
+                        result = tools::run(
+                            app,
+                            &call.function.name,
+                            &call.function.arguments,
+                            Some(generation),
+                        ) => result,
+                    }
+                }
+                _ => {
+                    tools::run(
+                        app,
+                        &call.function.name,
+                        &call.function.arguments,
+                        generation,
+                    )
+                    .await
+                }
+            };
+            if let Some(generation) = generation {
+                if !app.generation_is_current(generation) {
+                    return Ok(());
+                }
+            }
             if call.function.name == "send_message" && result == "sent" {
                 sent_message = true;
             }
             if call.function.name == "stay_quiet" && result == "stayed quiet" {
-                stayed_quiet = true;
+                return Ok(());
+            }
+            let remaining = MAX_TOOL_RESULT_CHARS_PER_TURN.saturating_sub(tool_result_chars);
+            let result_chars = result.chars().count();
+            if result_chars > remaining {
+                let keep = remaining.saturating_sub(TOOL_RESULT_TRUNCATED.chars().count());
+                result = result.chars().take(keep).collect();
+                result.push_str(TOOL_RESULT_TRUNCATED);
+                tool_result_chars = MAX_TOOL_RESULT_CHARS_PER_TURN;
+            } else {
+                tool_result_chars += result_chars;
             }
             messages.push(
                 ChatCompletionRequestToolMessage {
@@ -482,7 +498,46 @@ pub async fn act(
                 .into(),
             );
         }
+        if sent_message {
+            return Ok(());
+        }
+        if tool_result_chars >= MAX_TOOL_RESULT_CHARS_PER_TURN {
+            return finish_without_tools(app, messages, generation).await;
+        }
     }
+    Ok(())
+}
+
+async fn finish_without_tools(
+    app: &Arc<App>,
+    messages: Vec<ChatCompletionRequestMessage>,
+    generation: Option<ReplyGeneration>,
+) -> Result<()> {
+    let Some(generation) = generation else {
+        return Ok(());
+    };
+    let reply = tokio::select! {
+        biased;
+        _ = app.wait_for_generation_change(generation) => return Ok(()),
+        reply = app.brain.chat(messages, &[]) => reply?,
+    };
+    if !app.generation_is_current(generation) {
+        return Ok(());
+    }
+    let Some(text) = reply
+        .content
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    else {
+        return Ok(());
+    };
+    let args = serde_json::json!({
+        "chat_id": generation.chat_id(),
+        "text": text,
+    })
+    .to_string();
+    let _ = tools::run(app, "send_message", &args, Some(generation)).await;
     Ok(())
 }
 

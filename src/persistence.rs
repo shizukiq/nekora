@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 // that will ever be, and the ceiling stops a corrupt or hostile file from being
 // slurped whole into memory.
 const MAX_NOTE_BYTES: u64 = 1 << 20;
+const MAX_RUNTIME_FILE_BYTES: u64 = 16 << 20;
 
 pub fn ensure_directory(directory: &Path) -> bool {
     fs::create_dir_all(directory).is_ok() && directory.is_dir()
@@ -21,8 +22,18 @@ pub fn ensure_directory(directory: &Path) -> bool {
 /// Returns `None` for a missing, oversized, or unreadable file so the caller can
 /// simply skip it rather than abort loading the whole vault.
 pub fn read_file(path: &Path) -> Option<String> {
+    read_file_up_to(path, MAX_NOTE_BYTES)
+}
+
+/// Runtime checkpoints can legitimately contain several bounded events and are
+/// allowed to be larger than one diary note.
+pub fn read_runtime_file(path: &Path) -> Option<String> {
+    read_file_up_to(path, MAX_RUNTIME_FILE_BYTES)
+}
+
+fn read_file_up_to(path: &Path, max_bytes: u64) -> Option<String> {
     let size = fs::metadata(path).ok()?.len();
-    if size > MAX_NOTE_BYTES {
+    if size > max_bytes {
         return None;
     }
     fs::read_to_string(path).ok()

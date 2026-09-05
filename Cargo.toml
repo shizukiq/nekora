@@ -7,7 +7,7 @@ license = "GPL-3"
 
 # One binary, one Nekora. The old Python "hand" and C++ "core" are now one Rust
 # process: the core modules (heartbeat, conversation, diary, persistence) stay
-# pure-std and never touch the network; the I/O modules (brain, tools, userbot,
+# local and never touch the network; the I/O modules (brain, tools, userbot,
 # sleep) do every request through a library, never hand-rolled HTTP.
 [[bin]]
 name = "nekora"
@@ -53,7 +53,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 anyhow = "1"
 
 # The I/O layer's small randomness: the 10% chance she ignores a message, the
-# occasional tool reminder, and the words-per-minute typing jitter. The core has
+# words-per-minute typing jitter. The core has
 # its own std-only PRNG; this is only for the hand.
 rand = "0.9"
 
