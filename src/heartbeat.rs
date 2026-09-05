@@ -5,6 +5,8 @@
 //! doing anything at all. An incoming message can `wake` her out of a nap early,
 //! but it can never make her answer on the spot.
 
+use std::time::Duration;
+
 // A local SplitMix64 keeps the core free of the `rand` crate: the decision loop
 // is std-only on purpose, and one well-distributed generator is all a coin flip
 // needs. It is seeded once at startup, never reseeded.
@@ -46,8 +48,42 @@ const SLEEP_CHANCE: f64 = 0.01;
 const SLEEP_MIN_MINUTES: i64 = 15;
 const SLEEP_MAX_MINUTES: i64 = 120;
 
+/// The part of her rhythm that emotions will eventually move around. Keeping it
+/// with the heartbeat means a message handler never grows its own social rules.
+#[derive(Clone, Copy)]
+pub struct SocialPace {
+    pub private_reply_chance: f64,
+    pub addressed_group_reply_chance: f64,
+    pub passive_group_reply_chance: f64,
+    pub idle_return_chance: f64,
+    pub idle_return_min: Duration,
+    pub idle_return_max: Duration,
+    pub idle_return_for: Duration,
+}
+
+impl Default for SocialPace {
+    fn default() -> Self {
+        Self {
+            private_reply_chance: 0.98,
+            addressed_group_reply_chance: 0.35,
+            passive_group_reply_chance: 0.08,
+            idle_return_chance: 0.25,
+            idle_return_min: Duration::from_secs(2 * 60),
+            idle_return_max: Duration::from_secs(8 * 60),
+            idle_return_for: Duration::from_secs(90),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct PresencePlan {
+    pub idle_return_after: Option<Duration>,
+    pub idle_return_for: Duration,
+}
+
 pub struct Heartbeat {
     random: SplitMix64,
+    social_pace: SocialPace,
     // Unix seconds until which she stays asleep; 0 means awake.
     asleep_until: i64,
 }
@@ -56,6 +92,7 @@ impl Heartbeat {
     pub fn new(seed: u64) -> Self {
         Self {
             random: SplitMix64::new(seed),
+            social_pace: SocialPace::default(),
             asleep_until: 0,
         }
     }
@@ -78,6 +115,34 @@ impl Heartbeat {
     /// A message just arrived; end any nap so she can decide to respond to it.
     pub fn wake(&mut self) {
         self.asleep_until = 0;
+    }
+
+    pub fn should_consider_reply(&mut self, is_private: bool, is_addressed: bool) -> bool {
+        let chance = if is_private {
+            self.social_pace.private_reply_chance
+        } else if is_addressed {
+            self.social_pace.addressed_group_reply_chance
+        } else {
+            self.social_pace.passive_group_reply_chance
+        };
+        self.random.chance() < chance.clamp(0.0, 1.0)
+    }
+
+    /// Decide whether her next quiet stretch gets a brief, unprompted return.
+    /// The choice belongs to the same mutable rhythm as reply attention, so an
+    /// emotion layer can change both without teaching Telegram about emotions.
+    pub fn presence_plan(&mut self) -> PresencePlan {
+        let pace = self.social_pace;
+        let idle_return_after = (self.random.chance() < pace.idle_return_chance.clamp(0.0, 1.0))
+            .then(|| {
+                let min = pace.idle_return_min.as_secs() as i64;
+                let max = pace.idle_return_max.max(pace.idle_return_min).as_secs() as i64;
+                Duration::from_secs(self.random.range_inclusive(min, max) as u64)
+            });
+        PresencePlan {
+            idle_return_after,
+            idle_return_for: pace.idle_return_for,
+        }
     }
 }
 

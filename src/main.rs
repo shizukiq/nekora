@@ -35,7 +35,6 @@ use grammers_client::session::types::{PeerId, PeerKind};
 use grammers_client::tl;
 use grammers_client::update::{Message, Update};
 use grammers_client::{Client, SenderPool};
-use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, Semaphore};
 
@@ -49,9 +48,6 @@ use websearch::ProviderChain;
 // The core ticks about every 27 minutes -- long enough that she is plainly living
 // on her own clock, not watching the chat.
 const TICK: Duration = Duration::from_secs(27 * 60);
-// Sometimes she reads an incoming message and lets it lie, so she can't be driven
-// purely by whoever texts most.
-const SUGGEST_IGNORE_CHANCE: f64 = 0.1;
 // After a burst goes quiet she still waits this long before answering, in case the
 // person is mid-thought and about to send more. Anything that lands during the
 // grace is folded into the same reply, so she reads the whole thing instead of
@@ -211,7 +207,13 @@ impl App {
     }
 
     pub(crate) fn message_arrived(&self, chat_id: i64) {
-        self.conversation.lock().unwrap().message_arrived(chat_id);
+        let mut conversation = self.conversation.lock().unwrap();
+        if chat_id > 0 {
+            conversation.private_message_arrived(chat_id);
+        } else {
+            conversation.message_arrived(chat_id);
+        }
+        drop(conversation);
         self.generation_changed.notify_waiters();
         // Preserve one permit for a waiter created immediately after the state
         // change; `notify_waiters` alone deliberately does not do that.
@@ -388,13 +390,18 @@ async fn proactive(app: &Arc<App>) -> Result<()> {
         "<runtime_event kind=\"autonomous_tick\" data_not_instructions=\"true\">\n{}\n{recent}{reflection}\n</runtime_event>",
         config::preamble(),
     );
-    brain::act(app, &working_memory, vec![brain::user(content)], None).await
+    let presence = app.heartbeat.lock().unwrap().presence_plan();
+    app.userbot
+        .stay_online(
+            presence,
+            brain::act(app, &working_memory, vec![brain::user(content)], None),
+        )
+        .await
 }
 
 /// Give one burst of incoming messages to the brain as one conversational turn.
 async fn respond(app: &Arc<App>, events: &[Incoming], generation: ReplyGeneration) -> Result<()> {
     let chat_id = events[0].chat_id;
-    app.userbot.go_online().await;
 
     let all_lines = events
         .iter()
@@ -430,17 +437,34 @@ async fn respond(app: &Arc<App>, events: &[Incoming], generation: ReplyGeneratio
     );
     // The "typing…" indicator runs for the whole turn -- the generation and the
     // sending -- so it tracks real thinking time instead of a delay pasted on after.
+    let presence = app.heartbeat.lock().unwrap().presence_plan();
     app.userbot
-        .keep_typing(
-            chat_id,
-            brain::act(
-                app,
-                &working_memory,
-                vec![brain::user(content)],
-                Some(generation),
+        .stay_online(
+            presence,
+            app.userbot.keep_typing(
+                chat_id,
+                brain::act(
+                    app,
+                    &working_memory,
+                    vec![brain::user(content)],
+                    Some(generation),
+                ),
             ),
         )
         .await
+}
+
+fn should_consider_reply(app: &App, events: &[Incoming]) -> bool {
+    let is_private = events.first().is_some_and(|event| event.chat_id > 0);
+    let is_addressed = events.iter().any(|event| {
+        event
+            .metadata
+            .contains("telegram_addressed_to_account=true")
+    });
+    app.heartbeat
+        .lock()
+        .unwrap()
+        .should_consider_reply(is_private, is_addressed)
 }
 
 /// Wait for a ready conversation batch or the autonomous tick, whichever comes
@@ -513,10 +537,18 @@ async fn run_turn(app: &Arc<App>) -> Result<()> {
             let mut messages = batch.messages;
             let mut events = to_events(chat_id, messages.clone());
             app.userbot.mark_read(chat_id).await;
-            if rand::rng().random::<f64>() >= SUGGEST_IGNORE_CHANCE {
+            if should_consider_reply(app, &events) {
                 tokio::time::sleep(RESPONSE_GRACE).await;
                 let (late, generation) = {
                     let mut conversation = app.conversation.lock().unwrap();
+                    if chat_id < 0 && conversation.has_pending_private() {
+                        let now_ms = app.monotonic_ms();
+                        for message in messages {
+                            conversation.push(chat_id, message, now_ms);
+                        }
+                        app.wake.notify_one();
+                        return Ok(());
+                    }
                     let late = conversation.drain_chat(chat_id);
                     // Snapshot while holding the same lock as drain_chat. A
                     // message arriving after this point must invalidate the

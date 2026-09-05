@@ -31,6 +31,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use crate::brain::Brain;
 use crate::config::env_or;
 use crate::conversation::{split_message, ReplyGeneration};
+use crate::heartbeat::PresencePlan;
 use crate::App;
 
 // Keep bubbles human-paced without making a reply feel stuck. The word-based
@@ -114,6 +115,12 @@ pub struct CurrentTime {
     pub datetime: String,
 }
 
+#[derive(Default)]
+struct Presence {
+    active_turns: usize,
+    revision: u64,
+}
+
 pub struct Userbot {
     client: Client,
     // Shared with the sender pool: grammers caches every peer's access authority
@@ -128,6 +135,7 @@ pub struct Userbot {
     // Private chats already verified against Telegram's Contacts category. This
     // lets the update reader invalidate an old reply before waiting on media I/O.
     private_contacts: Mutex<HashSet<i64>>,
+    presence: Mutex<Presence>,
 }
 
 impl Userbot {
@@ -138,6 +146,7 @@ impl Userbot {
             brain,
             peers: Mutex::new(HashMap::new()),
             private_contacts: Mutex::new(HashSet::new()),
+            presence: Mutex::new(Presence::default()),
         }
     }
 
@@ -806,13 +815,90 @@ impl Userbot {
         (!text.is_empty()).then(|| text.to_string())
     }
 
-    /// Appear online while she is answering, so "typing…" reads as a person at
-    /// the keyboard, not a bot poking an offline account. Best-effort.
-    pub async fn go_online(&self) {
+    async fn go_online(&self) {
         let _ = self
             .client
             .invoke(&tl::functions::account::UpdateStatus { offline: false })
             .await;
+    }
+
+    async fn go_offline(&self) {
+        let _ = self
+            .client
+            .invoke(&tl::functions::account::UpdateStatus { offline: true })
+            .await;
+    }
+
+    async fn online_refresh_period(&self) -> Option<Duration> {
+        let tl::enums::Config::Config(config) = self
+            .client
+            .invoke(&tl::functions::help::GetConfig {})
+            .await
+            .ok()?;
+        u64::try_from(config.online_update_period_ms)
+            .ok()
+            .filter(|period| *period > 0)
+            .map(Duration::from_millis)
+    }
+
+    fn presence_is_idle(&self, revision: u64) -> bool {
+        let presence = self.presence.lock().unwrap();
+        presence.active_turns == 0 && presence.revision == revision
+    }
+
+    /// Keep Telegram's online status alive throughout a real turn, then let the
+    /// current social rhythm decide whether a quiet, brief return happens later.
+    pub async fn stay_online<T>(
+        self: &Arc<Self>,
+        plan: PresencePlan,
+        future: impl Future<Output = T>,
+    ) -> T {
+        {
+            let mut presence = self.presence.lock().unwrap();
+            presence.active_turns += 1;
+            presence.revision = presence.revision.wrapping_add(1);
+        }
+        self.go_online().await;
+        let refresh = self.online_refresh_period().await;
+        tokio::pin!(future);
+        let output = match refresh {
+            Some(period) => loop {
+                tokio::select! {
+                    output = &mut future => break output,
+                    _ = tokio::time::sleep(period) => self.go_online().await,
+                }
+            },
+            None => future.await,
+        };
+
+        let idle_revision = {
+            let mut presence = self.presence.lock().unwrap();
+            presence.active_turns -= 1;
+            if presence.active_turns == 0 {
+                presence.revision = presence.revision.wrapping_add(1);
+                Some(presence.revision)
+            } else {
+                None
+            }
+        };
+        if let Some(revision) = idle_revision {
+            self.go_offline().await;
+            if let Some(delay) = plan.idle_return_after {
+                let userbot = Arc::clone(self);
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    if !userbot.presence_is_idle(revision) {
+                        return;
+                    }
+                    userbot.go_online().await;
+                    tokio::time::sleep(plan.idle_return_for).await;
+                    if userbot.presence_is_idle(revision) {
+                        userbot.go_offline().await;
+                    }
+                });
+            }
+        }
+        output
     }
 
     /// Show a live "typing…" in `chat_id` for exactly as long as `fut` runs, then

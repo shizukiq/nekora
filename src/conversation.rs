@@ -91,6 +91,17 @@ impl Conversation {
         *revision = revision.wrapping_add(1);
     }
 
+    /// A private conversation takes precedence over a group turn already being
+    /// composed. Let the group wait rather than make a person wait behind it.
+    pub fn private_message_arrived(&mut self, chat_id: i64) {
+        for (other_chat_id, revision) in &mut self.revisions {
+            if *other_chat_id < 0 {
+                *revision = revision.wrapping_add(1);
+            }
+        }
+        self.message_arrived(chat_id);
+    }
+
     /// Capture the revision a reply must still match before it can be sent.
     pub fn start_generation(&self, chat_id: i64) -> ReplyGeneration {
         ReplyGeneration {
@@ -138,13 +149,14 @@ impl Conversation {
         true
     }
 
-    /// Take the oldest batch whose quiet/typing window has closed, if any.
+    /// Take a private batch before a ready group batch; within either class, keep
+    /// arrival order so one chat cannot starve the others.
     pub fn take_ready(&mut self, now_ms: i64) -> Option<ConversationBatch> {
         let chat_id = self
             .pending
             .iter()
             .filter(|(_, pending)| pending.is_ready(now_ms))
-            .min_by_key(|(_, pending)| pending.sequence)
+            .min_by_key(|(chat_id, pending)| (**chat_id < 0, pending.sequence))
             .map(|(chat_id, _)| *chat_id)?;
         let pending = self.pending.remove(&chat_id).unwrap();
         Some(ConversationBatch {
@@ -160,6 +172,10 @@ impl Conversation {
             .remove(&chat_id)
             .map(|pending| pending.messages)
             .unwrap_or_default()
+    }
+
+    pub fn has_pending_private(&self) -> bool {
+        self.pending.keys().any(|chat_id| *chat_id > 0)
     }
 
     /// When the loop must next wake to check for a ready batch, or -1 when empty.
