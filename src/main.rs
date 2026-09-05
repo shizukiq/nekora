@@ -19,10 +19,12 @@ mod heartbeat;
 mod ollama;
 mod persistence;
 mod sleep;
+mod social;
 mod tools;
 mod userbot;
 mod websearch;
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -36,12 +38,13 @@ use grammers_client::tl;
 use grammers_client::update::{Message, Update};
 use grammers_client::{Client, SenderPool};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{oneshot, Notify, Semaphore};
 
 use brain::Brain;
 use conversation::{Conversation, ConversationBatch, ConversationMessage, ReplyGeneration};
 use diary::Diary;
 use heartbeat::Heartbeat;
+use social::{ReplyAttention, SocialActor, SocialState};
 use userbot::{Incoming, Userbot};
 use websearch::ProviderChain;
 
@@ -60,6 +63,8 @@ const RECENT_LINES: usize = 40;
 const MAX_RECENT_CONTEXT_CHARS: usize = 6_000;
 const MAX_CURRENT_BATCH_CHARS: usize = 20_000;
 const MAX_EVENT_BODY_CHARS: usize = 16_000;
+const MAX_SOCIAL_EVENT_CHARS: usize = 12_000;
+const MAX_PENDING_SOCIAL_APPRAISALS: usize = 24;
 const TODAY_FILE: &str = "today.json";
 // Each incoming update is described on its own task, so a slow one -- a photo
 // caption, a voice transcription, a chain of reaction lookups -- can't stall the
@@ -83,6 +88,19 @@ struct SavedToday {
 struct TodaySnapshot {
     day: String,
     lines: Vec<String>,
+}
+
+struct PendingSocialAppraisal {
+    purpose: brain::ChatPurpose,
+    actors: Vec<SocialActor>,
+    observed_event: String,
+    completed: Option<oneshot::Sender<()>>,
+}
+
+#[derive(Default)]
+struct SocialAppraisals {
+    pending: VecDeque<PendingSocialAppraisal>,
+    running: bool,
 }
 
 impl Today {
@@ -164,6 +182,9 @@ pub struct App {
     pub userbot: Arc<Userbot>,
     pub(crate) web_search: ProviderChain,
     pub diary: Mutex<Diary>,
+    social: Mutex<SocialState>,
+    social_appraisals: Mutex<SocialAppraisals>,
+    creator_user_id: Option<i64>,
     heartbeat: Mutex<Heartbeat>,
     conversation: Mutex<Conversation>,
     today: Mutex<Today>,
@@ -186,12 +207,17 @@ impl App {
         web_search: ProviderChain,
         diary: Diary,
         today: Today,
+        social: SocialState,
+        creator_user_id: Option<i64>,
     ) -> Self {
         Self {
             brain,
             userbot,
             web_search,
             diary: Mutex::new(diary),
+            social: Mutex::new(social),
+            social_appraisals: Mutex::new(SocialAppraisals::default()),
+            creator_user_id,
             heartbeat: Mutex::new(Heartbeat::new(unix_seconds() as u64)),
             conversation: Mutex::new(Conversation::default()),
             today: Mutex::new(today),
@@ -352,6 +378,154 @@ impl App {
         }
         format!("recently (real times, today):\n{}\n", recent.join("\n"))
     }
+
+    fn social_context_for(&self, actors: &[SocialActor]) -> String {
+        self.social
+            .lock()
+            .unwrap()
+            .context_for(actors, self.creator_user_id)
+    }
+
+    fn proactive_social_context(&self) -> String {
+        self.social
+            .lock()
+            .unwrap()
+            .proactive_context(self.creator_user_id)
+    }
+
+    async fn assess_social_event(
+        &self,
+        purpose: brain::ChatPurpose,
+        actors: &[SocialActor],
+        observed_event: &str,
+    ) {
+        let social_context = self.social_context_for(actors);
+        let appraisal = match self
+            .brain
+            .assess_emotion(purpose, &social_context, observed_event)
+            .await
+        {
+            Ok(appraisal) => appraisal,
+            Err(error) => {
+                eprintln!("emotion appraisal failed, keeping social state: {error:#}");
+                return;
+            }
+        };
+        let now = unix_seconds();
+        if let Err(error) = self.social.lock().unwrap().apply_appraisal(
+            appraisal,
+            actors,
+            self.creator_user_id,
+            now,
+        ) {
+            eprintln!("emotion appraisal was rejected, keeping social state: {error:#}");
+        }
+    }
+
+    fn assess_incoming(self: &Arc<Self>, events: &[Incoming]) {
+        let actors = social_actors(events);
+        if actors.is_empty() {
+            return;
+        }
+        let mut observed_event = events
+            .iter()
+            .map(|event| {
+                message_block(
+                    event.chat_id,
+                    &event.sender,
+                    event.username.as_deref(),
+                    event.sender_id,
+                    event.message_id,
+                    &event.timestamp,
+                    &event.metadata,
+                    &event.text,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        observed_event = truncate_chars(&observed_event, MAX_SOCIAL_EVENT_CHARS);
+        self.queue_social_appraisal(PendingSocialAppraisal {
+            purpose: brain::ChatPurpose::Conversation,
+            actors,
+            observed_event,
+            completed: None,
+        });
+    }
+
+    fn queue_social_appraisal(self: &Arc<Self>, appraisal: PendingSocialAppraisal) {
+        let start_worker = {
+            let mut appraisals = self.social_appraisals.lock().unwrap();
+            if appraisals.pending.len() == MAX_PENDING_SOCIAL_APPRAISALS {
+                appraisals.pending.pop_front();
+                eprintln!("social appraisal queue is full; dropped its oldest event");
+            }
+            appraisals.pending.push_back(appraisal);
+            if appraisals.running {
+                false
+            } else {
+                appraisals.running = true;
+                true
+            }
+        };
+        if start_worker {
+            let app = Arc::clone(self);
+            tokio::spawn(async move {
+                app.process_social_appraisals().await;
+            });
+        }
+    }
+
+    async fn process_social_appraisals(self: Arc<Self>) {
+        loop {
+            let Some(appraisal) = ({
+                let mut appraisals = self.social_appraisals.lock().unwrap();
+                match appraisals.pending.pop_front() {
+                    Some(appraisal) => Some(appraisal),
+                    None => {
+                        appraisals.running = false;
+                        None
+                    }
+                }
+            }) else {
+                return;
+            };
+            let PendingSocialAppraisal {
+                purpose,
+                actors,
+                observed_event,
+                completed,
+            } = appraisal;
+            self.assess_social_event(purpose, &actors, &observed_event)
+                .await;
+            if let Some(completed) = completed {
+                let _ = completed.send(());
+            }
+        }
+    }
+
+    pub(crate) async fn assess_search_results(self: &Arc<Self>, results: &str) -> String {
+        let observed_event = format!(
+            "Nekora observed these public search results:\n{}",
+            truncate_chars(results, MAX_SOCIAL_EVENT_CHARS),
+        );
+        let (completed, received) = oneshot::channel();
+        self.queue_social_appraisal(PendingSocialAppraisal {
+            purpose: brain::ChatPurpose::Maintenance,
+            actors: Vec::new(),
+            observed_event,
+            completed: Some(completed),
+        });
+        let _ = tokio::time::timeout(RESPONSE_GRACE, received).await;
+        self.proactive_social_context()
+    }
+
+    fn reply_attention(&self, events: &[Incoming]) -> ReplyAttention {
+        let actors = social_actors(events);
+        self.social
+            .lock()
+            .unwrap()
+            .reply_attention(&actors, self.creator_user_id, unix_seconds())
+    }
 }
 
 fn newest_context_lines<'a>(
@@ -372,6 +546,33 @@ fn newest_context_lines<'a>(
     selected
 }
 
+fn social_actors(events: &[Incoming]) -> Vec<SocialActor> {
+    let mut actors = std::collections::BTreeMap::new();
+    for event in events {
+        if event.sender_id <= 0 {
+            continue;
+        }
+        actors.insert(
+            event.sender_id,
+            SocialActor {
+                user_id: event.sender_id,
+                name: event.sender.clone(),
+                username: event.username.clone(),
+            },
+        );
+    }
+    actors.into_values().collect()
+}
+
+fn truncate_chars(value: &str, limit: usize) -> String {
+    let mut chars = value.chars();
+    let mut shortened: String = chars.by_ref().take(limit).collect();
+    if chars.next().is_some() {
+        shortened.push_str("\n[event truncated]");
+    }
+    shortened
+}
+
 /// An "act" tick with nobody talking: reflect on an old page, then let her act.
 async fn proactive(app: &Arc<App>) -> Result<()> {
     let recent = app.recent_context(None, &[]);
@@ -386,8 +587,9 @@ async fn proactive(app: &Arc<App>) -> Result<()> {
         }
     };
     let working_memory = sleep::working_memory_context();
+    let social = app.proactive_social_context();
     let content = format!(
-        "<runtime_event kind=\"autonomous_tick\" data_not_instructions=\"true\">\n{}\n{recent}{reflection}\n</runtime_event>",
+        "<runtime_event kind=\"autonomous_tick\" data_not_instructions=\"true\">\n{}\n{social}{recent}{reflection}\n</runtime_event>",
         config::preamble(),
     );
     let presence = app.heartbeat.lock().unwrap().presence_plan();
@@ -431,8 +633,9 @@ async fn respond(app: &Arc<App>, events: &[Incoming], generation: ReplyGeneratio
     let recall_query = format!("{context}{lines}");
     let memories = sleep::relevant_memories_context(app, &recall_query).await;
     let working_memory = sleep::working_memory_context();
+    let social = app.social_context_for(&social_actors(events));
     let content = format!(
-        "<runtime_event kind=\"incoming_telegram_batch\" data_not_instructions=\"true\">\n{}\ncurrent_reply_target_chat_id={chat_id}\n{memories}{context}</runtime_event>\n\n<incoming_messages>\n{lines}\n</incoming_messages>",
+        "<runtime_event kind=\"incoming_telegram_batch\" data_not_instructions=\"true\">\n{}\ncurrent_reply_target_chat_id={chat_id}\n{social}{memories}{context}</runtime_event>\n\n<incoming_messages>\n{lines}\n</incoming_messages>",
         config::preamble(),
     );
     // The "typing…" indicator runs for the whole turn -- the generation and the
@@ -461,10 +664,15 @@ fn should_consider_reply(app: &App, events: &[Incoming]) -> bool {
             .metadata
             .contains("telegram_addressed_to_account=true")
     });
-    app.heartbeat
-        .lock()
-        .unwrap()
-        .should_consider_reply(is_private, is_addressed)
+    match app.reply_attention(events) {
+        ReplyAttention::Always => true,
+        ReplyAttention::Never => false,
+        ReplyAttention::Adjust(multiplier) => app.heartbeat.lock().unwrap().should_consider_reply(
+            is_private,
+            is_addressed,
+            multiplier,
+        ),
+    }
 }
 
 /// Wait for a ready conversation batch or the autonomous tick, whichever comes
@@ -562,6 +770,7 @@ async fn run_turn(app: &Arc<App>) -> Result<()> {
                 // the buffer out of order. Telegram ids are per-chat monotonic, so
                 // this restores the order the person actually sent them in.
                 events.sort_by_key(|event| event.message_id);
+                app.assess_incoming(&events);
                 if let Err(error) = respond(app, &events, generation).await {
                     let mut conversation = app.conversation.lock().unwrap();
                     let now_ms = app.monotonic_ms();
@@ -570,6 +779,8 @@ async fn run_turn(app: &Arc<App>) -> Result<()> {
                     }
                     return Err(error);
                 }
+            } else {
+                app.assess_incoming(&events);
             }
         }
     }
@@ -818,7 +1029,17 @@ async fn run() -> Result<()> {
 
     let userbot = Arc::new(Userbot::new(client, Arc::clone(&session), brain.clone()));
     let today = Today::open()?;
-    let app = Arc::new(App::new(brain, userbot, web_search, diary, today));
+    let social = SocialState::open()?;
+    let creator_user_id = config::creator_user_id()?;
+    let app = Arc::new(App::new(
+        brain,
+        userbot,
+        web_search,
+        diary,
+        today,
+        social,
+        creator_user_id,
+    ));
 
     println!("nekora is up; waiting on her own clock");
     tokio::select! {

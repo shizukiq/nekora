@@ -65,9 +65,9 @@ impl Default for SocialPace {
     fn default() -> Self {
         Self {
             private_reply_chance: 0.98,
-            addressed_group_reply_chance: 0.35,
-            passive_group_reply_chance: 0.08,
-            idle_return_chance: 0.25,
+            addressed_group_reply_chance: 0.48,
+            passive_group_reply_chance: 0.14,
+            idle_return_chance: 0.35,
             idle_return_min: Duration::from_secs(2 * 60),
             idle_return_max: Duration::from_secs(8 * 60),
             idle_return_for: Duration::from_secs(90),
@@ -117,7 +117,12 @@ impl Heartbeat {
         self.asleep_until = 0;
     }
 
-    pub fn should_consider_reply(&mut self, is_private: bool, is_addressed: bool) -> bool {
+    pub fn should_consider_reply(
+        &mut self,
+        is_private: bool,
+        is_addressed: bool,
+        attention_multiplier: f64,
+    ) -> bool {
         let chance = if is_private {
             self.social_pace.private_reply_chance
         } else if is_addressed {
@@ -125,7 +130,7 @@ impl Heartbeat {
         } else {
             self.social_pace.passive_group_reply_chance
         };
-        self.random.chance() < chance.clamp(0.0, 1.0)
+        self.random.chance() < (chance * attention_multiplier).clamp(0.0, 1.0)
     }
 
     /// Decide whether her next quiet stretch gets a brief, unprompted return.

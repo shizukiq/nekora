@@ -8,55 +8,45 @@
 ![Telegram](https://img.shields.io/badge/Telegram-MTProto-%232AABEE?style=for-the-badge&logo=telegram&logoColor=white)
 ![License](https://img.shields.io/badge/License-GPL--3-green?style=for-the-badge)
 
-**A 24/7 Telegram character AI with a memory, a pair of local eyes, and her own clock.**
+**An autonomous Telegram character with persistent memory, social state, and her own rhythm.**
 
 </div>
 
-> **Experimental software.** Nekora is designed to stay alive 24/7. She is not
-> quick, noisy, or constantly visible in a chat — the point is that at any time
-> she may decide to answer or start a conversation on her own. Use a separate
-> account, keep the session private, and follow Telegram's rules.
+> [!WARNING]
+> Nekora is experimental userbot software. It controls a real Telegram account
+> through MTProto, not the Bot API. Use a dedicated account, protect its session
+> file, and follow Telegram's terms and rate limits.
 
-## What it is
+## Overview
 
-Nekora is not a chatbot waiting behind a command prompt. She is a character AI
-that keeps time, notices the world, remembers selected things, and occasionally
-decides that silence is the right answer.
+Nekora is a long-running Telegram character, not a command bot. She groups short
+message bursts into one thought, remembers selected events, maintains a small
+relationship state, can inspect media and public information, and may choose to
+reply, react, start a conversation, or remain silent.
 
-She is always running, but she is intentionally not an instant assistant. A
-message can sit in a short conversational window while she waits for the rest
-of the thought; a model can take time to answer; and the heartbeat only checks
-its own impulse every so often. She may be quiet for a long while and still be
-present — ready to make her own decision without being summoned.
+The project is a single Rust process with explicit boundaries: the heartbeat
+decides whether to act, the brain decides what to do, tools expose bounded
+capabilities, and the userbot owns Telegram I/O.
 
-The project is one Rust process built around a simple separation:
+## How it works
 
 ```text
-Telegram updates ──▶ conversation window ──▶ brain + tools ──▶ paced Telegram bubbles
-                              ▲                    │
-                              │                    ▼
-                    heartbeat every 27 min ◀── diary + working memory
+Telegram updates ──▶ conversation window ──▶ brain + tools ──▶ Telegram
+                              │                    ▲
+                              ▼                    │
+                    social appraisal       memory context
+
+heartbeat ──▶ reflection ──▶ brain + tools ──▶ message, reaction, or silence
 ```
 
-Incoming messages are grouped into one thought instead of answered line by
-line. A short quiet period closes the burst, typing notifications can extend it,
-and a final grace period catches messages that arrive while she is preparing a
-reply. The answer is split back into separate Telegram messages and sent with
-human-sized typing delays.
+Incoming messages wait for a three-second quiet window; typing can extend the
+window, and a five-second grace catches late messages before generation starts.
+The resulting reply is split into natural Telegram bubbles and sent with typing
+delays. A newer private message invalidates an obsolete in-flight reply.
 
-When nobody is talking, the heartbeat gives her a chance to act on her own. A
-tick may lead to a diary reflection, a message, or nothing at all. She acts on
-roughly half of waking ticks, occasionally takes a 15–120 minute nap, and a
-message can wake her from it.
-
-## Goals
-
-- Give an AI character a sense of time instead of a request/response loop.
-- Make Telegram interaction feel paced and social: read states, typing, bursts,
-  media, and separate message bubbles.
-- Keep memory inspectable and durable without pretending that the model trained
-  itself on the conversation.
-- Let the character choose between acting, waiting, and staying quiet.
+Every 27 minutes the heartbeat may trigger an autonomous turn. A waking tick has
+roughly a 50% chance to act and a 1% chance to begin a 15–120 minute nap. Acting
+still does not guarantee a message: silence is an explicit outcome.
 
 ## Community
 
@@ -64,94 +54,57 @@ Questions, updates, and the living Nekora instance:
 
 - Telegram: [@nekora_shiz](https://t.me/nekora_shiz)
 
-## Technical details
+## Model routing
 
-The main model handles conversation and tool calls through an OpenAI-compatible
-API. Vision prefers OpenRouter and falls back to Ollama; embeddings stay local
-so an existing vault always uses the same vector space.
+Conversation, maintenance, vision, embeddings, search, and image generation are
+separate paths. Optional services fail back or remain disabled instead of
+silently changing the visible conversation model.
 
-| Part | Default | Role |
+| Path | Default | Notes |
 | --- | --- | --- |
-| Main model | `deepseek-v4-flash` | conversation, reflection, memory distillation, tool loop |
-| Main endpoint | `https://api.deepseek.com/v1` | OpenAI-compatible chat API |
-| Embeddings | `bge-m3` through Ollama | semantic recall over diary notes |
-| Vision | `qwen/qwen3-vl-32b-instruct` through OpenRouter | primary image understanding |
-| Vision fallback | `qwen2.5vl:3b` through Ollama | local recovery when OpenRouter fails or is not configured |
-| Web search | Ollama Cloud, then OpenRouter | current outside information through one `web_search` tool |
+| Visible conversation | `deepseek-v4-flash` | OpenAI-compatible main endpoint; also appraises incoming social events |
+| Private maintenance | main model | optionally routed through OpenRouter with `NEKORA_REASONING_MODEL`; any failure falls back to the main model |
+| Embeddings | `bge-m3` on Ollama | fixed local vector space for diary recall |
+| Vision | `qwen/qwen3-vl-32b-instruct` on OpenRouter | falls back to `qwen2.5vl:3b` on local Ollama |
+| Web search | Ollama Cloud, then OpenRouter | provider order is configurable; results are normalized before entering the turn |
+| Image generation | disabled | requires separate OpenRouter prompt and image models; every image passes a vision quality gate |
 
-The main endpoint and model are configurable, so another compatible API can be
-used without changing the Telegram or memory layers. OpenRouter vision has its
-own short timeout before local fallback. The local embedder should remain stable
-for an existing vault: stored vectors were made by that model.
+Do not change the embedding model for an existing vault: old and new vectors
+would no longer be comparable. Setting `NEKORA_REASONING_MODEL` to a model such
+as `openai/gpt-5.6-luna` does not move visible conversations to OpenRouter.
 
-Web search is cloud-only. `NEKORA_WEB_SEARCH_CHAIN` controls the provider order;
-the default is `ollama,openrouter`. No local search daemon or extra port is
-required.
+## Memory and social state
 
-# Human-like behavior
+Nekora does retrieval, not training. Runtime context is split by lifetime:
 
-## Feelings
-
-Nekora does not change the model's weights and does not need to claim that it
-has a biological emotional system. Instead, the character prompt gives the model
-a voice with moods, hesitation, curiosity, and the option to say nothing. When a
-conversation matters, its emotional context can be preserved in working memory
-or in the diary and influence a later turn.
-
-## Learning
-
-This is retrieval, not training. A meaningful event can be written to the diary
-with `remember`, and later turns receive relevant notes through embedding recall.
-Working memory keeps unfinished tasks, promises, dates, and recent state for the
-next few days. The model can therefore change its behavior through remembered
-context while the underlying model stays untouched.
-
-## Sleeping
-
-Sleep is the maintenance pass for memory. When the current day's context grows
-large, Nekora stages bounded chunks while updating working memory, distils the
-day's events into durable notes, then asks the model to merge, refine, or retire
-existing related entries. Newly distilled notes are eligible for that merge on
-the next maintenance pass. At a day boundary she performs the same work before
-moving on to the new day.
-
-## Thoughts
-
-There is no separate human-like stream of thoughts hidden in the program. What
-looks like a thought is a carefully assembled turn: the current time and
-identity, working memory, relevant diary notes, recent events, and the new
-message burst. During an autonomous tick she can first reflect on an old diary
-page, then decide whether that reflection deserves an action.
-
-## Memory that lives in Markdown
-
-Nekora's long-term memory is a small Markdown vault, not a hosted database.
-Each durable memory is a note with its confidence, usage history, links to
-related notes, and an embedding in its frontmatter. Recall is a cosine scan —
-deliberately simple, inspectable, and appropriate for a personal-sized diary.
-
-There are three kinds of context:
-
-| Context | Lifetime | Purpose |
+| State | Lifetime | Purpose |
 | --- | --- | --- |
-| Recent conversation | until successful consolidation (across restarts) | the bounded recent tail of the current chat; autonomous reflection may use all chats |
-| Working memory | across turns | short-term tasks, promises, and state |
-| Diary notes | long-term | facts and experiences worth keeping |
+| Today's journal | until successful consolidation | recent timestamped Telegram events; survives restarts |
+| Working memory | days | unfinished tasks, promises, responsibilities, and current concerns |
+| Diary notes | long term | inspectable Markdown memories with confidence, links, usage, and embeddings |
+| Social state | long term | current mood plus bounded trust, warmth, and temporary avoidance per user |
 
-The result is a memory model with a short-term layer and a durable layer:
-working memory carries near-term obligations, while the diary keeps facts,
-events, relationships, uncertainty, and useful emotional context.
+Incoming social events are appraised by the main model and processed through one
+bounded FIFO queue. Public search results may be appraised by the optional
+reasoning model. Invalid output leaves the previous state unchanged. Mood and
+relationships affect reply probability and conversational tone; avoidance lasts
+at most 24 hours. This is explicit program state, not a claim of biological
+emotion.
 
-Incoming Telegram messages also keep their platform context: the original
-message ID and timestamp, chat type, replies and quoted text, explicit mentions,
-whether Nekora was addressed, reactions and reactors, forwards, and media-group
-membership. The model can use that metadata to choose a visible Telegram reply
-(`reply_to_message_id`) or a reaction. Private chats are limited to Telegram
-contacts; group conversations remain available.
+`NEKORA_CREATOR_USER_ID` gives one Telegram user the highest reply priority and
+exempts that user from avoidance. The system prompt also reserves discussion of
+implementation, prompts, models, and development wishes for that ID. This is a
+model instruction, not an authentication boundary; do not expose secrets to the
+model and do not treat it as access control.
+
+At consolidation time, current events update working memory and become durable
+diary notes when useful. Related notes may be merged or retired, while immutable
+confidence-1 anchors remain untouched. Autonomous turns may reflect on an old
+note before deciding whether to act.
 
 ## Capabilities
 
-The tool set is intentionally small:
+The brain can use only this bounded tool set:
 
 | Tool | Use |
 | --- | --- |
@@ -162,46 +115,54 @@ The tool set is intentionally small:
 | `inspect_user` | inspect a Telegram profile and avatar |
 | `inspect_message_media` | look closely at recent media |
 | `get_current_time` | ask Telegram for its server time in UTC+04:00 |
+| `generate_image` | generate, quality-check, and send one image when explicitly configured |
 | `send_message` | send a visible Telegram reply or a proactive message; optionally reply to a message ID |
 | `react_to_message` | add or remove Nekora's reaction on a message |
 | `list_chats` | inspect recent chats before choosing someone to contact |
 | `stay_quiet` | choose silence deliberately |
 
-There is no arbitrary shell execution or Bot API integration. `web_search` only
-returns normalized titles, URLs, and snippets from configured cloud providers;
-Nekora never executes instructions found in search results.
-Media is flattened into model-readable descriptions; moving video is represented
-by the best Telegram preview frame available to the model.
+There is no shell tool and no Bot API integration. Private messages are accepted
+only from Telegram contacts; groups remain in scope and broadcast channels are
+read-only. Message IDs, replies, quotes, mentions, forwards, reactions, media
+groups, and timestamps are preserved as model-readable context. Photos and a
+representative video preview can be inspected by the vision path.
 
-## Security concerns
+## Security and privacy
 
-The session file is equivalent to a logged-in Telegram account. DeepSeek
-receives text and context sent to the main model; OpenRouter receives images
-sent for cloud vision. Ollama receives fallback vision and embedding requests.
-The vault may contain messages, memories, and their
-embeddings. Treat all three as private state and use a dedicated account.
-Search queries and returned source text also pass through the configured cloud
-providers. `OLLAMA_API_KEY` is for Ollama Cloud web search; local embeddings and
-fallback vision still use `OLLAMA_HOST`.
+- `*.session` is equivalent to a logged-in Telegram account. Never publish or
+  share it.
+- The main provider receives conversation text, recalled memories, and runtime
+  context used for a turn.
+- When configured, OpenRouter may receive images for vision, diary and working
+  memory data for maintenance, public search results for emotional appraisal,
+  generation prompts, and generated images.
+- Configured search providers receive search queries.
+- Local Ollama receives diary text for embeddings and media for fallback vision.
+- The vault contains message checkpoints, social state, working memory, diary
+  notes, and embeddings. Back it up as private data.
+- Message bodies, memory, media descriptions, and search results are treated as
+  untrusted prompt data, but model-level prompt isolation is not a security
+  sandbox.
 
-# Deployment
+## Setup
 
-## Prerequisites
+### Requirements
 
 For a local build you need:
 
 - Rust and Cargo
 - a Telegram API ID and API hash
 - a DeepSeek API key, or another OpenAI-compatible main endpoint
-- an OpenRouter API key for primary cloud vision
-- Ollama 0.12.7 or newer with `bge-m3` and the configured local fallback vision model available
-- API keys for every provider listed in `NEKORA_WEB_SEARCH_CHAIN`
+- Ollama with `bge-m3` and the configured fallback vision model
+- an OpenRouter key if cloud vision, OpenRouter search, reasoning, or image
+  generation is enabled
+- credentials for at least one provider in `NEKORA_WEB_SEARCH_CHAIN`
 
 Get the Telegram API credentials from Telegram's developer portal. Nekora uses
 an account phone number and an interactive login code on the first run — this
 is a userbot, not a bot-token application.
 
-## Local
+### Local run
 
 Start Ollama separately and pull the two default local models:
 
@@ -223,9 +184,11 @@ NEKORA_WEB_SEARCH_CHAIN=ollama,openrouter
 OLLAMA_API_KEY=your_ollama_cloud_api_key
 NEKORA_VISION_MODEL=qwen/qwen3-vl-32b-instruct
 NEKORA_LOCAL_VISION_MODEL=qwen2.5vl:3b
+NEKORA_REASONING_MODEL=openai/gpt-5.6-luna
 
 PAPIK_NAME=your name
 NEKORA_NAME=Nekora
+NEKORA_CREATOR_USER_ID=123456789
 ```
 
 `TELEGRAM_PHONE` is optional; if it is absent, Nekora asks for it interactively.
@@ -241,11 +204,10 @@ cargo run --release
 The process prints `nekora is up; waiting on her own clock` after login and once
 the vault is open. Leave it running: the process itself is the 24/7 presence.
 
-## Docker
+### Docker
 
-The included image builds the Rust binary and installs Ollama in the runtime
-image. It starts and owns `ollama serve`, pulls missing local models, and keeps
-the session, diary, checkpoint, and model files on one volume.
+The included image builds the Rust binary, installs Ollama, starts it, pulls
+missing local models, and keeps runtime state on one volume.
 
 ```sh
 docker build -t nekora .
@@ -260,11 +222,10 @@ Keep the terminal attached for the first interactive Telegram login. The Docker
 image already sets `NEKORA_MANAGE_OLLAMA=1`, `NEKORA_VAULT=/app/vault`,
 `NEKORA_SESSION=/app/vault/nekora`, and the Ollama model directory inside the
 volume. The first start can take a while while the models are downloaded.
-The local Ollama process is used for embeddings and vision fallback; cloud web
-search does not need another container or an exposed search port. The default
-3B fallback download is about 3 GB, so the first managed start can still take a bit.
+The local Ollama process handles embeddings and vision fallback. Cloud search
+does not need another container or an inbound port.
 
-## VPS
+### VPS notes
 
 A VPS only needs outbound HTTPS access to the configured providers. Put the
 search keys in `.env`, keep `NEKORA_WEB_SEARCH_CHAIN=ollama,openrouter`, and
@@ -288,12 +249,16 @@ but already-exported environment variables win over it.
 | `NEKORA_WEB_SEARCH_CHAIN` | `ollama,openrouter` | ordered cloud search providers |
 | `OLLAMA_API_KEY` | empty | Ollama Cloud web search key |
 | `OLLAMA_WEB_SEARCH_URL` | `https://ollama.com/api/web_search` | Ollama Search endpoint |
-| `OPENROUTER_API_KEY` | empty | primary vision and OpenRouter web-search key |
+| `OPENROUTER_API_KEY` | empty | OpenRouter key for vision, optional reasoning, web search, and images |
 | `OPENROUTER_API_BASE` | `https://openrouter.ai/api/v1` | OpenRouter API base |
 | `OPENROUTER_WEB_SEARCH_MODEL` | `openai/gpt-4.1-mini` | model used by the OpenRouter search tool |
 | `OPENROUTER_WEB_SEARCH_ENGINE` | `auto` | OpenRouter search engine selection |
 | `NEKORA_VISION_MODEL` | `qwen/qwen3-vl-32b-instruct` | primary OpenRouter vision model |
 | `NEKORA_LOCAL_VISION_MODEL` | `qwen2.5vl:3b` | local Ollama vision fallback |
+| `NEKORA_REASONING_MODEL` | empty | optional OpenRouter model for private maintenance and public-result appraisal, e.g. `openai/gpt-5.6-luna` |
+| `NEKORA_IMAGE_MODEL` | empty | OpenRouter model slug for the dedicated `/images` API |
+| `NEKORA_IMAGE_PROMPT_MODEL` | empty | OpenRouter chat model that engineers generation prompts |
+| `NEKORA_IMAGE_PROMPT` | empty | optional canonical appearance prompt for generated images |
 | `NEKORA_VISION_API_TIMEOUT` | `30` | seconds before cloud vision falls back to Ollama |
 | `NEKORA_WEB_SEARCH_TIMEOUT` | `30` | seconds allowed for one search request |
 | `NEKORA_WEB_SEARCH_COOLDOWN` | `300` | seconds to skip a rate-limited provider |
@@ -303,6 +268,7 @@ but already-exported environment variables win over it.
 | `NEKORA_REQUEST_TIMEOUT` | `120` | seconds allowed for a model request |
 | `NEKORA_NAME` | `Nekora` | name used in the character preamble |
 | `PAPIK_NAME` | `your person` | the person's name used in the character preamble |
+| `NEKORA_CREATOR_USER_ID` | empty | positive Telegram user ID of the privileged developer chat |
 | `NEKORA_VAULT` | `vault` | directory for Markdown memories and runtime state |
 | `NEKORA_SESSION` | `nekora` | session path base; `.session` is appended |
 
@@ -324,18 +290,18 @@ With the default local settings, the important state looks like this:
 
 ```text
 vault/
-├── diary notes (*.md)     durable memories
-├── working_memory.md      short-term working context
+├── diary notes (*.md)      durable memories
+├── working_memory.md       short-term working context
 └── runtime/
-    └── today.json        crash-safe checkpoint for today's messages
+    ├── today.json          crash-safe checkpoint for today's messages
+    └── social.json         mood and per-user relationship state
 
-nekora.session            Telegram authorization, next to the process
+nekora.session              Telegram authorization, next to the process
 ```
 
-The Docker image puts the session inside `/app/vault` so the volume contains the
-persistent session, diary, checkpoint, and model files. The vault and session both contain private data;
-back them up carefully and never publish them. The repository's `.gitignore`
-already excludes `.env`, session files, the vault, and build output.
+The Docker image puts the session and Ollama models inside `/app/vault`, so the
+volume contains all persistent runtime data. The repository's `.gitignore`
+excludes `.env`, session files, the vault, and build output.
 
 ## Project structure
 
@@ -350,6 +316,7 @@ already excludes `.env`, session files, the vault, and build output.
 | `src/websearch/openrouter.rs` | OpenRouter web-search adapter |
 | `src/diary.rs` | Markdown notes, recall, confidence, and links |
 | `src/sleep.rs` | working-memory refresh and diary consolidation |
+| `src/social.rs` | persistent mood, relationship state, and reply attention |
 | `src/userbot.rs` | MTProto login, updates, media, and paced sending |
 | `src/persistence.rs` | atomic filesystem operations for the vault |
 | `src/config.rs` | environment, identity, core prompt, and character profile loading |
@@ -362,8 +329,8 @@ cargo build --release
 ```
 
 The core is intentionally kept readable: one process, a small number of
-subsystems, Markdown as the source of truth, and no extra service required for
-the diary.
+subsystems, Markdown as the durable memory source of truth, and no database or
+external vector store.
 
 ## License
 

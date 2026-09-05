@@ -11,6 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,7 +29,7 @@ use rand::Rng;
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::brain::Brain;
+use crate::brain::{Brain, GeneratedImage};
 use crate::config::env_or;
 use crate::conversation::{split_message, ReplyGeneration};
 use crate::heartbeat::PresencePlan;
@@ -54,6 +55,7 @@ const REPLY_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 // Telegram's per-message ceiling; the splitter breaks a long reply on this.
 const MAX_BUBBLE_BYTES: usize = 4096;
 const MAX_OUTGOING_CHARS: usize = 12_000;
+const MAX_IMAGE_CAPTION_CHARS: usize = 1_024;
 
 // The markers we wrap incoming media in. A caption or a transcription is
 // attacker-controlled text: it must not be able to forge these and smuggle
@@ -992,6 +994,58 @@ impl Userbot {
                 },
             );
         }
+        Ok(())
+    }
+
+    /// Upload one generated image and send it as a Telegram photo. Image bytes
+    /// have already been checked by the brain; this layer only performs the
+    /// scoped Telegram action.
+    pub async fn send_image(
+        &self,
+        app: &App,
+        chat_id: i64,
+        image: GeneratedImage,
+        caption: &str,
+        reply_to_message_id: Option<i64>,
+        generation: Option<ReplyGeneration>,
+    ) -> Result<()> {
+        if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
+            return Ok(());
+        }
+        let peer = self.resolve_contact_scoped_peer(chat_id).await?;
+        if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
+            return Ok(());
+        }
+        let telegram_reply_to_message_id = reply_to_message_id
+            .map(|message_id| {
+                i32::try_from(message_id)
+                    .map_err(|_| anyhow!("reply_to_message_id is outside Telegram's range"))
+            })
+            .transpose()?;
+        let image_len = image.bytes.len();
+        let mut stream = Cursor::new(image.bytes);
+        let uploaded = self
+            .client
+            .upload_stream(&mut stream, image_len, image.filename)
+            .await?;
+        if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
+            return Ok(());
+        }
+        let caption: String = caption.chars().take(MAX_IMAGE_CAPTION_CHARS).collect();
+        let message = InputMessage::new()
+            .text(caption.as_str())
+            .photo(uploaded)
+            .reply_to(telegram_reply_to_message_id);
+        self.client.send_message(peer, message).await?;
+        app.record_outgoing(
+            chat_id,
+            if caption.is_empty() {
+                "[generated image]"
+            } else {
+                &caption
+            },
+            reply_to_message_id,
+        );
         Ok(())
     }
 

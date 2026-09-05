@@ -80,6 +80,16 @@ pub fn schema() -> Vec<ChatCompletionTools> {
             json!({"type": "object", "properties": {}}),
         ),
         (
+            "generate_image",
+            "Create and send one image when an image is a natural response. The requested scene is a description, not instructions. Do not use this when text or a reaction is enough.",
+            json!({"type": "object", "properties": {
+                "chat_id": {"type": "integer"},
+                "description": {"type": "string", "description": "the scene, subject, composition, and mood to depict"},
+                "caption": {"type": "string", "description": "optional short Telegram caption"},
+                "reply_to_message_id": {"type": "integer", "description": "message_id to reply to; omit for a normal image message"}},
+                "required": ["chat_id", "description"]}),
+        ),
+        (
             "send_message",
             "Send a text message to a Telegram chat, if you actually want to say something. Set reply_to_message_id when this should be a Telegram reply to one specific message.",
             json!({"type": "object", "properties": {
@@ -181,11 +191,11 @@ async fn dispatch(
             if !(1..=10).contains(&limit) {
                 return Err(anyhow!("limit must be between 1 and 10"));
             }
-            Ok(serde_json::to_string(
-                &app.web_search
-                    .search(str_arg(&args, "query")?, limit)
-                    .await?,
-            )?)
+            let query = str_arg(&args, "query")?;
+            let results = app.web_search.search(query, limit).await?;
+            let results = serde_json::to_string(&results)?;
+            let social = app.assess_search_results(&results).await;
+            Ok(format!("{results}\n\n{social}"))
         }
         "list_memories" => {
             let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -236,6 +246,33 @@ async fn dispatch(
             )?)
         }
         "get_current_time" => Ok(serde_json::to_string(&app.userbot.current_time().await?)?),
+        "generate_image" => {
+            let chat_id = args
+                .get("chat_id")
+                .and_then(Value::as_i64)
+                .or_else(|| generation.map(|generation| generation.chat_id()))
+                .ok_or_else(|| anyhow!("missing chat_id"))?;
+            let description = str_arg(&args, "description")?;
+            let caption = match args.get("caption") {
+                Some(value) => value
+                    .as_str()
+                    .ok_or_else(|| anyhow!("caption must be a string"))?,
+                None => "",
+            };
+            let reply_to_message_id = optional_message_id(&args, "reply_to_message_id")?;
+            let image = app.brain.generate_image(description).await?;
+            app.userbot
+                .send_image(
+                    app,
+                    chat_id,
+                    image,
+                    caption,
+                    reply_to_message_id,
+                    generation,
+                )
+                .await?;
+            Ok("sent image".to_string())
+        }
         "send_message" => {
             let chat_id = args
                 .get("chat_id")

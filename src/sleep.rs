@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 
-use crate::brain::{escape_prompt_data, system, user};
+use crate::brain::{escape_prompt_data, system, user, ChatPurpose};
 use crate::{config, persistence, App};
 
 // Leave room for the system prompt and the current turn inside the 32k model
@@ -292,6 +292,7 @@ async fn distill_events(app: &Arc<App>, events: &str) -> Result<Vec<(String, Vec
     let reply = app
         .brain
         .chat(
+            ChatPurpose::Maintenance,
             vec![
                 system(DISTIL_SYSTEM),
                 user(format!(
@@ -334,7 +335,11 @@ async fn refresh_working_memory(app: &Arc<App>, previous: &str, events: &str) ->
     );
     let reply = app
         .brain
-        .chat(vec![system(WORKING_MEMORY_SYSTEM), user(prompt)], &[])
+        .chat(
+            ChatPurpose::Maintenance,
+            vec![system(WORKING_MEMORY_SYSTEM), user(prompt)],
+            &[],
+        )
         .await?;
     let body = reply.content.unwrap_or_default().trim().to_string();
     if body.is_empty() {
@@ -401,6 +406,7 @@ async fn consolidate_diary(app: &Arc<App>) -> Result<()> {
         let reply = app
             .brain
             .chat(
+                ChatPurpose::Maintenance,
                 vec![
                     system(SLEEP_SYSTEM),
                     user(format!(
@@ -479,7 +485,11 @@ pub async fn reflect(app: &Arc<App>, recent: &str) -> Result<Option<String>> {
 
     let reply = app
         .brain
-        .chat(vec![system(REFLECTION_SYSTEM), user(prompt)], &[])
+        .chat(
+            ChatPurpose::Maintenance,
+            vec![system(REFLECTION_SYSTEM), user(prompt)],
+            &[],
+        )
         .await?;
     let thought = reply.content.unwrap_or_default().trim().to_string();
     if thought.is_empty() {
