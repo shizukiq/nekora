@@ -25,6 +25,7 @@ const MAX_LISTED_MEMORY_CHARS: usize = 12_000;
 const MAX_GRAPH_LINKS: usize = 4;
 const GRAPH_RELATEDNESS: f64 = 0.78;
 const WORKING_MEMORY_FILE: &str = "working_memory";
+const MIN_GENERATED_MEMORY_CHARS: usize = 8;
 
 struct DiaryEntry {
     id: String,
@@ -61,10 +62,57 @@ pub struct MemoryList {
     pub truncated: bool,
 }
 
+pub enum MemoryRevision {
+    Replaced(String),
+    AlreadyKnown,
+    Unchanged,
+    NotEditable,
+}
+
 pub struct Diary {
     directory: PathBuf,
     entries: Vec<DiaryEntry>,
     counter: u64,
+}
+
+/// Generated long-term notes need enough substance and a final cue paragraph
+/// before callers may replace or archive their source material.
+pub fn is_valid_generated_memory(memory: &str) -> bool {
+    let mut cue_line = None;
+    for (index, line) in memory.lines().enumerate() {
+        if line.trim_start().starts_with("Retrieval cues:") {
+            cue_line = Some((index, line));
+            break;
+        }
+    }
+    let Some((index, line)) = cue_line else {
+        return false;
+    };
+    let body_chars = memory
+        .lines()
+        .take(index)
+        .flat_map(str::chars)
+        .filter(|character| !character.is_whitespace())
+        .count();
+    if body_chars < MIN_GENERATED_MEMORY_CHARS {
+        return false;
+    }
+    if memory
+        .lines()
+        .skip(index + 1)
+        .any(|line| !line.trim().is_empty())
+    {
+        return false;
+    }
+    let Some((_, cues)) = line.split_once(':') else {
+        return false;
+    };
+    let count = cues
+        .split([',', ';', '|'])
+        .map(str::trim)
+        .filter(|cue| !cue.is_empty())
+        .count();
+    (3..=7).contains(&count)
 }
 
 // Cosine similarity remapped from [-1, 1] to [0, 1], the same scale the tools
@@ -194,6 +242,40 @@ impl Diary {
         self.remember_excluding(body, embedding, confidence, source_ids)
     }
 
+    /// Replace one mutable memory while keeping its source note recoverable.
+    pub fn revise(
+        &mut self,
+        id: &str,
+        body: &str,
+        embedding: &[f32],
+        confidence: f32,
+    ) -> std::io::Result<MemoryRevision> {
+        let Some(source) = self
+            .entries
+            .iter()
+            .find(|entry| entry.id == id && !entry.retired && entry.confidence < 1.0)
+        else {
+            return Ok(MemoryRevision::NotEditable);
+        };
+        if source.body.trim() == body.trim() {
+            return Ok(MemoryRevision::Unchanged);
+        }
+
+        let source_ids = [id.to_string()];
+        let replacement = self.remember_replacement(body, embedding, confidence, &source_ids)?;
+        if let Err(error) = self.retire(&source_ids) {
+            if let Some(replacement_id) = replacement.as_ref() {
+                let _ = self.retire(std::slice::from_ref(replacement_id));
+            }
+            return Err(error);
+        }
+
+        Ok(match replacement {
+            Some(id) => MemoryRevision::Replaced(id),
+            None => MemoryRevision::AlreadyKnown,
+        })
+    }
+
     fn remember_excluding(
         &mut self,
         body: &str,
@@ -216,7 +298,22 @@ impl Diary {
             .map(|entry| entry.file_name.clone())
             .collect::<HashSet<_>>();
         let file_name = unique_file_name(&title, &occupied);
-        let links = self.graph_links(embedding, None, excluded_ids);
+        // Replacements remain navigable to their archived sources in the vault.
+        let mut links = self
+            .entries
+            .iter()
+            .filter(|entry| excluded_ids.iter().any(|id| id == &entry.id))
+            .map(|entry| entry.file_name.clone())
+            .take(MAX_GRAPH_LINKS)
+            .collect::<Vec<_>>();
+        for link in self.graph_links(embedding, None, excluded_ids) {
+            if links.len() == MAX_GRAPH_LINKS {
+                break;
+            }
+            if !links.contains(&link) {
+                links.push(link);
+            }
+        }
         let id = self.next_id();
         let entry = DiaryEntry {
             id,
@@ -235,6 +332,7 @@ impl Diary {
         for existing in &mut self.entries {
             if entry.links.iter().any(|link| link == &existing.file_name)
                 && !existing.links.contains(&entry.file_name)
+                && existing.links.len() < MAX_GRAPH_LINKS
             {
                 existing.links.push(entry.file_name.clone());
                 let _ = write_note_to(&self.directory, existing);
@@ -434,7 +532,7 @@ impl Diary {
         let directory = self.directory.clone();
         let mut retired = 0;
         for entry in &mut self.entries {
-            if ids.iter().any(|id| id == &entry.id) && !entry.retired {
+            if ids.iter().any(|id| id == &entry.id) && !entry.retired && entry.confidence < 1.0 {
                 entry.retired = true;
                 if let Err(error) = write_note_to(&directory, entry) {
                     entry.retired = false;

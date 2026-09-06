@@ -102,6 +102,8 @@ The brain can use only this bounded tool set:
 | `web_search`            | search current outside information through the configured cloud providers              |
 | `list_memories`         | browse durable memories or answer what she remembers                                   |
 | `remember`              | write something worth keeping                                                          |
+| `revise_memory`         | replace an active memory while preserving its archived source                          |
+| `archive_memory`        | remove a mutable memory from recall without deleting its note                          |
 | `inspect_user`          | inspect a Telegram profile and avatar                                                  |
 | `inspect_message_media` | look closely at recent media                                                           |
 | `get_current_time`      | ask Telegram for its server time in UTC+04:00                                          |

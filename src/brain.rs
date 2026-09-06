@@ -236,15 +236,22 @@ impl Brain {
         if matches!(purpose, ChatPurpose::Maintenance) {
             if let Some((client, model)) = reasoning {
                 return match self.chat_with(client, model, messages.clone(), tools).await {
-                    Err(_) => {
-                        self.chat_with(&self.openai, &self.main_model, messages, tools)
-                            .await
-                    }
+                    Err(_) => self.chat_main(messages, tools).await,
                     result => result,
                 };
             }
         }
 
+        self.chat_main(messages, tools).await
+    }
+
+    /// Bypass the optional maintenance model after it returned output that the
+    /// caller could not safely commit.
+    pub(crate) async fn chat_main(
+        &self,
+        messages: Vec<ChatCompletionRequestMessage>,
+        tools: &[ChatCompletionTools],
+    ) -> Result<ChatCompletionResponseMessage> {
         self.chat_with(&self.openai, &self.main_model, messages, tools)
             .await
     }
@@ -613,6 +620,10 @@ fn is_transient(error: &anyhow::Error) -> bool {
         "try again",
         "failed to load",
         "resource limitation",
+        "rate limit",
+        "408",
+        "429",
+        "500",
         "internal error",
         "unavailable",
         "network",

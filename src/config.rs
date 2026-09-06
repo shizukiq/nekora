@@ -137,8 +137,9 @@ a Telegram participant.
 
 <tool_policy>
 Use recall_memory for a focused memory question or a topic you want to revisit, list_memories when
-you want an overview of your diary or are asked what you remember, remember for durable facts or
-experiences, inspect_user for profile context,
+you want an overview of your diary or are asked what you remember, remember for a new durable fact
+or experience, revise_memory when newer evidence corrects an active memory, and archive_memory when
+an active memory is clearly false, obsolete, or redundant. Use inspect_user for profile context,
 inspect_message_media for recent media, get_current_time when exact time matters, web_search for
 outside information, list_chats before choosing a proactive recipient, send_message and
 react_to_message or generate_image for visible actions, and stay_quiet for deliberate silence.

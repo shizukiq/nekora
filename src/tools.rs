@@ -14,6 +14,7 @@ use async_openai::types::chat::{ChatCompletionTool, ChatCompletionTools, Functio
 use serde_json::{json, Value};
 
 use crate::conversation::ReplyGeneration;
+use crate::diary::{is_valid_generated_memory, MemoryRevision};
 use crate::App;
 
 // How many notes recall hands back, and the floor to bother injecting one. The
@@ -57,6 +58,21 @@ pub fn schema() -> Vec<ChatCompletionTools> {
             json!({"type": "object", "properties": {
                 "text": {"type": "string", "description": "a readable Russian Markdown memory with enough identity and retrieval context to find it later"}},
                 "required": ["text"]}),
+        ),
+        (
+            "revise_memory",
+            "Replace one active diary memory when newer evidence makes it incomplete or false. Use an id returned by recall_memory or list_memories and provide the complete corrected Russian Markdown note, including its Retrieval cues paragraph. The previous version is archived for recovery. Immutable confidence-1 anchors cannot be changed.",
+            json!({"type": "object", "properties": {
+                "memory_id": {"type": "string", "description": "id of the active memory to replace"},
+                "text": {"type": "string", "description": "complete corrected self-contained memory"}},
+                "required": ["memory_id", "text"]}),
+        ),
+        (
+            "archive_memory",
+            "Archive one active diary memory that is clearly false, obsolete, or fully redundant. Use an id returned by recall_memory or list_memories. Archiving removes it from normal recall but keeps the note recoverable. Immutable confidence-1 anchors cannot be archived.",
+            json!({"type": "object", "properties": {
+                "memory_id": {"type": "string", "description": "id of the active memory to archive"}},
+                "required": ["memory_id"]}),
         ),
         (
             "inspect_user",
@@ -204,6 +220,11 @@ async fn dispatch(
         }
         "remember" => {
             let text = str_arg(&args, "text")?;
+            if !is_valid_generated_memory(text) {
+                return Err(anyhow!(
+                    "memory must contain a complete final Retrieval cues paragraph"
+                ));
+            }
             let vector = app.brain.embed(text).await?;
             if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
                 return Ok("turn became outdated before the memory was stored".to_string());
@@ -216,6 +237,52 @@ async fn dispatch(
             Ok(match stored {
                 None => "already knew that".to_string(),
                 Some(_) => "noted".to_string(),
+            })
+        }
+        "revise_memory" => {
+            let memory_id = str_arg(&args, "memory_id")?;
+            let text = str_arg(&args, "text")?;
+            if !is_valid_generated_memory(text) {
+                return Err(anyhow!(
+                    "replacement memory must contain a complete final Retrieval cues paragraph"
+                ));
+            }
+            let vector = app.brain.embed(text).await?;
+            if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
+                return Ok("turn became outdated before the memory was revised".to_string());
+            }
+            let revision =
+                app.diary
+                    .lock()
+                    .unwrap()
+                    .revise(memory_id, text, &vector, DEFAULT_CONFIDENCE)?;
+            Ok(match revision {
+                MemoryRevision::Replaced(id) => {
+                    format!("revised as {id}; previous memory archived")
+                }
+                MemoryRevision::AlreadyKnown => {
+                    "correction already existed; previous memory archived".to_string()
+                }
+                MemoryRevision::Unchanged => "memory already says that".to_string(),
+                MemoryRevision::NotEditable => {
+                    "memory was not active or is an immutable anchor".to_string()
+                }
+            })
+        }
+        "archive_memory" => {
+            let memory_id = str_arg(&args, "memory_id")?.to_string();
+            if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
+                return Ok("turn became outdated before the memory was archived".to_string());
+            }
+            let retired = app
+                .diary
+                .lock()
+                .unwrap()
+                .retire(std::slice::from_ref(&memory_id))?;
+            Ok(if retired == 1 {
+                "archived".to_string()
+            } else {
+                "memory was not active or is an immutable anchor".to_string()
             })
         }
         "inspect_user" => {
@@ -258,19 +325,29 @@ async fn dispatch(
                     .as_str()
                     .ok_or_else(|| anyhow!("caption must be a string"))?,
                 None => "",
-            };
+            }
+            .to_string();
             let reply_to_message_id = optional_message_id(&args, "reply_to_message_id")?;
             let image = app.brain.generate_image(description).await?;
-            app.userbot
-                .send_image(
-                    app,
-                    chat_id,
-                    image,
-                    caption,
-                    reply_to_message_id,
-                    generation,
-                )
-                .await?;
+            // Generation may be cancelled when a newer message arrives. Once
+            // Telegram sending begins it must finish its own generation checks
+            // and record a successful send even if the calling turn is dropped.
+            let app = Arc::clone(app);
+            let userbot = Arc::clone(&app.userbot);
+            tokio::spawn(async move {
+                userbot
+                    .send_image(
+                        &app,
+                        chat_id,
+                        image,
+                        &caption,
+                        reply_to_message_id,
+                        generation,
+                    )
+                    .await
+            })
+            .await
+            .map_err(|error| anyhow!("image sender task failed: {error}"))??;
             Ok("sent image".to_string())
         }
         "send_message" => {

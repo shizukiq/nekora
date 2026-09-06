@@ -208,7 +208,10 @@ impl ProviderChain {
                     return Ok(results);
                 }
                 Err(error) => {
-                    if matches!(&error, SearchError::Configuration(_)) {
+                    if matches!(
+                        &error,
+                        SearchError::Configuration(_) | SearchError::Permanent(_)
+                    ) {
                         failures.push(format!("{}: {error}", slot.provider.name()));
                         continue;
                     }
@@ -319,7 +322,9 @@ pub(crate) async fn response_json<T: DeserializeOwned>(
             .filter(|seconds| *seconds > 0)
             .map(|seconds| Duration::from_secs(seconds.min(MAX_COOLDOWN_SECS)));
         let message = format!("{provider} returned HTTP {status}");
-        let error = if status == StatusCode::TOO_MANY_REQUESTS {
+        let error = if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            SearchError::Configuration(message)
+        } else if status == StatusCode::TOO_MANY_REQUESTS {
             SearchError::RateLimited {
                 message,
                 retry_after,

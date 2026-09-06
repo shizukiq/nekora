@@ -52,8 +52,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # for every backend. The pure core modules deliberately avoid it and use std only.
 anyhow = "1"
 
-# The I/O layer's small randomness: the 10% chance she ignores a message, the
-# words-per-minute typing jitter. The core has
+# The I/O layer's small randomness: words-per-minute typing jitter. The core has
 # its own std-only PRNG; this is only for the hand.
 rand = "0.9"
 

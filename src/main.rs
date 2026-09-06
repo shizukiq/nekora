@@ -704,7 +704,11 @@ async fn run_turn(app: &Arc<App>) -> Result<()> {
         let snapshot = app.today_snapshot();
         match sleep::consolidate(app, snapshot.lines.clone(), true).await {
             Ok(fresh) if fresh.is_empty() => {
-                app.finish_today(&snapshot, Some(day.clone()))?;
+                if let Err(error) = app.finish_today(&snapshot, Some(day.clone())) {
+                    // The batch was already removed from Conversation. Keep the
+                    // old journal and process that batch instead of losing it.
+                    eprintln!("rollover checkpoint failed, continuing with old journal: {error:#}");
+                }
             }
             Ok(_) => {}
             Err(error) => {
@@ -752,7 +756,6 @@ async fn run_turn(app: &Arc<App>) -> Result<()> {
                 // the buffer out of order. Telegram ids are per-chat monotonic, so
                 // this restores the order the person actually sent them in.
                 events.sort_by_key(|event| event.message_id);
-                app.assess_incoming(&events);
                 if let Err(error) = respond(app, &events, generation).await {
                     let mut conversation = app.conversation.lock().unwrap();
                     let now_ms = app.monotonic_ms();
@@ -761,6 +764,7 @@ async fn run_turn(app: &Arc<App>) -> Result<()> {
                     }
                     return Err(error);
                 }
+                app.assess_incoming(&events);
             } else {
                 app.assess_incoming(&events);
             }
@@ -1038,8 +1042,8 @@ async fn run() -> Result<()> {
 
     let userbot = Arc::new(Userbot::new(client, Arc::clone(&session), brain.clone()));
     let today = Today::open()?;
-    let social = SocialState::open()?;
     let creator_user_id = config::creator_user_id()?;
+    let social = SocialState::open(creator_user_id)?;
     let app = Arc::new(App::new(
         brain,
         userbot,

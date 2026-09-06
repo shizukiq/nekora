@@ -139,7 +139,7 @@ pub struct SocialState {
 }
 
 impl SocialState {
-    pub fn open() -> Result<Self> {
+    pub fn open(creator_user_id: Option<i64>) -> Result<Self> {
         let path = config::runtime_dir().join(SOCIAL_FILE);
         let saved = if path.exists() {
             let raw = persistence::read_runtime_file(&path)
@@ -153,7 +153,7 @@ impl SocialState {
             SavedSocial::default()
         };
         let mut state = Self { path, saved };
-        state.normalize();
+        state.normalize(creator_user_id);
         if !state.path.exists() {
             state.persist()?;
         }
@@ -335,7 +335,7 @@ impl SocialState {
         Ok(())
     }
 
-    fn normalize(&mut self) {
+    fn normalize(&mut self, creator_user_id: Option<i64>) {
         self.saved.mood.intensity = self.saved.mood.intensity.min(3);
         self.saved.mood.reason = clipped(&self.saved.mood.reason, MAX_REASON_CHARS);
         self.saved.people.retain(|user_id, person| {
@@ -346,7 +346,7 @@ impl SocialState {
             person.username = cleaned_username(person.username.as_deref());
             true
         });
-        self.trim_relationships(None);
+        self.trim_relationships(creator_user_id);
     }
 
     fn trim_relationships(&mut self, creator_user_id: Option<i64>) {
