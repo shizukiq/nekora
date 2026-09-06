@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use chrono::{DateTime, FixedOffset, Utc};
+use chrono::{DateTime, Utc};
 use grammers_client::media::{Document, Downloadable, Media, PhotoSize, Sticker};
 use grammers_client::message::{InputMessage, InputReactions, Message as TelegramMessage};
 use grammers_client::peer::Peer;
@@ -30,7 +30,7 @@ use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::brain::{Brain, GeneratedImage};
-use crate::config::env_or;
+use crate::config::{self, env_or};
 use crate::conversation::{split_message, ReplyGeneration};
 use crate::heartbeat::PresencePlan;
 use crate::App;
@@ -45,7 +45,6 @@ const BUBBLE_DELAY_PER_WORD_MS: u64 = 220;
 // How many recent chats list_chats shows the model, and how much of each last line.
 const RECENT_CHATS: usize = 20;
 const LAST_LINE_CHARS: usize = 120;
-const TELEGRAM_TIME_OFFSET_SECONDS: i32 = 4 * 60 * 60;
 const MAX_TEXT_DOCUMENT_BYTES: usize = 96 * 1024;
 const MAX_MEDIA_BYTES: usize = 32 * 1024 * 1024;
 const MAX_CONTEXT_ITEMS: usize = 16;
@@ -205,7 +204,10 @@ impl Userbot {
             message_id: message.id() as i64,
             sender,
             username,
-            timestamp: message.date().to_rfc3339(),
+            timestamp: message
+                .date()
+                .with_timezone(&config::nekora_utc_offset())
+                .to_rfc3339(),
             metadata,
             text,
         }
@@ -300,7 +302,7 @@ impl Userbot {
             message_id: i64::from(update.msg_id),
             sender: "Telegram reactions".to_string(),
             username: None,
-            timestamp: Utc::now().to_rfc3339(),
+            timestamp: config::nekora_time().to_rfc3339(),
             metadata,
             text: format!("[Telegram reaction update on message_id={}]", update.msg_id),
         })
@@ -519,8 +521,7 @@ impl Userbot {
             .await?;
         let utc = DateTime::<Utc>::from_timestamp_secs(i64::from(state.date))
             .ok_or_else(|| anyhow!("Telegram returned an invalid server timestamp"))?;
-        let offset = FixedOffset::east_opt(TELEGRAM_TIME_OFFSET_SECONDS)
-            .ok_or_else(|| anyhow!("invalid UTC+4 offset"))?;
+        let offset = config::nekora_utc_offset();
         let datetime = utc
             .with_timezone(&offset)
             .format("%Y-%m-%d %H:%M:%S %:z")

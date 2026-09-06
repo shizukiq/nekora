@@ -30,7 +30,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Result};
-use chrono::Local;
 use grammers_client::client::UpdatesConfiguration;
 use grammers_client::session::storages::SqliteSession;
 use grammers_client::session::types::{PeerId, PeerKind};
@@ -1076,11 +1075,13 @@ fn unix_seconds() -> i64 {
 }
 
 fn today_str() -> String {
-    Local::now().format("%Y-%m-%d").to_string()
+    config::nekora_time().format("%Y-%m-%d").to_string()
 }
 
 fn now_stamp() -> String {
-    Local::now().format("%Y-%m-%d %H:%M").to_string()
+    config::nekora_time()
+        .format("%Y-%m-%d %H:%M %:z")
+        .to_string()
 }
 
 #[cfg(test)]
