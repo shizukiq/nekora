@@ -1093,7 +1093,7 @@ impl Userbot {
     /// The last handful of chats, so the model can choose who to talk to. Also
     /// caches each peer so a later send_message to it can resolve.
     pub async fn recent_chats(&self) -> Result<Vec<ChatSummary>> {
-        let mut dialogs = self.client.iter_dialogs().limit(RECENT_CHATS);
+        let mut dialogs = self.client.iter_dialogs();
         let mut out = Vec::new();
         while let Some(dialog) = dialogs.next().await? {
             let id = dialog.peer.id().bot_api_dialog_id_unchecked();
@@ -1115,6 +1115,9 @@ impl Userbot {
                 username: dialog.peer.username().map(str::to_string),
                 last,
             });
+            if out.len() == RECENT_CHATS {
+                break;
+            }
         }
         Ok(out)
     }

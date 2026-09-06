@@ -48,13 +48,10 @@ const SLEEP_CHANCE: f64 = 0.01;
 const SLEEP_MIN_MINUTES: i64 = 15;
 const SLEEP_MAX_MINUTES: i64 = 120;
 
-/// The part of her rhythm that emotions will eventually move around. Keeping it
-/// with the heartbeat means a message handler never grows its own social rules.
+/// Timing for brief online returns around a turn. Keeping it with the heartbeat
+/// keeps Telegram presence timing out of the message handler.
 #[derive(Clone, Copy)]
 pub struct SocialPace {
-    pub private_reply_chance: f64,
-    pub addressed_group_reply_chance: f64,
-    pub passive_group_reply_chance: f64,
     pub idle_return_chance: f64,
     pub idle_return_min: Duration,
     pub idle_return_max: Duration,
@@ -64,9 +61,6 @@ pub struct SocialPace {
 impl Default for SocialPace {
     fn default() -> Self {
         Self {
-            private_reply_chance: 0.98,
-            addressed_group_reply_chance: 0.48,
-            passive_group_reply_chance: 0.14,
             idle_return_chance: 0.35,
             idle_return_min: Duration::from_secs(2 * 60),
             idle_return_max: Duration::from_secs(8 * 60),
@@ -117,25 +111,7 @@ impl Heartbeat {
         self.asleep_until = 0;
     }
 
-    pub fn should_consider_reply(
-        &mut self,
-        is_private: bool,
-        is_addressed: bool,
-        attention_multiplier: f64,
-    ) -> bool {
-        let chance = if is_private {
-            self.social_pace.private_reply_chance
-        } else if is_addressed {
-            self.social_pace.addressed_group_reply_chance
-        } else {
-            self.social_pace.passive_group_reply_chance
-        };
-        self.random.chance() < (chance * attention_multiplier).clamp(0.0, 1.0)
-    }
-
     /// Decide whether her next quiet stretch gets a brief, unprompted return.
-    /// The choice belongs to the same mutable rhythm as reply attention, so an
-    /// emotion layer can change both without teaching Telegram about emotions.
     pub fn presence_plan(&mut self) -> PresencePlan {
         let pace = self.social_pace;
         let idle_return_after = (self.random.chance() < pace.idle_return_chance.clamp(0.0, 1.0))

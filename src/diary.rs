@@ -436,7 +436,10 @@ impl Diary {
         for entry in &mut self.entries {
             if ids.iter().any(|id| id == &entry.id) && !entry.retired {
                 entry.retired = true;
-                write_note_to(&directory, entry)?;
+                if let Err(error) = write_note_to(&directory, entry) {
+                    entry.retired = false;
+                    return Err(error);
+                }
                 retired += 1;
             }
         }

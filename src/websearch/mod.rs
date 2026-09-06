@@ -96,6 +96,9 @@ impl SearchResult {
         snippet: Option<&str>,
     ) -> Option<Self> {
         let url = url.trim();
+        if url.chars().count() > MAX_URL_CHARS {
+            return None;
+        }
         let Ok(parsed_url) = Url::parse(url) else {
             return None;
         };
@@ -111,7 +114,7 @@ impl SearchResult {
                     .unwrap_or("untitled result"),
                 MAX_TITLE_CHARS,
             ),
-            url: clip(url, MAX_URL_CHARS),
+            url: url.to_string(),
             snippet: clip(snippet.unwrap_or_default().trim(), MAX_SNIPPET_CHARS),
         })
     }
@@ -196,11 +199,19 @@ impl ProviderChain {
             }
             attempted = true;
             match slot.provider.search(query, limit).await {
+                Ok(results) if results.results.is_empty() => {
+                    slot.clear_cooldown();
+                    failures.push(format!("{}: no results", slot.provider.name()));
+                }
                 Ok(results) => {
                     slot.clear_cooldown();
                     return Ok(results);
                 }
                 Err(error) => {
+                    if matches!(&error, SearchError::Configuration(_)) {
+                        failures.push(format!("{}: {error}", slot.provider.name()));
+                        continue;
+                    }
                     let Some(delay) = error.fallback_delay(self.cooldown) else {
                         return Err(anyhow!(
                             "web search provider {} failed: {error}",

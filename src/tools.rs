@@ -47,15 +47,15 @@ pub fn schema() -> Vec<ChatCompletionTools> {
         ),
         (
             "list_memories",
-            "List durable diary entries when you need to answer what you remember.",
+            "Browse durable diary entries when you want an overview of your memories or need to answer what you remember.",
             json!({"type": "object", "properties": {
                 "limit": {"type": "integer", "minimum": 0, "maximum": 100}}}),
         ),
         (
             "remember",
-            "Write one self-contained lasting diary note. Use canonical names; preserve source, outcome, and uncertainty; end with `Retrieval cues:` and three to five likely search phrases. Use for things worth keeping, not small talk.",
+            "Write one self-contained lasting diary note in Russian. Use canonical names; preserve source, outcome, and uncertainty. Format multiple ideas as short Markdown paragraphs separated by blank lines. End with a separate one-line `Retrieval cues: cue one; cue two; cue three` paragraph containing three to five likely search phrases. Use for things worth keeping, not small talk.",
             json!({"type": "object", "properties": {
-                "text": {"type": "string", "description": "a standalone memory with enough identity and retrieval context to find it later"}},
+                "text": {"type": "string", "description": "a readable Russian Markdown memory with enough identity and retrieval context to find it later"}},
                 "required": ["text"]}),
         ),
         (

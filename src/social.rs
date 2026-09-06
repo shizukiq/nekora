@@ -1,6 +1,6 @@
 //! Persistent social state: Nekora's current mood and the relationships that
-//! change how much attention a person gets. Telegram stays unaware of these
-//! choices; the heartbeat asks this module for an attention decision instead.
+//! inform her choices. Telegram stays unaware of them; only an active avoidance
+//! boundary prevents an event from reaching her decision-making turn.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -20,13 +20,6 @@ pub struct SocialActor {
     pub user_id: i64,
     pub name: String,
     pub username: Option<String>,
-}
-
-#[derive(Clone, Copy)]
-pub enum ReplyAttention {
-    Always,
-    Never,
-    Adjust(f64),
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -189,7 +182,8 @@ impl SocialState {
             let relationship = self.saved.people.get(&actor.user_id);
             let trust = relationship.map_or(50, |person| person.trust);
             let affection = relationship.map_or(50, |person| person.affection);
-            let avoiding = relationship.is_some_and(|person| person.avoid_until > unix_seconds());
+            let avoiding = Some(actor.user_id) != creator_user_id
+                && relationship.is_some_and(|person| person.avoid_until > unix_seconds());
             let role = (Some(actor.user_id) == creator_user_id)
                 .then_some(" creator")
                 .unwrap_or("");
@@ -221,10 +215,14 @@ impl SocialState {
         }
         let mut people = self.saved.people.iter().collect::<Vec<_>>();
         people.sort_by_key(|(_, person)| std::cmp::Reverse((person.score(), person.last_seen)));
-        for (user_id, person) in people.into_iter().take(3) {
-            if person.avoid_until > unix_seconds() {
-                continue;
-            }
+        let now = unix_seconds();
+        for (user_id, person) in people
+            .into_iter()
+            .filter(|(user_id, person)| {
+                Some(**user_id) == creator_user_id || person.avoid_until <= now
+            })
+            .take(3)
+        {
             lines.push(format!(
                 "trusted contact user_id={user_id}: trust={}/100, warmth={}/100",
                 person.trust, person.affection
@@ -236,48 +234,24 @@ impl SocialState {
         )
     }
 
-    pub fn reply_attention(
+    pub fn allows_reply_decision(
         &self,
         actors: &[SocialActor],
         creator_user_id: Option<i64>,
         now: i64,
-    ) -> ReplyAttention {
+    ) -> bool {
         if creator_user_id
             .is_some_and(|creator| actors.iter().any(|actor| actor.user_id == creator))
         {
-            return ReplyAttention::Always;
+            return true;
         }
-        let people = actors
-            .iter()
-            .filter_map(|actor| self.saved.people.get(&actor.user_id))
-            .collect::<Vec<_>>();
-        if !actors.is_empty()
-            && actors.iter().all(|actor| {
+        actors.is_empty()
+            || !actors.iter().all(|actor| {
                 self.saved
                     .people
                     .get(&actor.user_id)
                     .is_some_and(|person| person.avoid_until > now)
             })
-        {
-            return ReplyAttention::Never;
-        }
-        let relationship = if people.is_empty() {
-            0.5
-        } else {
-            people
-                .iter()
-                .map(|person| f64::from(person.score()) / 200.0)
-                .sum::<f64>()
-                / people.len() as f64
-        };
-        let mood = match self.saved.mood.kind {
-            MoodKind::Warm | MoodKind::Cheerful => 1.08,
-            MoodKind::Sad if relationship >= 0.6 => 1.12,
-            MoodKind::Hurt | MoodKind::Anxious if relationship < 0.6 => 0.8,
-            MoodKind::Tired => 0.85,
-            _ => 1.0,
-        };
-        ReplyAttention::Adjust((0.82 + relationship * 0.36) * mood)
     }
 
     pub fn apply_appraisal(

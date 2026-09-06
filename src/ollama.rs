@@ -52,6 +52,7 @@ pub async fn start_if_managed(vision_model: &str) -> Result<Option<Managed>> {
         .arg("serve")
         // `ollama serve` reads OLLAMA_HOST as a bare host:port, without the scheme.
         .env("OLLAMA_HOST", authority(&host))
+        .kill_on_drop(true)
         .spawn()?;
 
     let ollama = client_from_host(&host);

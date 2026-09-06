@@ -44,7 +44,7 @@ use brain::Brain;
 use conversation::{Conversation, ConversationBatch, ConversationMessage, ReplyGeneration};
 use diary::Diary;
 use heartbeat::Heartbeat;
-use social::{ReplyAttention, SocialActor, SocialState};
+use social::{SocialActor, SocialState};
 use userbot::{Incoming, Userbot};
 use websearch::ProviderChain;
 
@@ -519,12 +519,13 @@ impl App {
         self.proactive_social_context()
     }
 
-    fn reply_attention(&self, events: &[Incoming]) -> ReplyAttention {
+    fn allows_reply_decision(&self, events: &[Incoming]) -> bool {
         let actors = social_actors(events);
-        self.social
-            .lock()
-            .unwrap()
-            .reply_attention(&actors, self.creator_user_id, unix_seconds())
+        self.social.lock().unwrap().allows_reply_decision(
+            &actors,
+            self.creator_user_id,
+            unix_seconds(),
+        )
     }
 }
 
@@ -657,24 +658,6 @@ async fn respond(app: &Arc<App>, events: &[Incoming], generation: ReplyGeneratio
         .await
 }
 
-fn should_consider_reply(app: &App, events: &[Incoming]) -> bool {
-    let is_private = events.first().is_some_and(|event| event.chat_id > 0);
-    let is_addressed = events.iter().any(|event| {
-        event
-            .metadata
-            .contains("telegram_addressed_to_account=true")
-    });
-    match app.reply_attention(events) {
-        ReplyAttention::Always => true,
-        ReplyAttention::Never => false,
-        ReplyAttention::Adjust(multiplier) => app.heartbeat.lock().unwrap().should_consider_reply(
-            is_private,
-            is_addressed,
-            multiplier,
-        ),
-    }
-}
-
 /// Wait for a ready conversation batch or the autonomous tick, whichever comes
 /// first. `None` means the tick fired with nobody talking.
 async fn wait_for_turn(app: &Arc<App>) -> Option<ConversationBatch> {
@@ -745,7 +728,7 @@ async fn run_turn(app: &Arc<App>) -> Result<()> {
             let mut messages = batch.messages;
             let mut events = to_events(chat_id, messages.clone());
             app.userbot.mark_read(chat_id).await;
-            if should_consider_reply(app, &events) {
+            if app.allows_reply_decision(&events) {
                 tokio::time::sleep(RESPONSE_GRACE).await;
                 let (late, generation) = {
                     let mut conversation = app.conversation.lock().unwrap();
@@ -878,8 +861,8 @@ async fn ingest(app: &Arc<App>, updates: &mut grammers_client::client::UpdateStr
             Ok(update) if update_needs_handling(&update) => {
                 if let Update::NewMessage(message) = &update {
                     let chat_id = message.peer_id().bot_api_dialog_id_unchecked();
-                    if message.peer_id().kind() == PeerKind::User
-                        && app.userbot.is_known_private_contact(chat_id)
+                    if message.peer_id().kind() != PeerKind::User
+                        || app.userbot.is_known_private_contact(chat_id)
                     {
                         // Do not let slow media handlers ahead of this message
                         // keep an obsolete reply alive while we wait for a slot.
@@ -910,7 +893,10 @@ fn update_needs_handling(update: &Update) -> bool {
         Update::NewMessage(message) | Update::MessageEdited(message) => !message.outgoing(),
         Update::Raw(raw) => matches!(
             &raw.raw,
-            tl::enums::Update::MessageReactions(_) | tl::enums::Update::UserTyping(_)
+            tl::enums::Update::MessageReactions(_)
+                | tl::enums::Update::UserTyping(_)
+                | tl::enums::Update::ChatUserTyping(_)
+                | tl::enums::Update::ChannelUserTyping(_)
         ),
         _ => false,
     }
@@ -928,7 +914,7 @@ async fn handle_incoming(app: &Arc<App>, message: Message, is_edit: bool) {
     }
     // Invalidate before media captioning or reply lookups: those can take much
     // longer than the old generation needs to finish and reach Telegram.
-    if !is_edit && message.peer_id().kind() == PeerKind::User {
+    if !is_edit {
         app.message_arrived(chat_id);
     }
     let incoming = app.userbot.describe(&message).await;
@@ -977,20 +963,44 @@ async fn handle_update(app: &Arc<App>, update: Update) {
                     }
                 }
             }
-            if let tl::enums::Update::UserTyping(typing) = &raw.raw {
-                if let Some(chat_id) =
-                    PeerId::user(typing.user_id).map(PeerId::bot_api_dialog_id_unchecked)
+            let typing = match &raw.raw {
+                tl::enums::Update::UserTyping(typing) => PeerId::user(typing.user_id).map(|peer| {
+                    let chat_id = peer.bot_api_dialog_id_unchecked();
+                    (chat_id, chat_id, &typing.action)
+                }),
+                tl::enums::Update::ChatUserTyping(typing) => {
+                    PeerId::chat(typing.chat_id).and_then(|peer| {
+                        Some((
+                            peer.bot_api_dialog_id_unchecked(),
+                            PeerId::from(&typing.from_id).bot_api_dialog_id()?,
+                            &typing.action,
+                        ))
+                    })
+                }
+                tl::enums::Update::ChannelUserTyping(typing) => PeerId::channel(typing.channel_id)
+                    .and_then(|peer| {
+                        Some((
+                            peer.bot_api_dialog_id_unchecked(),
+                            PeerId::from(&typing.from_id).bot_api_dialog_id()?,
+                            &typing.action,
+                        ))
+                    }),
+                _ => None,
+            };
+            if let Some((chat_id, sender_id, action)) = typing {
+                if !matches!(
+                    action,
+                    tl::enums::SendMessageAction::SendMessageCancelAction
+                ) && app.userbot.chat_is_in_contact_scope(chat_id).await
                 {
-                    if app.userbot.chat_is_in_contact_scope(chat_id).await {
-                        let now_ms = app.monotonic_ms();
-                        if app
-                            .conversation
-                            .lock()
-                            .unwrap()
-                            .note_typing(chat_id, chat_id, now_ms)
-                        {
-                            app.wake.notify_one();
-                        }
+                    let now_ms = app.monotonic_ms();
+                    if app
+                        .conversation
+                        .lock()
+                        .unwrap()
+                        .note_typing(chat_id, sender_id, now_ms)
+                    {
+                        app.wake.notify_one();
                     }
                 }
             }
