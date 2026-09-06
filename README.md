@@ -6,7 +6,6 @@
 
 ![Rust](https://img.shields.io/badge/Rust-2021-%23dea584?style=for-the-badge&logo=rust&logoColor=white)
 ![Telegram](https://img.shields.io/badge/Telegram-MTProto-%232AABEE?style=for-the-badge&logo=telegram&logoColor=white)
-![License](https://img.shields.io/badge/License-GPL--3-green?style=for-the-badge)
 
 **An autonomous Telegram character with persistent memory, social state, and her own rhythm.**
 
@@ -59,14 +58,14 @@ back or remain disabled instead of silently changing the visible conversation mo
 | Path                 | Default                                    | Notes                                                                                                        |
 |----------------------|--------------------------------------------|--------------------------------------------------------------------------------------------------------------|
 | Visible conversation | `deepseek-v4-flash`                        | OpenAI-compatible main endpoint; also appraises incoming social events                                       |
-| Private maintenance  | main model                                 | optionally routed through OpenRouter with `NEKORA_REASONING_MODEL`; any failure falls back to the main model |
+| Private maintenance  | `openai/gpt-5.6-luna` on OpenRouter        | configurable with `NEKORA_REASONING_MODEL`; an empty value disables it, and failures fall back to the main model |
 | Embeddings           | `bge-m3` on Ollama                         | fixed local vector space for diary recall                                                                    |
 | Vision               | `qwen/qwen3-vl-32b-instruct` on OpenRouter | falls back to `qwen2.5vl:3b` on local Ollama                                                                 |
 | Web search           | Ollama Cloud, then OpenRouter              | provider order is configurable; results are normalized before entering the turn                              |
 | Image generation     | disabled                                   | requires separate OpenRouter prompt and image models; every image passes a vision quality gate               |
 
-Do not change the embedding model for an existing vault: old and new vectors would no longer be comparable. Setting
-`NEKORA_REASONING_MODEL` to a model such as `openai/gpt-5.6-luna` does not move visible conversations to OpenRouter.
+Do not change the embedding model for an existing vault: old and new vectors would no longer be comparable. Changing
+`NEKORA_REASONING_MODEL` does not move visible conversations to OpenRouter.
 
 ## Memory and social state
 
@@ -237,7 +236,7 @@ variables win over it.
 | `OPENROUTER_WEB_SEARCH_ENGINE` | `auto`                              | OpenRouter search engine selection                                                                        |
 | `NEKORA_VISION_MODEL`          | `qwen/qwen3-vl-32b-instruct`        | primary OpenRouter vision model                                                                           |
 | `NEKORA_LOCAL_VISION_MODEL`    | `qwen2.5vl:3b`                      | local Ollama vision fallback                                                                              |
-| `NEKORA_REASONING_MODEL`       | empty                               | optional OpenRouter model for private maintenance and public-result appraisal, e.g. `openai/gpt-5.6-luna` |
+| `NEKORA_REASONING_MODEL`       | `openai/gpt-5.6-luna`               | OpenRouter model for private maintenance and public-result appraisal; set empty to use the main model     |
 | `NEKORA_IMAGE_MODEL`           | empty                               | OpenRouter model slug for the dedicated `/images` API                                                     |
 | `NEKORA_IMAGE_PROMPT_MODEL`    | empty                               | OpenRouter chat model that engineers generation prompts                                                   |
 | `NEKORA_IMAGE_PROMPT`          | empty                               | optional canonical appearance prompt for generated images                                                 |

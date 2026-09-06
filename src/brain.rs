@@ -42,6 +42,7 @@ const DEFAULT_MAIN_API_BASE: &str = "https://api.deepseek.com/v1";
 const DEFAULT_OPENROUTER_API_BASE: &str = "https://openrouter.ai/api/v1";
 const DEFAULT_VISION_MODEL: &str = "qwen/qwen3-vl-32b-instruct";
 const DEFAULT_LOCAL_VISION_MODEL: &str = "qwen2.5vl:3b";
+const DEFAULT_REASONING_MODEL: &str = "openai/gpt-5.6-luna";
 const EMBED_MODEL: &str = "bge-m3";
 
 // Low temperature keeps her in character rather than loose.
@@ -184,7 +185,8 @@ impl Brain {
             )),
             main_model: env_or("NEKORA_MAIN_MODEL", "deepseek-v4-flash"),
             vision_model: env_or("NEKORA_VISION_MODEL", DEFAULT_VISION_MODEL),
-            reasoning_model: nonempty_env("NEKORA_REASONING_MODEL"),
+            reasoning_model: Some(env_or("NEKORA_REASONING_MODEL", DEFAULT_REASONING_MODEL))
+                .filter(|model| !model.trim().is_empty()),
             image_model: nonempty_env("NEKORA_IMAGE_MODEL"),
             image_prompt_model: nonempty_env("NEKORA_IMAGE_PROMPT_MODEL"),
             image_prompt: env_or("NEKORA_IMAGE_PROMPT", ""),
