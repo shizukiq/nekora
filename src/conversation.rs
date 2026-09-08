@@ -5,8 +5,8 @@ const TYPING_HOLD_MS: i64 = 4_000;
 const MAX_BATCH_MS: i64 = 10_000;
 const MAX_BATCH_MESSAGES: usize = 32;
 const PRIVATE_RETRY_MS: i64 = 60_000;
-const GROUP_RETRY_MS: i64 = 5 * 60_000;
 const MAX_RETRY_MS: i64 = 27 * 60_000;
+const GROUP_SESSION_GAP_MS: i64 = 15 * 60_000;
 
 #[derive(Clone)]
 pub struct ConversationMessage {
@@ -50,6 +50,12 @@ struct Pending {
     sequence: u64,
 }
 
+struct GroupSession {
+    last_message_at: i64,
+    considered: bool,
+    participating: bool,
+}
+
 impl Pending {
     fn keep_recent_messages(&mut self) {
         let excess = self.messages.len().saturating_sub(MAX_BATCH_MESSAGES);
@@ -83,10 +89,47 @@ impl Pending {
 pub struct Conversation {
     pending: BTreeMap<i64, Pending>,
     revisions: BTreeMap<i64, u64>,
+    group_sessions: BTreeMap<i64, GroupSession>,
     next_sequence: u64,
 }
 
 impl Conversation {
+    /// Treat continuous group chatter as one social session. Once Nekora has
+    /// considered that session and stayed out, only a direct address should
+    /// pull her back in before the room has gone quiet for a while.
+    pub fn should_open_group_turn(
+        &mut self,
+        chat_id: i64,
+        addressed_to_account: bool,
+        now_ms: i64,
+    ) -> bool {
+        let session = self.group_sessions.entry(chat_id).or_insert(GroupSession {
+            last_message_at: now_ms,
+            considered: false,
+            participating: false,
+        });
+        if now_ms.saturating_sub(session.last_message_at) >= GROUP_SESSION_GAP_MS {
+            session.considered = false;
+            session.participating = false;
+        }
+        session.last_message_at = now_ms;
+        addressed_to_account || session.participating || !session.considered
+    }
+
+    pub fn note_group_participation(&mut self, chat_id: i64, now_ms: i64) {
+        if chat_id >= 0 {
+            return;
+        }
+        let session = self.group_sessions.entry(chat_id).or_insert(GroupSession {
+            last_message_at: now_ms,
+            considered: true,
+            participating: true,
+        });
+        session.last_message_at = now_ms;
+        session.considered = true;
+        session.participating = true;
+    }
+
     /// Invalidate any reply currently being generated for this chat.
     pub fn message_arrived(&mut self, chat_id: i64) {
         let revision = self.revisions.entry(chat_id).or_default();
@@ -167,6 +210,9 @@ impl Conversation {
             .min_by_key(|(chat_id, pending)| (**chat_id < 0, pending.sequence))
             .map(|(chat_id, _)| *chat_id)?;
         let pending = self.pending.remove(&chat_id).unwrap();
+        if let Some(session) = self.group_sessions.get_mut(&chat_id) {
+            session.considered = true;
+        }
         Some(ConversationBatch {
             chat_id,
             messages: pending.messages,
@@ -206,12 +252,14 @@ impl Conversation {
     /// Keep a deliberately unanswered batch alive. Repeated silence backs off
     /// to the normal heartbeat interval instead of spinning or forgetting it.
     pub fn defer_after_silence(&mut self, mut batch: ConversationBatch, now_ms: i64) {
+        if batch.chat_id < 0 {
+            if let Some(session) = self.group_sessions.get_mut(&batch.chat_id) {
+                session.participating = false;
+            }
+            return;
+        }
         batch.silent_reviews = batch.silent_reviews.saturating_add(1);
-        let base = if batch.chat_id > 0 {
-            PRIVATE_RETRY_MS
-        } else {
-            GROUP_RETRY_MS
-        };
+        let base = PRIVATE_RETRY_MS;
         let multiplier = 1_i64
             .checked_shl(batch.silent_reviews.saturating_sub(1).min(30))
             .unwrap_or(i64::MAX);

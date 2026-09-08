@@ -110,11 +110,6 @@ impl SearchProvider for OpenRouterProvider {
                 .filter(|result| seen_urls.insert(result.url.clone()))
                 .take(limit)
                 .collect::<Vec<_>>();
-            if results.is_empty() {
-                return Err(SearchError::Temporary(
-                    "openrouter returned no web citations".to_string(),
-                ));
-            }
             Ok(SearchResults { results })
         })
     }

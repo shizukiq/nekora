@@ -270,6 +270,10 @@ impl App {
 
     /// Keep a sent answer in today's context.
     pub fn record_outgoing(&self, chat_id: i64, text: &str, reply_to_message_id: Option<i64>) {
+        self.conversation
+            .lock()
+            .unwrap()
+            .note_group_participation(chat_id, self.monotonic_ms());
         let metadata = reply_to_message_id.map_or_else(String::new, |message_id| {
             format!("telegram_context:\ntelegram_reply_to_message_id={message_id}\n")
         });
@@ -806,7 +810,11 @@ async fn run_turn(app: &Arc<App>, batch: Option<ConversationBatch>) -> Result<()
                     silent_reviews,
                 };
                 match outcome {
-                    brain::TurnOutcome::VisibleAction => {}
+                    brain::TurnOutcome::VisibleAction => app
+                        .conversation
+                        .lock()
+                        .unwrap()
+                        .note_group_participation(chat_id, app.monotonic_ms()),
                     brain::TurnOutcome::StayedQuiet => app
                         .conversation
                         .lock()
@@ -913,8 +921,8 @@ async fn ingest(app: &Arc<App>, updates: &mut grammers_client::client::UpdateStr
             Ok(update) if update_needs_handling(&update) => {
                 if let Update::NewMessage(message) = &update {
                     let chat_id = message.peer_id().bot_api_dialog_id_unchecked();
-                    if message.peer_id().kind() != PeerKind::User
-                        || app.userbot.is_known_private_contact(chat_id)
+                    if message.peer_id().kind() == PeerKind::User
+                        && app.userbot.is_known_private_contact(chat_id)
                     {
                         app.message_arrived(chat_id);
                     }
@@ -958,16 +966,22 @@ async fn handle_incoming(app: &Arc<App>, message: Message, is_edit: bool) {
     if !app.userbot.accepts_incoming(&message).await {
         return;
     }
-    // Invalidate before slower media and reply lookups.
-    if !is_edit {
-        app.message_arrived(chat_id);
-    }
     let incoming = app.userbot.describe(&message).await;
     app.record_event(&incoming);
     if is_edit || app.userbot.is_broadcast_channel(chat_id).await {
         return;
     }
     let now_ms = app.monotonic_ms();
+    if chat_id < 0
+        && !app.conversation.lock().unwrap().should_open_group_turn(
+            chat_id,
+            message.mentioned(),
+            now_ms,
+        )
+    {
+        return;
+    }
+    app.message_arrived(chat_id);
     app.conversation.lock().unwrap().push(
         incoming.chat_id,
         ConversationMessage {
@@ -1073,12 +1087,18 @@ async fn run() -> Result<()> {
     let pool_task = tokio::spawn(runner.run());
 
     userbot::login(&client).await?;
+    let account_user_id = client.get_me().await?.id().bot_api_dialog_id_unchecked();
     let mut update_stream = client
         .stream_updates(updates, UpdatesConfiguration::default())
         .await
         .map_err(|error| anyhow::anyhow!("could not start update stream: {error}"))?;
 
-    let userbot = Arc::new(Userbot::new(client, Arc::clone(&session), brain.clone()));
+    let userbot = Arc::new(Userbot::new(
+        client,
+        account_user_id,
+        Arc::clone(&session),
+        brain.clone(),
+    ));
     let today = Today::open()?;
     let creator_user_id = config::creator_user_id()?;
     let social = SocialState::open(creator_user_id)?;

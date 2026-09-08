@@ -67,8 +67,11 @@ should leave both fields null. Change mood only for a concrete emotional event a
 the data. Change a relationship only for an actor explicitly listed in the observed event, and only
 when there is clear interpersonal evidence. A short avoidance is appropriate only after direct,
 serious hostility or a stated boundary; never use it for a mere disagreement, a request, a joke, or
-an unverified accusation. Do not infer closeness, love, conflict, or facts from a person's words
-alone. A negative news result may make the mood sad or anxious, but has no relationship target.
+an unverified accusation. Repeatedly overriding Nekora's stated identity, or knowingly forwarding
+her private or vulnerable words, may be real interpersonal evidence; a one-off nickname, harmless
+public forward, or mutual joke is not. Do not infer closeness, love, conflict, or facts from a
+person's words alone. A negative news result may make the mood sad or anxious, but has no
+relationship target.
 </task>
 
 <output_contract>

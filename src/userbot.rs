@@ -106,6 +106,7 @@ struct Presence {
 
 pub struct Userbot {
     client: Client,
+    account_user_id: i64,
     // SqliteSession preserves peer access hashes across restarts.
     session: Arc<SqliteSession>,
     brain: Arc<Brain>,
@@ -115,9 +116,15 @@ pub struct Userbot {
 }
 
 impl Userbot {
-    pub fn new(client: Client, session: Arc<SqliteSession>, brain: Arc<Brain>) -> Self {
+    pub fn new(
+        client: Client,
+        account_user_id: i64,
+        session: Arc<SqliteSession>,
+        brain: Arc<Brain>,
+    ) -> Self {
         Self {
             client,
+            account_user_id,
             session,
             brain,
             peers: Mutex::new(HashMap::new()),
@@ -443,8 +450,27 @@ impl Userbot {
         if let Some(grouped_id) = message.grouped_id() {
             lines.push(format!("telegram_media_group_id={grouped_id}"));
         }
-        if message.forward_header().is_some() {
-            lines.push("telegram_forwarded=true".to_string());
+        if let Some(tl::enums::MessageFwdHeader::Header(header)) = message.forward_header() {
+            lines.push("telegram_forwarded_by_sender=true".to_string());
+            if let Some(origin) = header.from_id.as_ref() {
+                let origin_id = PeerId::from(origin).bot_api_dialog_id_unchecked();
+                lines.push(format!("telegram_forward_origin_peer_id={origin_id}"));
+                if origin_id == self.account_user_id {
+                    lines.push("telegram_forward_origin_is_nekora=true".to_string());
+                }
+            }
+            if let Some(name) = header.from_name.as_deref() {
+                lines.push(format!(
+                    "telegram_forward_origin_name={}",
+                    compact_context_text(name)
+                ));
+            }
+            if let Some(author) = header.post_author.as_deref() {
+                lines.push(format!(
+                    "telegram_forward_origin_post_author={}",
+                    compact_context_text(author)
+                ));
+            }
         }
         if let Some(post_author) = message.post_author() {
             lines.push(format!(
