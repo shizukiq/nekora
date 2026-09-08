@@ -1,16 +1,7 @@
-//! The vault on disk: the few filesystem primitives the diary is built on.
-//!
-//! Nothing here is Nekora-specific; it is the small, careful layer that keeps a
-//! note from being half-written. Writes go through a temp file and a rename so a
-//! crash mid-write never leaves a truncated note the parser would then reject.
-
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-// A single note is prose plus one embedding line; a megabyte is far more than
-// that will ever be, and the ceiling stops a corrupt or hostile file from being
-// slurped whole into memory.
 const MAX_NOTE_BYTES: u64 = 1 << 20;
 const MAX_RUNTIME_FILE_BYTES: u64 = 16 << 20;
 
@@ -18,15 +9,10 @@ pub fn ensure_directory(directory: &Path) -> bool {
     fs::create_dir_all(directory).is_ok() && directory.is_dir()
 }
 
-/// Read a note, refusing anything larger than a note has any business being.
-/// Returns `None` for a missing, oversized, or unreadable file so the caller can
-/// simply skip it rather than abort loading the whole vault.
 pub fn read_file(path: &Path) -> Option<String> {
     read_file_up_to(path, MAX_NOTE_BYTES)
 }
 
-/// Runtime checkpoints can legitimately contain several bounded events and are
-/// allowed to be larger than one diary note.
 pub fn read_runtime_file(path: &Path) -> Option<String> {
     read_file_up_to(path, MAX_RUNTIME_FILE_BYTES)
 }
@@ -39,9 +25,6 @@ fn read_file_up_to(path: &Path, max_bytes: u64) -> Option<String> {
     fs::read_to_string(path).ok()
 }
 
-/// Write `contents` to `path` atomically: fill a sibling `.tmp` and rename it
-/// over the target, so a reader never sees a partial note. The rename is atomic
-/// within a filesystem, which the vault always is.
 pub fn write_file_atomic(path: &Path, contents: &str) -> io::Result<()> {
     if let Some(directory) = path
         .parent()
@@ -62,8 +45,6 @@ pub fn write_file_atomic(path: &Path, contents: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Every `.md` note in the vault, unsorted. The diary sorts them itself so the
-/// id order is its concern, not the directory walk's.
 pub fn markdown_files(directory: &Path) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for entry in fs::read_dir(directory)? {

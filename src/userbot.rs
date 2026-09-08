@@ -1,14 +1,3 @@
-//! The Telegram side: a real userbot on a real account, via grammers (never the
-//! Bot API).
-//!
-//! Purely hands — it receives, sends, and reports; it never decides. Incoming
-//! media is flattened to text the brain can read (photos, stickers, GIFs, and
-//! video previews become captions; a voice note can become a transcription),
-//! always keeping at least a label so nothing arrives as empty text. Outgoing text
-//! is paced like a person typing, not a bot
-//! blasting: a short "typing…" and a delay drawn from a words-per-minute band, so
-//! a long line takes longer to land than a short one.
-
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io::Cursor;
@@ -35,14 +24,10 @@ use crate::conversation::{split_message, ReplyGeneration};
 use crate::heartbeat::PresencePlan;
 use crate::App;
 
-// Keep bubbles human-paced without making a reply feel stuck. The word-based
-// estimate gives short, medium, and long chunks distinct bands while the bounds
-// keep random jitter from producing an awkward outlier.
 const BUBBLE_DELAY_MIN_MS: u64 = 500;
 const BUBBLE_DELAY_MAX_MS: u64 = 3_000;
 const BUBBLE_DELAY_PER_WORD_MS: u64 = 220;
 
-// How many recent chats list_chats shows the model, and how much of each last line.
 const RECENT_CHATS: usize = 20;
 const LAST_LINE_CHARS: usize = 120;
 const MAX_TEXT_DOCUMENT_BYTES: usize = 96 * 1024;
@@ -51,14 +36,11 @@ const MAX_CONTEXT_ITEMS: usize = 16;
 const MAX_CONTEXT_TEXT_CHARS: usize = 1_500;
 const REPLY_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
-// Telegram's per-message ceiling; the splitter breaks a long reply on this.
 const MAX_BUBBLE_BYTES: usize = 4096;
 const MAX_OUTGOING_CHARS: usize = 12_000;
 const MAX_IMAGE_CAPTION_CHARS: usize = 1_024;
 
-// The markers we wrap incoming media in. A caption or a transcription is
-// attacker-controlled text: it must not be able to forge these and smuggle
-// instructions past the brain as if they were our labels.
+// Escaped before insertion so media text cannot forge its surrounding marker.
 const MEDIA_TOKENS: [&str; 11] = [
     "[photo]",
     "[voice message]",
@@ -124,17 +106,10 @@ struct Presence {
 
 pub struct Userbot {
     client: Client,
-    // Shared with the sender pool: grammers caches every peer's access authority
-    // here (and SqliteSession keeps it across restarts), which is how a bare chat
-    // id gets turned back into something Telegram will accept.
+    // SqliteSession preserves peer access hashes across restarts.
     session: Arc<SqliteSession>,
     brain: Arc<Brain>,
-    // A Bot-API chat id to the reference needed to message it, learned from every
-    // incoming message and every listed dialog — grammers needs the peer's access
-    // authority to send, which a bare id doesn't carry.
     peers: Mutex<HashMap<i64, PeerRef>>,
-    // Private chats already verified against Telegram's Contacts category. This
-    // lets the update reader invalidate an old reply before waiting on media I/O.
     private_contacts: Mutex<HashSet<i64>>,
     presence: Mutex<Presence>,
 }
@@ -151,11 +126,7 @@ impl Userbot {
         }
     }
 
-    /// Flatten an incoming message to text. Every non-text message yields at least
-    /// a label ([photo], [voice message], …) so media never arrives empty — an
-    /// empty turn makes her confabulate. Extracted content is appended when it
-    /// works; when it fails the label alone remains and the real error goes to the
-    /// operator, never into her context.
+    /// Flatten an incoming message to text, retaining a label when media parsing fails.
     pub async fn describe(&self, message: &Message) -> Incoming {
         let chat_id = message.peer_id().bot_api_dialog_id_unchecked();
         if let Ok(Some(peer_ref)) = message.peer_ref().await {
@@ -213,8 +184,7 @@ impl Userbot {
         }
     }
 
-    /// Match Telegram's Contacts chat category for private messages. Groups and
-    /// channels stay in scope; a missing private peer is rejected closed.
+    /// Accept private messages only from Telegram contacts.
     pub async fn accepts_incoming(&self, message: &Message) -> bool {
         if message.peer_id().kind() != PeerKind::User {
             return true;
@@ -242,9 +212,7 @@ impl Userbot {
         self.resolve_contact_scoped_peer(chat_id).await.is_ok()
     }
 
-    /// Turn a later reaction update into durable context without starting a new
-    /// conversational turn. The next message or heartbeat can then see that an
-    /// earlier message's social signal changed after it was received.
+    /// Record a reaction update without starting a new conversational turn.
     pub async fn describe_reaction_update(
         &self,
         update: &tl::types::UpdateMessageReactions,
@@ -412,8 +380,6 @@ impl Userbot {
         Some(response.reactions)
     }
 
-    /// Gather Telegram-native relationship data once, at the update boundary,
-    /// so the brain and the durable daily context see the same message shape.
     async fn describe_message_context(&self, message: &Message) -> String {
         let mut lines = vec![format!("telegram_chat_type={}", chat_type(message))];
         if let Some(peer) = message.peer() {
@@ -499,8 +465,6 @@ impl Userbot {
         format!("telegram_context:\n{}\n", lines.join("\n"))
     }
 
-    /// Broadcast channels are read-only sources for Nekora. Keep their posts in
-    /// the diary, but never let the reply loop announce typing there.
     pub async fn is_broadcast_channel(&self, chat_id: i64) -> bool {
         let Ok(peer_ref) = self.resolve(chat_id).await else {
             return false;
@@ -511,9 +475,6 @@ impl Userbot {
         )
     }
 
-    /// Ask Telegram for its server clock and present it in the requested UTC+4
-    /// zone. The server timestamp is more useful here than the machine clock:
-    /// it is the same clock Telegram uses for updates and message dates.
     pub async fn current_time(&self) -> Result<CurrentTime> {
         let tl::enums::updates::State::State(state) = self
             .client
@@ -534,9 +495,6 @@ impl Userbot {
         })
     }
 
-    /// Fetch a user's current profile and describe the avatar when one exists.
-    /// The lookup is on-demand so ordinary messages do not cause an extra photo
-    /// download or a vision request for every sender.
     pub async fn inspect_user(
         &self,
         user_id: Option<i64>,
@@ -613,9 +571,6 @@ impl Userbot {
         })
     }
 
-    /// Fetch and describe visual media from a recent Telegram message. Videos and
-    /// animations use Telegram's best available preview frame because the current
-    /// Ollama vision request accepts images, not moving-media containers.
     pub async fn inspect_message_media(
         &self,
         chat_id: i64,
@@ -678,9 +633,6 @@ impl Userbot {
         }
     }
 
-    // Voice notes are audio/ogg and can be transcribed with Premium; text files are
-    // read in full up to the same scale as one context dump. Non-visual documents
-    // stay as labels so a large binary never gets loaded into memory.
     async fn describe_document(&self, message: &Message, document: &Document) -> String {
         if let Some(kind) = visual_document_kind(document) {
             return self.describe_visual_document(document, kind).await;
@@ -803,9 +755,6 @@ impl Userbot {
         Ok(bytes)
     }
 
-    // Telegram Premium transcription. Returns text or None (no premium, backend
-    // error, still pending); never an error string, so a failure reaches the
-    // operator, not her context.
     async fn transcribe(&self, message: &Message) -> Option<String> {
         let peer_ref = message.peer_ref().await.ok()??;
         let request = tl::functions::messages::TranscribeAudio {
@@ -849,8 +798,6 @@ impl Userbot {
         presence.active_turns == 0 && presence.revision == revision
     }
 
-    /// Keep Telegram's online status alive throughout a real turn, then let the
-    /// current social rhythm decide whether a quiet, brief return happens later.
     pub async fn stay_online<T>(
         self: &Arc<Self>,
         plan: PresencePlan,
@@ -904,10 +851,6 @@ impl Userbot {
         output
     }
 
-    /// Show a live "typing…" in `chat_id` for exactly as long as `fut` runs, then
-    /// hand back its output. This ties the indicator to the real generation time
-    /// instead of a fixed delay tacked on afterwards. If the peer can't be
-    /// resolved the work still runs, just without the indicator.
     pub async fn keep_typing<T>(&self, chat_id: i64, fut: impl Future<Output = T>) -> T {
         let Ok(peer) = self.resolve_contact_scoped_peer(chat_id).await else {
             return fut.await;
@@ -921,9 +864,6 @@ impl Userbot {
         output
     }
 
-    /// Send one logical answer as sequential, human-sized Telegram bubbles. Each
-    /// part gets its own typing indicator and short delay; an incoming message
-    /// wakes that delay and makes the remaining parts stale.
     pub async fn send(
         &self,
         app: &App,
@@ -974,8 +914,7 @@ impl Userbot {
                 return Ok(());
             }
 
-            // This is deliberately immediately before the network send. A new
-            // message can arrive during typing or the delay above.
+            // Recheck after typing and delay, immediately before the send.
             if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
                 return Ok(());
             }
@@ -998,9 +937,6 @@ impl Userbot {
         Ok(())
     }
 
-    /// Upload one generated image and send it as a Telegram photo. Image bytes
-    /// have already been checked by the brain; this layer only performs the
-    /// scoped Telegram action.
     pub async fn send_image(
         &self,
         app: &App,
@@ -1050,8 +986,6 @@ impl Userbot {
         Ok(())
     }
 
-    /// Add or remove one reaction on a known message. Telegram accepts an empty
-    /// reaction as removal; the message itself need not be fetched first.
     pub async fn react(
         &self,
         app: &App,
@@ -1083,16 +1017,12 @@ impl Userbot {
         Ok(true)
     }
 
-    /// Mark the sender's chat read up to its latest message. Cosmetic, so a
-    /// failure is swallowed rather than allowed to kill the turn.
     pub async fn mark_read(&self, chat_id: i64) {
         if let Ok(peer) = self.resolve_contact_scoped_peer(chat_id).await {
             let _ = self.client.mark_as_read(peer).await;
         }
     }
 
-    /// The last handful of chats, so the model can choose who to talk to. Also
-    /// caches each peer so a later send_message to it can resolve.
     pub async fn recent_chats(&self) -> Result<Vec<ChatSummary>> {
         let mut dialogs = self.client.iter_dialogs();
         let mut out = Vec::new();
@@ -1140,10 +1070,7 @@ impl Userbot {
         }
         let id = PeerId::from_bot_api_dialog_id(chat_id)
             .ok_or_else(|| anyhow!("not a valid chat id: {chat_id}"))?;
-        // The session holds the access authority for every peer she has ever seen,
-        // even across restarts; a bare id doesn't carry it, and without it Telegram
-        // rejects the send with PEER_ID_INVALID. Only a peer the session has truly
-        // never cached falls through to the ambient reference.
+        // A bare peer id cannot replace the access hash cached by the session.
         if let Some(peer) = self.session.peer_ref(id).await.ok().flatten() {
             self.peers.lock().unwrap().insert(chat_id, peer);
             return Ok(peer);
@@ -1570,9 +1497,6 @@ fn type_delay(text: &str) -> Duration {
     Duration::from_millis(milliseconds.clamp(BUBBLE_DELAY_MIN_MS, BUBBLE_DELAY_MAX_MS))
 }
 
-/// Log in interactively the first time, then never again — the session is
-/// persisted, so this only prompts on a fresh account. Uses the account phone (a
-/// real userbot, not a bot token).
 pub async fn login(client: &Client) -> Result<()> {
     if client.is_authorized().await? {
         return Ok(());

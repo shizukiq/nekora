@@ -1,11 +1,5 @@
-//! Sleep and reflection: how a day of talking turns into lasting memory.
-//!
-//! Sleep first keeps the short-lived promises and tasks separately, then turns
-//! the durable diary into fewer, better-connected notes. Source notes are
-//! archived instead of deleted, so a bad consolidation can always be inspected.
-
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use serde_json::Value;
@@ -14,21 +8,16 @@ use crate::brain::{escape_prompt_data, system, user, ChatPurpose};
 use crate::diary::is_valid_generated_memory;
 use crate::{config, persistence, App};
 
-// Leave room for the system prompt and the current turn inside the 32k model
-// window; this is an estimate based on the buffered text, not a model setting.
 const CONTEXT_DUMP_TRIGGER: usize = 20_000;
-// A conservative mixed Russian/English estimate. This only decides when to sleep.
 const CHARS_PER_TOKEN: usize = 2;
-// One maintenance request must leave room for its system prompt and output even
-// after a long outage has accumulated many events.
 const MAX_SLEEP_INPUT_CHARS: usize = 24_000;
 const MAINTENANCE_TRUNCATION_MARKER: &str = "\n[event truncated for maintenance]";
 const MAX_SLEEP_DIARY_CHARS: usize = 20_000;
 const REFLECTION_CONFIDENCE: f32 = 0.6;
 const MEMORY_CONFIDENCE: f32 = 0.7;
-const SLEEP_PASSES: usize = 2;
-const RELATED_MEMORIES: usize = 1;
-const SLEEP_RELATEDNESS: f64 = 0.86;
+const SLEEP_MAX_TIME: Duration = Duration::from_secs(6 * 60 * 60);
+const RELATED_MEMORIES: usize = 10;
+const RECALL_RELATEDNESS: f64 = 0.86;
 const WORKING_MEMORY_FILE: &str = "working_memory.md";
 const MAX_WORKING_MEMORY_CHARS: usize = 3_000;
 const MAX_RECALL_QUERY_CHARS: usize = 12_000;
@@ -210,7 +199,6 @@ thought, separate them into short paragraphs with a blank line. Do not address a
 events, mention this task, explain your process, or write a generic life lesson.
 </output_contract>"#;
 
-/// Short-lived state included as runtime data in every turn.
 pub fn working_memory_context() -> String {
     let path = config::vault_dir().join(WORKING_MEMORY_FILE);
     let Some(body) = persistence::read_file(&path) else {
@@ -226,8 +214,6 @@ pub fn working_memory_context() -> String {
         .collect()
 }
 
-/// Pull a few relevant durable memories into the turn without making the model
-/// remember to call the recall tool first.
 pub async fn relevant_memories_context(app: &Arc<App>, query: &str) -> String {
     if query.trim().is_empty() {
         return String::new();
@@ -270,7 +256,7 @@ pub async fn relevant_memories_context(app: &Arc<App>, query: &str) -> String {
             Ok(Ok(vector)) => app.diary.lock().unwrap().recall(
                 &vector,
                 4,
-                SLEEP_RELATEDNESS,
+                RECALL_RELATEDNESS,
                 (remaining / 5).max(1),
                 &anchor_ids,
             ),
@@ -309,8 +295,6 @@ pub async fn relevant_memories_context(app: &Arc<App>, query: &str) -> String {
     context
 }
 
-/// Sleep: if the buffer is heavy, refresh short-term memory, distil the day,
-/// consolidate related diary notes, and return it emptied.
 pub async fn consolidate(
     app: &Arc<App>,
     short_term: Vec<String>,
@@ -333,8 +317,7 @@ pub async fn consolidate(
         distilled.extend(distill_events(app, &events).await?);
     }
 
-    // Finish all fallible model work before committing the new event-derived
-    // state, so a late chunk cannot make an earlier chunk replay on retry.
+    // Commit only after every model call succeeds, otherwise the same events can be retried.
     consolidate_diary(app).await?;
     persistence::write_file_atomic(&working_memory_path, &working_memory)?;
     for (memory, vector, confidence) in distilled {
@@ -444,8 +427,9 @@ fn distilled_memory_pieces(output: &str) -> Result<Vec<(String, f32)>> {
 }
 
 async fn consolidate_diary(app: &Arc<App>) -> Result<()> {
+    let deadline = Instant::now() + SLEEP_MAX_TIME;
     let mut excluded = Vec::new();
-    for _ in 0..SLEEP_PASSES {
+    while Instant::now() < deadline {
         let Some(target) = app.diary.lock().unwrap().sleep_target(&excluded) else {
             break;
         };
@@ -460,7 +444,7 @@ async fn consolidate_diary(app: &Arc<App>) -> Result<()> {
             &target.id,
             &vector,
             RELATED_MEMORIES,
-            SLEEP_RELATEDNESS,
+            0.0,
             &excluded,
         );
         let mut remaining = MAX_SLEEP_DIARY_CHARS - target_chars;
@@ -555,9 +539,6 @@ async fn consolidate_diary(app: &Arc<App>) -> Result<()> {
     Ok(())
 }
 
-/// Reflection: drift to a random diary page, meet it with the present, keep the
-/// thought. Returns the reflection (also filed), or `None` when the diary is
-/// still empty. `recent` is a short string of what's lately on her mind.
 pub async fn reflect(app: &Arc<App>, recent: &str) -> Result<Option<String>> {
     let Some(page) = app.diary.lock().unwrap().random_page() else {
         return Ok(None);

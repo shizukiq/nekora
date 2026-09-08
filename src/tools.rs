@@ -1,12 +1,3 @@
-//! Her action set, as the function calls the turn can reach for.
-//!
-//! Two halves: memory tools that touch the diary (recall is a RAG lookup,
-//! remember is how a thought becomes a durable note) and world tools that go out
-//! through the userbot (message, list chats). Every tool returns a short string
-//! the model reads on its next step; a tool that fails returns an in-character
-//! "not right now" while the real error goes to the operator, so one bad call
-//! narrows the turn instead of killing it.
-
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -17,18 +8,11 @@ use crate::conversation::ReplyGeneration;
 use crate::diary::{is_valid_generated_memory, MemoryRevision};
 use crate::App;
 
-// How many notes recall hands back, and the floor to bother injecting one. The
-// core reports (cosine+1)/2, so 0.8 raw cosine is ~0.9 here; below it a memory is
-// noise, not a memory.
 const RECALL_K: usize = 6;
 const RECALL_MIN_RELATEDNESS: f64 = 0.9;
 const MAX_RECALL_BODY_CHARS: usize = 12_000;
-// Fresh direct memories use the same baseline confidence as distilled events;
-// recall usage is tracked separately as observable retrieval history.
 const DEFAULT_CONFIDENCE: f32 = 0.7;
 
-/// The tools the model sees. Kept deliberately small: the fewer the tools, the
-/// less she forgets she has them.
 pub fn schema() -> Vec<ChatCompletionTools> {
     [
         (

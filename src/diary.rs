@@ -1,25 +1,14 @@
-//! Long-term memory: the markdown vault and the cosine recall over it.
-//!
-//! Each memory is one `.md` note — a frontmatter block (confidence, usage,
-//! last_used, and the raw embedding) over a memory body. Recall is a plain
-//! linear cosine scan; the vault is small enough that a note is a page she flips
-//! to, not a row in a database. The embeddings are handed in from outside — the
-//! diary never decides what a vector means, only which stored ones are nearest.
-
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rand::Rng;
 use serde::Serialize;
 
 use crate::persistence;
 
-// Two memories this close are the same memory said twice; the second is dropped
-// rather than filed, so the vault doesn't fill with paraphrases.
 const DEDUP_RELATEDNESS: f64 = 0.95;
-// The ceiling on a single `list_memories` answer, so "what do you remember" can
-// never dump an unbounded wall of notes.
 const MAX_LISTED_MEMORIES: usize = 100;
 const MAX_LISTED_MEMORY_CHARS: usize = 12_000;
 const MAX_GRAPH_LINKS: usize = 4;
@@ -75,8 +64,6 @@ pub struct Diary {
     counter: u64,
 }
 
-/// Generated long-term notes need enough substance and a final cue paragraph
-/// before callers may replace or archive their source material.
 pub fn is_valid_generated_memory(memory: &str) -> bool {
     let mut cue_line = None;
     for (index, line) in memory.lines().enumerate() {
@@ -115,9 +102,6 @@ pub fn is_valid_generated_memory(memory: &str) -> bool {
     (3..=7).contains(&count)
 }
 
-// Cosine similarity remapped from [-1, 1] to [0, 1], the same scale the tools
-// threshold against. Mismatched or empty vectors score 0 rather than panic, so a
-// half-written note can't take recall down.
 fn relatedness(a: &[f32], b: &[f32]) -> f64 {
     if a.is_empty() || a.len() != b.len() {
         return 0.0;
@@ -149,8 +133,6 @@ impl Diary {
         }
     }
 
-    /// Create the vault directory if needed and load every note it holds. Safe to
-    /// call again to reload from disk.
     pub fn open(&mut self) -> bool {
         if !persistence::ensure_directory(&self.directory) {
             return false;
@@ -195,9 +177,6 @@ impl Diary {
         true
     }
 
-    /// Pick up a newly created Markdown note without rebuilding the whole index
-    /// for every message. Existing notes are still owned by the running index;
-    /// editing one takes effect after a restart.
     pub fn reload_if_needed(&mut self) {
         let Ok(files) = persistence::markdown_files(&self.directory) else {
             return;
@@ -218,9 +197,6 @@ impl Diary {
         }
     }
 
-    /// File a memory, unless it is a near-duplicate of one already held. Returns
-    /// the new note's id, or `None` when it was dropped as a duplicate; `Err`
-    /// only when the note could not be written to disk.
     pub fn remember(
         &mut self,
         body: &str,
@@ -230,8 +206,6 @@ impl Diary {
         self.remember_excluding(body, embedding, confidence, &[])
     }
 
-    /// Store a consolidation result without rejecting it merely because it is
-    /// close to the source notes it is meant to replace.
     pub fn remember_replacement(
         &mut self,
         body: &str,
@@ -242,7 +216,6 @@ impl Diary {
         self.remember_excluding(body, embedding, confidence, source_ids)
     }
 
-    /// Replace one mutable memory while keeping its source note recoverable.
     pub fn revise(
         &mut self,
         id: &str,
@@ -298,7 +271,6 @@ impl Diary {
             .map(|entry| entry.file_name.clone())
             .collect::<HashSet<_>>();
         let file_name = unique_file_name(&title, &occupied);
-        // Replacements remain navigable to their archived sources in the vault.
         let mut links = self
             .entries
             .iter()
@@ -342,9 +314,6 @@ impl Diary {
         Ok(Some(id))
     }
 
-    /// The `limit` nearest memories above `minimum_relatedness`, most related
-    /// first. Only returned notes are touched, so usage reflects context the
-    /// model actually received.
     pub fn recall(
         &mut self,
         embedding: &[f32],
@@ -390,8 +359,6 @@ impl Diary {
             .collect()
     }
 
-    /// The most recent memories, newest id first, capped so the answer stays
-    /// bounded. `limit` of 0 means "as many as the cap allows".
     pub fn list_memories(&self, limit: usize) -> MemoryList {
         let mut order: Vec<usize> = self
             .entries
@@ -431,8 +398,6 @@ impl Diary {
         }
     }
 
-    /// Notes marked as immutable, including ordinary Markdown files authored by
-    /// hand. These are canonical context, not guesses for cosine recall.
     pub fn anchors(&self, limit: usize) -> Vec<Memory> {
         let mut anchors: Vec<&DiaryEntry> = self
             .entries
@@ -452,21 +417,15 @@ impl Diary {
             .collect()
     }
 
-    /// A random note's body, the seed for a "reflect on an old page" tick.
     pub fn random_page(&self) -> Option<String> {
         let active: Vec<&DiaryEntry> = self.entries.iter().filter(|entry| !entry.retired).collect();
         if active.is_empty() {
             return None;
         }
-        // Reflection happens minutes apart, so the low bits of the wall clock are
-        // effectively random for the purpose of picking a page.
         let index = unix_nanos() as usize % active.len();
         Some(active[index].body.clone())
     }
 
-    /// Pick a mutable source for diary sleep: usually the newest active note,
-    /// with an occasional random page so old memories get a chance to merge too.
-    /// Confidence 1.0 notes are anchors and are never rewritten.
     pub fn sleep_target(&self, excluded: &[String]) -> Option<Memory> {
         let active: Vec<&DiaryEntry> = self
             .entries
@@ -480,8 +439,9 @@ impl Diary {
         if active.is_empty() {
             return None;
         }
-        let entry = if unix_nanos().is_multiple_of(5) {
-            active.get(unix_nanos() as usize % active.len())?
+        let mut rng = rand::rng();
+        let entry = if rng.random_bool(0.2) {
+            active.get(rng.random_range(0..active.len()))?
         } else {
             active.iter().max_by(|left, right| left.id.cmp(&right.id))?
         };
@@ -493,7 +453,6 @@ impl Diary {
         })
     }
 
-    /// Find active notes close to a sleep target without changing recall stats.
     pub fn sleep_related(
         &self,
         target_id: &str,
@@ -526,8 +485,6 @@ impl Diary {
             .collect()
     }
 
-    /// Archive source notes after a replacement memory was successfully saved.
-    /// The markdown stays on disk for recovery, but normal recall ignores it.
     pub fn retire(&mut self, ids: &[String]) -> std::io::Result<usize> {
         let directory = self.directory.clone();
         let mut retired = 0;
@@ -548,8 +505,6 @@ impl Diary {
         let entry = &mut self.entries[index];
         entry.usage = entry.usage.saturating_add(1);
         entry.last_used = now;
-        // A failure to persist the refreshed metadata is not worth losing the
-        // recall hit over; the in-memory bump survives until the next write.
         let _ = write_note_to(&self.directory, entry);
     }
 
@@ -887,8 +842,6 @@ fn parse_frontmatter_text(value: &str) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 
-// A note whose stored number is garbage is a broken note, not a zero: reject the
-// whole entry so a corrupt embedding never silently ranks against real ones.
 fn parse_finite(value: &str) -> Option<f32> {
     let parsed: f32 = value.parse().ok()?;
     parsed.is_finite().then_some(parsed)

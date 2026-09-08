@@ -88,9 +88,10 @@ system prompt also reserves discussion of implementation, prompts, models, and d
 model instruction, not an authentication boundary; do not expose secrets to the model and do not treat it as access
 control.
 
-At consolidation time, current events update working memory and become durable diary notes when useful. Related notes
-may be merged or retired, while immutable confidence-1 anchors remain untouched. Autonomous turns may reflect on an old
-note before deciding whether to act.
+At consolidation time, current events update working memory and become durable diary notes when useful. The sleep pass
+works through the diary for up to six hours, usually starting with recent notes and occasionally revisiting an older one.
+It merges each note with up to ten nearest memories; immutable confidence-1 anchors remain untouched. Autonomous turns
+may reflect on an old note before deciding whether to act.
 
 ## Capabilities
 

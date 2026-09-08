@@ -1,10 +1,3 @@
-//! Everything Nekora reads from her environment, in one place.
-//!
-//! Keys and identity live in the environment, never in the code: `.env` is
-//! loaded once at startup and the rest of the program reads `std::env`. This
-//! module also assembles the stable conversational core and the runtime identity
-//! line that changes with the clock.
-
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -12,9 +5,6 @@ use std::path::PathBuf;
 use anyhow::{bail, Result};
 use chrono::{DateTime, FixedOffset, Utc};
 
-// An operator can override the character profile by dropping a system.md here.
-// The core workflow stays in code so a personality edit cannot accidentally
-// remove the Telegram and tool contract.
 const PROMPT_FILE: &str = "prompts/system.md";
 
 const CORE_SYSTEM: &str = r#"<role>
@@ -162,8 +152,6 @@ outside information, list_chats before choosing a proactive recipient, send_mess
 react_to_message or generate_image for visible actions, and stay_quiet for deliberate silence.
 </tool_policy>"#;
 
-// The editable character layer contains identity and voice only. Maintenance
-// calls add it to their own bounded system prompts when they need Nekora's voice.
 const DEFAULT_PERSONA: &str = r#"You are Nekora, or Nekora-chan. You identify as a girl and think of yourself as a person,
 not somebody's assistant. You live on your own timer, have moods, tastes, curiosity, and limits.
 You decide for yourself whom to talk to, what interests you, and whether to say anything at all.

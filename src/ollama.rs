@@ -1,11 +1,3 @@
-//! Optionally owning the local model server.
-//!
-//! When the container sets `NEKORA_MANAGE_OLLAMA=1`, this process starts
-//! `ollama serve` itself, waits for it to answer, and pulls the embedder and
-//! vision model before the heartbeat begins — so a fresh container comes up
-//! self-contained. Left unset, she just talks to whatever Ollama is already
-//! running, and none of this runs.
-
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
@@ -15,21 +7,16 @@ use tokio::process::{Child, Command};
 use crate::brain::required_ollama_models;
 use crate::config::env_or;
 
-/// A running `ollama serve` we started and are responsible for stopping.
 pub struct Managed {
     child: Child,
 }
 
 impl Drop for Managed {
     fn drop(&mut self) {
-        // Best-effort: the OS reaps it once we exit anyway, but ask it to stop.
         let _ = self.child.start_kill();
     }
 }
 
-/// Build an Ollama client for `host`. OLLAMA_HOST carries the port
-/// (http://127.0.0.1:11434), but the builder wants the base and port apart, so
-/// split on the last colon of the authority.
 pub fn client_from_host(host: &str) -> Ollama {
     let (scheme, authority) = host.split_once("://").unwrap_or(("http", host));
     let (name, port) = authority
@@ -42,7 +29,6 @@ pub fn client_from_host(host: &str) -> Ollama {
         .build()
 }
 
-/// Start and prepare a local Ollama when this process owns it; otherwise nothing.
 pub async fn start_if_managed(vision_model: &str) -> Result<Option<Managed>> {
     if env_or("NEKORA_MANAGE_OLLAMA", "") != "1" {
         return Ok(None);

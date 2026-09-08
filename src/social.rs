@@ -1,7 +1,3 @@
-//! Persistent social state: Nekora's current mood and the relationships that
-//! inform her choices. Telegram stays unaware of them; only an active avoidance
-//! boundary prevents an event from reaching her decision-making turn.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 

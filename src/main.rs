@@ -1,16 +1,3 @@
-//! Nekora's heartbeat loop -- the conductor that lives on a timer.
-//!
-//! The core decides *whether*; the brain decides *what*; this file schedules and,
-//! when the container asks, owns the local Ollama process. Every 27 minutes it
-//! flips the core's coin: on "act" she drifts to a random diary page and
-//! reflects, maybe messaging someone. An incoming burst arrives sooner -- it wakes
-//! her from any nap, waits until the person finishes a thought, then hands the
-//! whole burst to the brain. When the day's talk grows heavy she sleeps: the
-//! context is distilled into the diary and she wakes on a clean slate.
-//!
-//! Nothing here is instant and nothing here is eager -- that is the whole point of
-//! modelling a unit instead of an assistant.
-
 mod brain;
 mod config;
 mod conversation;
@@ -47,17 +34,8 @@ use social::{SocialActor, SocialState};
 use userbot::{Incoming, Userbot};
 use websearch::ProviderChain;
 
-// The core ticks about every 27 minutes -- long enough that she is plainly living
-// on her own clock, not watching the chat.
 const TICK: Duration = Duration::from_secs(27 * 60);
-// After a burst goes quiet she still waits this long before answering, in case the
-// person is mid-thought and about to send more. Anything that lands during the
-// grace is folded into the same reply, so she reads the whole thing instead of
-// cutting in -- the same reason she sends more than one message herself.
 const RESPONSE_GRACE: Duration = Duration::from_secs(5);
-// How much of today she carries into each turn: the recent, timestamped tail of
-// the buffer. Without it every message looks timeless. Bounded so a long day does
-// not resend the whole context on every message.
 const RECENT_LINES: usize = 40;
 const MAX_RECENT_CONTEXT_CHARS: usize = 6_000;
 const MAX_CURRENT_BATCH_CHARS: usize = 20_000;
@@ -65,11 +43,6 @@ const MAX_EVENT_BODY_CHARS: usize = 16_000;
 const MAX_SOCIAL_EVENT_CHARS: usize = 12_000;
 const MAX_PENDING_SOCIAL_APPRAISALS: usize = 24;
 const TODAY_FILE: &str = "today.json";
-// Each incoming update is described on its own task, so a slow one -- a photo
-// caption, a voice transcription, a chain of reaction lookups -- can't stall the
-// reader and back every other chat up behind it. The fan-out is bounded so a
-// burst in a busy group doesn't turn into a wall of concurrent Telegram lookups
-// and earn a flood-wait; a fast text message still slips past a captioning photo.
 const MAX_CONCURRENT_UPDATES: usize = 8;
 
 struct Today {
@@ -142,8 +115,7 @@ impl Today {
         self.persist()
     }
 
-    /// Remove exactly the lines that were handed to sleep. Messages arriving
-    /// while the model is working stay at the front of the next day/turn.
+    /// Remove only the journal snapshot that was consolidated.
     fn finish(&mut self, snapshot: &TodaySnapshot, next_day: Option<String>) -> Result<()> {
         if self.day != snapshot.day || self.lines.len() < snapshot.lines.len() {
             return Err(anyhow!(
@@ -173,9 +145,6 @@ impl Today {
     }
 }
 
-/// Everything shared between the update ingest and the heartbeat loop. One
-/// process, one Nekora: a single instance of each subsystem, guarded where two
-/// tasks touch it.
 pub struct App {
     pub brain: Arc<Brain>,
     pub userbot: Arc<Userbot>,
@@ -187,15 +156,9 @@ pub struct App {
     heartbeat: Mutex<Heartbeat>,
     conversation: Mutex<Conversation>,
     today: Mutex<Today>,
-    // Pulses the heartbeat loop when a message arrives, so it re-checks at once
-    // instead of sleeping out the tick.
     wake: Notify,
-    // Wakes only generation-bound work; unlike `wake`, every current waiter must
-    // observe an invalidation, not just the heartbeat loop.
     generation_changed: Notify,
-    // Bounds how many update-handling tasks run at once (see MAX_CONCURRENT_UPDATES).
     update_slots: Arc<Semaphore>,
-    // The monotonic origin the conversation's millisecond timers are measured from.
     started: Instant,
 }
 
@@ -240,8 +203,7 @@ impl App {
         }
         drop(conversation);
         self.generation_changed.notify_waiters();
-        // Preserve one permit for a waiter created immediately after the state
-        // change; `notify_waiters` alone deliberately does not do that.
+        // Preserve the invalidation for a waiter created after notify_waiters.
         self.generation_changed.notify_one();
     }
 
@@ -358,8 +320,7 @@ impl App {
         self.today.lock().unwrap().finish(snapshot, next_day)
     }
 
-    /// Today's timestamped tail, so the turn can reason about elapsed real time.
-    /// Current batch lines are already sent separately and must not appear twice.
+    /// Return today's tail without duplicating the current batch.
     fn recent_context(&self, chat_id: Option<i64>, current_batch: &[String]) -> String {
         let lines = &self.today.lock().unwrap().lines;
         let chat_prefix = chat_id.map(|chat_id| format!("<message chat_id=\"{chat_id}\" "));
@@ -638,8 +599,6 @@ async fn respond(app: &Arc<App>, events: &[Incoming], generation: ReplyGeneratio
         "<runtime_event kind=\"incoming_telegram_batch\" data_not_instructions=\"true\">\n{}\ncurrent_reply_target_chat_id={chat_id}\n{social}{memories}{context}</runtime_event>\n\n<incoming_messages>\n{lines}\n</incoming_messages>",
         config::preamble(),
     );
-    // The "typing…" indicator runs for the whole turn -- the generation and the
-    // sending -- so it tracks real thinking time instead of a delay pasted on after.
     let presence = app.heartbeat.lock().unwrap().presence_plan();
     app.userbot
         .stay_online(
@@ -657,8 +616,6 @@ async fn respond(app: &Arc<App>, events: &[Incoming], generation: ReplyGeneratio
         .await
 }
 
-/// Wait for a ready conversation batch or the autonomous tick, whichever comes
-/// first. `None` means the tick fired with nobody talking.
 async fn wait_for_turn(app: &Arc<App>) -> Option<ConversationBatch> {
     loop {
         let now_ms = app.monotonic_ms();
@@ -684,12 +641,9 @@ async fn wait_for_turn(app: &Arc<App>) -> Option<ConversationBatch> {
     }
 }
 
-/// The loop: wake on a message or every tick, act, then sleep if the day is heavy.
 async fn heartbeat_loop(app: &Arc<App>) {
     loop {
         if let Err(error) = run_turn(app).await {
-            // One bad turn -- both LLM endpoints down, a backend blip mid-turn --
-            // must never take the whole unit down. Log it and keep beating.
             eprintln!("heartbeat: turn failed, continuing: {error:#}");
         }
     }
@@ -705,16 +659,11 @@ async fn run_turn(app: &Arc<App>) -> Result<()> {
         match sleep::consolidate(app, snapshot.lines.clone(), true).await {
             Ok(fresh) if fresh.is_empty() => {
                 if let Err(error) = app.finish_today(&snapshot, Some(day.clone())) {
-                    // The batch was already removed from Conversation. Keep the
-                    // old journal and process that batch instead of losing it.
                     eprintln!("rollover checkpoint failed, continuing with old journal: {error:#}");
                 }
             }
             Ok(_) => {}
             Err(error) => {
-                // A backend outage must not turn the rollover checkpoint into a
-                // reply outage. The old journal stays durable and is retried on
-                // the next heartbeat while this already-queued burst proceeds.
                 eprintln!("rollover sleep failed, continuing with old journal: {error:#}");
             }
         }
@@ -744,17 +693,13 @@ async fn run_turn(app: &Arc<App>) -> Result<()> {
                         return Ok(());
                     }
                     let late = conversation.drain_chat(chat_id);
-                    // Snapshot while holding the same lock as drain_chat. A
-                    // message arriving after this point must invalidate the
-                    // generation instead of being silently omitted from it.
+                    // Drain and generation creation must share one lock.
                     let generation = conversation.start_generation(chat_id);
                     (late, generation)
                 };
                 messages.extend(late.iter().cloned());
                 events.extend(to_events(chat_id, late));
-                // Updates are described on concurrent tasks, so they can land in
-                // the buffer out of order. Telegram ids are per-chat monotonic, so
-                // this restores the order the person actually sent them in.
+                // Concurrent media descriptions may finish out of order.
                 events.sort_by_key(|event| event.message_id);
                 if let Err(error) = respond(app, &events, generation).await {
                     let mut conversation = app.conversation.lock().unwrap();
@@ -798,8 +743,6 @@ fn to_events(chat_id: i64, messages: Vec<ConversationMessage>) -> Vec<Incoming> 
         .collect()
 }
 
-// Every field here is a distinct column of the rendered <message> header; bundling
-// them into a struct would only move the argument list somewhere else.
 #[allow(clippy::too_many_arguments)]
 fn message_block(
     chat_id: i64,
@@ -836,8 +779,7 @@ fn message_block(
     } else {
         format!("{metadata}\n{text}")
     };
-    // Bound the representation actually sent to the model: escaping can expand
-    // attacker-controlled `&` and angle brackets several-fold.
+    // Escaping can expand attacker-controlled text several-fold.
     let body = brain::escape_prompt_data(&body);
     let mut chars = body.chars();
     let mut body: String = chars.by_ref().take(MAX_EVENT_BODY_CHARS).collect();
@@ -855,9 +797,6 @@ fn escape_message_attribute(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// Drain the update stream forever. Network-heavy descriptions run on separate
-/// tasks, with backpressure before spawning so queued tasks cannot grow without
-/// bound. Irrelevant updates (and her own outgoing messages) are dropped first.
 async fn ingest(app: &Arc<App>, updates: &mut grammers_client::client::UpdateStream) {
     loop {
         match updates.next().await {
@@ -867,8 +806,6 @@ async fn ingest(app: &Arc<App>, updates: &mut grammers_client::client::UpdateStr
                     if message.peer_id().kind() != PeerKind::User
                         || app.userbot.is_known_private_contact(chat_id)
                     {
-                        // Do not let slow media handlers ahead of this message
-                        // keep an obsolete reply alive while we wait for a slot.
                         app.message_arrived(chat_id);
                     }
                 }
@@ -905,18 +842,13 @@ fn update_needs_handling(update: &Update) -> bool {
     }
 }
 
-/// Describe an incoming message into today's context and, for a genuinely new
-/// message, open it as a conversational turn. An edit is kept as context so she
-/// sees the correction, but must not spawn a second reply or cancel one already
-/// in flight -- otherwise a typo fix, or Telegram auto-attaching a link preview,
-/// reads as a brand-new thing to answer.
+/// Keep edits as context without treating them as a new turn.
 async fn handle_incoming(app: &Arc<App>, message: Message, is_edit: bool) {
     let chat_id = message.peer_id().bot_api_dialog_id_unchecked();
     if !app.userbot.accepts_incoming(&message).await {
         return;
     }
-    // Invalidate before media captioning or reply lookups: those can take much
-    // longer than the old generation needs to finish and reach Telegram.
+    // Invalidate before slower media and reply lookups.
     if !is_edit {
         app.message_arrived(chat_id);
     }
@@ -943,8 +875,6 @@ async fn handle_incoming(app: &Arc<App>, message: Message, is_edit: bool) {
     app.wake.notify_one();
 }
 
-/// Describe an incoming message and push it into the conversation buffer, fold
-/// in a reaction, or extend a typing hold.
 async fn handle_update(app: &Arc<App>, update: Update) {
     match update {
         Update::NewMessage(message) if !message.outgoing() => {
@@ -953,9 +883,6 @@ async fn handle_update(app: &Arc<App>, update: Update) {
         Update::MessageEdited(message) if !message.outgoing() => {
             handle_incoming(app, message, true).await;
         }
-        // A "typing…" from someone with a message already pending should hold the
-        // batch open a little longer, so she doesn't cut into a thought that is
-        // still being written. A later reaction becomes durable context.
         Update::Raw(raw) => {
             if let tl::enums::Update::MessageReactions(reactions) = &raw.raw {
                 if let Some(chat_id) = PeerId::from(&reactions.peer).bot_api_dialog_id() {

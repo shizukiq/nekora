@@ -1,15 +1,5 @@
-//! The coin she flips every tick: act, stay quiet, or nap.
-//!
-//! This is the whole reason Nekora reads as a unit and not an assistant. A tick
-//! is not a reply; it is her deciding, on her own clock, whether she feels like
-//! doing anything at all. An incoming message can `wake` her out of a nap early,
-//! but it can never make her answer on the spot.
-
 use std::time::Duration;
 
-// A local SplitMix64 keeps the core free of the `rand` crate: the decision loop
-// is std-only on purpose, and one well-distributed generator is all a coin flip
-// needs. It is seeded once at startup, never reseeded.
 struct SplitMix64 {
     state: u64,
 }
@@ -27,29 +17,21 @@ impl SplitMix64 {
         z ^ (z >> 31)
     }
 
-    // A uniform draw in [0, 1) from the top 53 bits, the mantissa width of f64.
     fn chance(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
 
-    // Inclusive on both ends, matching the C++ core's nap length distribution.
     fn range_inclusive(&mut self, low: i64, high: i64) -> i64 {
         let span = (high - low) as u64 + 1;
         low + (self.next_u64() % span) as i64
     }
 }
 
-// Half the ticks she feels like acting; the other half she has better things to
-// do than talk to you.
 const ACT_CHANCE: f64 = 0.5;
-// A rare tick drops her into a nap instead, so there are quiet stretches she
-// can't be pulled out of except by someone actually messaging her.
 const SLEEP_CHANCE: f64 = 0.01;
 const SLEEP_MIN_MINUTES: i64 = 15;
 const SLEEP_MAX_MINUTES: i64 = 120;
 
-/// Timing for brief online returns around a turn. Keeping it with the heartbeat
-/// keeps Telegram presence timing out of the message handler.
 #[derive(Clone, Copy)]
 pub struct SocialPace {
     pub idle_return_chance: f64,

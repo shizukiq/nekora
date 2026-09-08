@@ -1,24 +1,8 @@
-//! Grouping an incoming burst into one thought, and splitting her reply back out.
-//!
-//! People send several short messages in a row and mean them as one turn. This
-//! buffer waits out a quiet gap (and any "typing…") before handing the whole
-//! burst to the brain, so she answers the thought and not each line. The reverse
-//! move, `split_message`, breaks her one reply back into human-sized bubbles on
-//! blank lines, never cutting inside a code fence.
-
 use std::collections::BTreeMap;
 
-// Once someone stops typing, wait this long before assuming the thought is
-// finished. Short enough to feel responsive, long enough to catch a trailing
-// line.
 const QUIET_MS: i64 = 3_000;
-// A "typing…" notification extends the wait by this much, so she doesn't cut in
-// while a longer message is still being written.
 const TYPING_HOLD_MS: i64 = 4_000;
-// …but a burst is never held longer than this from its first message, so a
-// non-stop typer can't defer her forever.
 const MAX_BATCH_MS: i64 = 10_000;
-// A hard cap on messages per batch, the other escape hatch from an endless burst.
 const MAX_BATCH_MESSAGES: usize = 32;
 
 #[derive(Clone)]
