@@ -4,6 +4,9 @@ const QUIET_MS: i64 = 3_000;
 const TYPING_HOLD_MS: i64 = 4_000;
 const MAX_BATCH_MS: i64 = 10_000;
 const MAX_BATCH_MESSAGES: usize = 32;
+const PRIVATE_RETRY_MS: i64 = 60_000;
+const GROUP_RETRY_MS: i64 = 5 * 60_000;
+const MAX_RETRY_MS: i64 = 27 * 60_000;
 
 #[derive(Clone)]
 pub struct ConversationMessage {
@@ -14,11 +17,14 @@ pub struct ConversationMessage {
     pub timestamp: String,
     pub metadata: String,
     pub text: String,
+    pub needs_social_appraisal: bool,
 }
 
 pub struct ConversationBatch {
     pub chat_id: i64,
     pub messages: Vec<ConversationMessage>,
+    pub first_message_at: i64,
+    pub silent_reviews: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,12 +44,22 @@ struct Pending {
     first_message_at: i64,
     last_message_at: i64,
     typing_until: i64,
+    retry_after: i64,
+    silent_reviews: u32,
     // Arrival order, so when several chats are ready at once the oldest goes first.
     sequence: u64,
 }
 
 impl Pending {
+    fn keep_recent_messages(&mut self) {
+        let excess = self.messages.len().saturating_sub(MAX_BATCH_MESSAGES);
+        self.messages.drain(..excess);
+    }
+
     fn is_ready(&self, now_ms: i64) -> bool {
+        if now_ms < self.retry_after {
+            return false;
+        }
         if self.messages.len() >= MAX_BATCH_MESSAGES
             || now_ms >= self.first_message_at + MAX_BATCH_MS
         {
@@ -54,10 +70,12 @@ impl Pending {
 
     fn deadline(&self, now_ms: i64) -> i64 {
         if self.messages.len() >= MAX_BATCH_MESSAGES {
-            return now_ms;
+            return now_ms.max(self.retry_after);
         }
-        (self.first_message_at + MAX_BATCH_MS)
-            .min((self.last_message_at + QUIET_MS).max(self.typing_until))
+        self.retry_after.max(
+            (self.first_message_at + MAX_BATCH_MS)
+                .min((self.last_message_at + QUIET_MS).max(self.typing_until)),
+        )
     }
 }
 
@@ -112,11 +130,17 @@ impl Conversation {
                 first_message_at: now_ms,
                 last_message_at: now_ms,
                 typing_until: 0,
+                retry_after: 0,
+                silent_reviews: 0,
                 sequence: seq,
             }
         });
+        if pending.retry_after > now_ms {
+            pending.retry_after = 0;
+        }
         pending.last_message_at = now_ms;
         pending.messages.push(message);
+        pending.keep_recent_messages();
     }
 
     /// Extend a chat's typing hold, but only if the typer already has a message
@@ -146,7 +170,75 @@ impl Conversation {
         Some(ConversationBatch {
             chat_id,
             messages: pending.messages,
+            first_message_at: pending.first_message_at,
+            silent_reviews: pending.silent_reviews,
         })
+    }
+
+    /// Put an interrupted turn back behind any messages that arrived while it
+    /// was being generated.
+    pub fn restore(&mut self, batch: ConversationBatch, now_ms: i64) {
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        match self.pending.entry(batch.chat_id) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let pending = entry.insert(Pending {
+                    messages: batch.messages,
+                    first_message_at: batch.first_message_at,
+                    last_message_at: now_ms,
+                    typing_until: 0,
+                    retry_after: now_ms + QUIET_MS,
+                    silent_reviews: batch.silent_reviews,
+                    sequence,
+                });
+                pending.keep_recent_messages();
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let pending = entry.get_mut();
+                pending.messages.splice(0..0, batch.messages);
+                pending.first_message_at = pending.first_message_at.min(batch.first_message_at);
+                pending.silent_reviews = pending.silent_reviews.max(batch.silent_reviews);
+                pending.keep_recent_messages();
+            }
+        }
+    }
+
+    /// Keep a deliberately unanswered batch alive. Repeated silence backs off
+    /// to the normal heartbeat interval instead of spinning or forgetting it.
+    pub fn defer_after_silence(&mut self, mut batch: ConversationBatch, now_ms: i64) {
+        batch.silent_reviews = batch.silent_reviews.saturating_add(1);
+        let base = if batch.chat_id > 0 {
+            PRIVATE_RETRY_MS
+        } else {
+            GROUP_RETRY_MS
+        };
+        let multiplier = 1_i64
+            .checked_shl(batch.silent_reviews.saturating_sub(1).min(30))
+            .unwrap_or(i64::MAX);
+        let retry_after = now_ms + base.saturating_mul(multiplier).min(MAX_RETRY_MS);
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        match self.pending.entry(batch.chat_id) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let pending = entry.insert(Pending {
+                    messages: batch.messages,
+                    first_message_at: batch.first_message_at,
+                    last_message_at: now_ms,
+                    typing_until: 0,
+                    retry_after,
+                    silent_reviews: batch.silent_reviews,
+                    sequence,
+                });
+                pending.keep_recent_messages();
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let pending = entry.get_mut();
+                pending.messages.splice(0..0, batch.messages);
+                pending.first_message_at = pending.first_message_at.min(batch.first_message_at);
+                pending.silent_reviews = pending.silent_reviews.max(batch.silent_reviews);
+                pending.keep_recent_messages();
+            }
+        }
     }
 
     /// Remove and return whatever is pending for one chat, ready or not. Used for
@@ -251,6 +343,7 @@ mod tests {
             timestamp: "2026-01-01T00:00:00Z".into(),
             metadata: String::new(),
             text: text.into(),
+            needs_social_appraisal: true,
         }
     }
 

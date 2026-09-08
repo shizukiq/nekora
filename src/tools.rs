@@ -303,6 +303,11 @@ async fn dispatch(
                 .and_then(Value::as_i64)
                 .or_else(|| generation.map(|generation| generation.chat_id()))
                 .ok_or_else(|| anyhow!("missing chat_id"))?;
+            if generation.is_some_and(|generation| generation.chat_id() != chat_id) {
+                return Err(anyhow!(
+                    "a conversational turn can only answer its current chat"
+                ));
+            }
             let description = str_arg(&args, "description")?;
             let caption = match args.get("caption") {
                 Some(value) => value
@@ -340,6 +345,11 @@ async fn dispatch(
                 .and_then(Value::as_i64)
                 .or_else(|| generation.map(|generation| generation.chat_id()))
                 .ok_or_else(|| anyhow!("missing chat_id"))?;
+            if generation.is_some_and(|generation| generation.chat_id() != chat_id) {
+                return Err(anyhow!(
+                    "a conversational turn can only answer its current chat"
+                ));
+            }
             let text = str_arg(&args, "text")?;
             let reply_to_message_id = optional_message_id(&args, "reply_to_message_id")?;
             app.userbot
@@ -352,6 +362,11 @@ async fn dispatch(
                 .get("chat_id")
                 .and_then(Value::as_i64)
                 .ok_or_else(|| anyhow!("missing chat_id"))?;
+            if generation.is_some_and(|generation| generation.chat_id() != chat_id) {
+                return Err(anyhow!(
+                    "a conversational turn can only answer its current chat"
+                ));
+            }
             let message_id = args
                 .get("message_id")
                 .and_then(Value::as_i64)

@@ -38,10 +38,13 @@ heartbeat ──▶ reflection ──▶ brain + tools ──▶ message, reacti
 
 Incoming messages wait for a three-second quiet window; typing can extend the window, and a five-second grace catches
 late messages before generation starts. The resulting reply is split into natural Telegram bubbles and sent with typing
-delays. A newer private message invalidates an obsolete in-flight reply.
+delays. A newer private message invalidates an obsolete in-flight reply. Deliberately unanswered batches remain pending
+and are reconsidered with increasing delays: private chats start at one minute, groups at five, and both cap at the
+27-minute heartbeat interval. A new message makes its pending chat eligible immediately.
 
-Every 27 minutes the heartbeat may trigger an autonomous turn. A waking tick has roughly a 50% chance to act and a 1%
-chance to begin a 15–120 minute nap. Acting still does not guarantee a message: silence is an explicit outcome.
+Every 27 minutes the heartbeat may trigger an autonomous turn independently of chat activity. A waking tick has roughly
+a 50% chance to act and a 1% chance to begin a 15–120 minute nap. Acting still does not guarantee a message: silence is
+an explicit outcome.
 
 ## Community
 
@@ -262,8 +265,9 @@ personality edit cannot remove it accidentally. The prompt is read relative to t
 
 Conversational requests keep only the core workflow and character profile in the stable system prefix. Working memory is
 runtime-derived data and follows in its own untrusted user-role block, before per-turn time, recalled diary notes,
-recent events, and incoming messages. Providers with automatic prefix caching can therefore reuse the stable part even
-when working memory changes.
+recent events, and incoming messages. A turn receives a larger history from its current chat plus a smaller private
+awareness window from other chats. Providers with automatic prefix caching can therefore reuse the stable part even when
+working memory changes.
 
 ## Data and state
 

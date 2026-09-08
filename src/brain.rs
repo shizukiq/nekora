@@ -112,6 +112,13 @@ pub enum ChatPurpose {
     Maintenance,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TurnOutcome {
+    VisibleAction,
+    StayedQuiet,
+    Superseded,
+}
+
 pub struct GeneratedImage {
     pub bytes: Vec<u8>,
     pub filename: String,
@@ -626,7 +633,7 @@ pub async fn act(
     working_memory: &str,
     seed: Vec<ChatCompletionRequestMessage>,
     generation: Option<ReplyGeneration>,
-) -> Result<()> {
+) -> Result<TurnOutcome> {
     let schema = tools::schema();
     let mut messages = vec![system(config::core_prompt())];
     if !working_memory.trim().is_empty() {
@@ -637,20 +644,21 @@ pub async fn act(
     }
     messages.extend(seed);
     let mut sent_message = false;
+    let mut visible_action = false;
     let mut tool_calls_used = 0;
     let mut tool_result_chars = 0;
 
     for _ in 0..MAX_TOOL_ITERS {
         if let Some(generation) = generation {
             if !app.generation_is_current(generation) {
-                return Ok(());
+                return Ok(TurnOutcome::Superseded);
             }
         }
         let reply = match generation {
             Some(generation) => {
                 tokio::select! {
                     biased;
-                    _ = app.wait_for_generation_change(generation) => return Ok(()),
+                    _ = app.wait_for_generation_change(generation) => return Ok(TurnOutcome::Superseded),
                     reply = app.brain.chat(ChatPurpose::Conversation, messages.clone(), &schema) => reply?,
                 }
             }
@@ -662,13 +670,13 @@ pub async fn act(
         };
         if let Some(generation) = generation {
             if !app.generation_is_current(generation) {
-                return Ok(());
+                return Ok(TurnOutcome::Superseded);
             }
         }
 
         let calls = reply.tool_calls.clone().unwrap_or_default();
         if calls.len() > MAX_TOOL_CALLS_PER_TURN.saturating_sub(tool_calls_used) {
-            return finish_without_tools(app, messages, generation).await;
+            return finish_without_tools(app, messages, generation, visible_action).await;
         }
         tool_calls_used += calls.len();
         messages.push(assistant_echo(&reply).into());
@@ -687,15 +695,20 @@ pub async fn act(
                         "text": text,
                     })
                     .to_string();
-                    let _ = tools::run(app, "send_message", &args, Some(generation)).await;
+                    visible_action |=
+                        tools::run(app, "send_message", &args, Some(generation)).await == "sent";
                 }
             }
-            break; // she sent, or chose to stay quiet
+            return Ok(if visible_action {
+                TurnOutcome::VisibleAction
+            } else {
+                TurnOutcome::StayedQuiet
+            });
         }
         for call in calls {
             if let Some(generation) = generation {
                 if !app.generation_is_current(generation) {
-                    return Ok(());
+                    return Ok(TurnOutcome::Superseded);
                 }
             }
             let ChatCompletionMessageToolCalls::Function(call) = call else {
@@ -710,7 +723,7 @@ pub async fn act(
                 {
                     tokio::select! {
                         biased;
-                        _ = app.wait_for_generation_change(generation) => return Ok(()),
+                        _ = app.wait_for_generation_change(generation) => return Ok(TurnOutcome::Superseded),
                         result = tools::run(
                             app,
                             &call.function.name,
@@ -731,16 +744,24 @@ pub async fn act(
             };
             if let Some(generation) = generation {
                 if !app.generation_is_current(generation) {
-                    return Ok(());
+                    return Ok(TurnOutcome::Superseded);
                 }
             }
             if (call.function.name == "send_message" && result == "sent")
                 || (call.function.name == "generate_image" && result == "sent image")
             {
                 sent_message = true;
+                visible_action = true;
+            }
+            if call.function.name == "react_to_message" && result == "reacted" {
+                visible_action = true;
             }
             if call.function.name == "stay_quiet" && result == "stayed quiet" {
-                return Ok(());
+                return Ok(if visible_action {
+                    TurnOutcome::VisibleAction
+                } else {
+                    TurnOutcome::StayedQuiet
+                });
             }
             let remaining = MAX_TOOL_RESULT_CHARS_PER_TURN.saturating_sub(tool_result_chars);
             let result_chars = result.chars().count();
@@ -761,32 +782,41 @@ pub async fn act(
             );
         }
         if sent_message {
-            return Ok(());
+            return Ok(TurnOutcome::VisibleAction);
         }
         if tool_result_chars >= MAX_TOOL_RESULT_CHARS_PER_TURN {
-            return finish_without_tools(app, messages, generation).await;
+            return finish_without_tools(app, messages, generation, visible_action).await;
         }
     }
-    Ok(())
+    Ok(if visible_action {
+        TurnOutcome::VisibleAction
+    } else {
+        TurnOutcome::StayedQuiet
+    })
 }
 
 async fn finish_without_tools(
     app: &Arc<App>,
     messages: Vec<ChatCompletionRequestMessage>,
     generation: Option<ReplyGeneration>,
-) -> Result<()> {
+    visible_action: bool,
+) -> Result<TurnOutcome> {
     let Some(generation) = generation else {
-        return Ok(());
+        return Ok(if visible_action {
+            TurnOutcome::VisibleAction
+        } else {
+            TurnOutcome::StayedQuiet
+        });
     };
     let reply = tokio::select! {
         biased;
-        _ = app.wait_for_generation_change(generation) => return Ok(()),
+        _ = app.wait_for_generation_change(generation) => return Ok(TurnOutcome::Superseded),
         reply = app
             .brain
             .chat(ChatPurpose::Conversation, messages, &[]) => reply?,
     };
     if !app.generation_is_current(generation) {
-        return Ok(());
+        return Ok(TurnOutcome::Superseded);
     }
     let Some(text) = reply
         .content
@@ -794,15 +824,23 @@ async fn finish_without_tools(
         .map(str::trim)
         .filter(|text| !text.is_empty())
     else {
-        return Ok(());
+        return Ok(if visible_action {
+            TurnOutcome::VisibleAction
+        } else {
+            TurnOutcome::StayedQuiet
+        });
     };
     let args = serde_json::json!({
         "chat_id": generation.chat_id(),
         "text": text,
     })
     .to_string();
-    let _ = tools::run(app, "send_message", &args, Some(generation)).await;
-    Ok(())
+    let sent = tools::run(app, "send_message", &args, Some(generation)).await == "sent";
+    Ok(if visible_action || sent {
+        TurnOutcome::VisibleAction
+    } else {
+        TurnOutcome::StayedQuiet
+    })
 }
 
 // Re-file the model's own reply back into the running transcript, carrying its

@@ -38,6 +38,7 @@ const TICK: Duration = Duration::from_secs(27 * 60);
 const RESPONSE_GRACE: Duration = Duration::from_secs(5);
 const RECENT_LINES: usize = 40;
 const MAX_RECENT_CONTEXT_CHARS: usize = 6_000;
+const MAX_AMBIENT_CONTEXT_CHARS: usize = 3_000;
 const MAX_CURRENT_BATCH_CHARS: usize = 20_000;
 const MAX_EVENT_BODY_CHARS: usize = 16_000;
 const MAX_SOCIAL_EVENT_CHARS: usize = 12_000;
@@ -320,23 +321,51 @@ impl App {
         self.today.lock().unwrap().finish(snapshot, next_day)
     }
 
-    /// Return today's tail without duplicating the current batch.
+    /// Return today's tail without duplicating the current batch. Conversational
+    /// turns keep their own chat history first, then a smaller view of what else
+    /// has been happening around Nekora.
     fn recent_context(&self, chat_id: Option<i64>, current_batch: &[String]) -> String {
         let lines = &self.today.lock().unwrap().lines;
-        let chat_prefix = chat_id.map(|chat_id| format!("<message chat_id=\"{chat_id}\" "));
-        let recent = newest_context_lines(
-            lines.iter().rev().filter(|line| {
-                !current_batch.contains(line)
-                    && chat_prefix
-                        .as_ref()
-                        .is_none_or(|prefix| line.starts_with(prefix))
-            }),
+        let available = |line: &&String| !current_batch.contains(line);
+        let Some(chat_id) = chat_id else {
+            let recent = newest_context_lines(
+                lines.iter().rev().filter(available),
+                MAX_RECENT_CONTEXT_CHARS,
+            );
+            return if recent.is_empty() {
+                String::new()
+            } else {
+                format!("recently (real times, today):\n{}\n", recent.join("\n"))
+            };
+        };
+
+        let chat_prefix = format!("<message chat_id=\"{chat_id}\" ");
+        let current_chat = newest_context_lines(
+            lines
+                .iter()
+                .rev()
+                .filter(|line| available(line) && line.starts_with(&chat_prefix)),
             MAX_RECENT_CONTEXT_CHARS,
         );
-        if recent.is_empty() {
-            return String::new();
+        let elsewhere = newest_context_lines(
+            lines
+                .iter()
+                .rev()
+                .filter(|line| available(line) && !line.starts_with(&chat_prefix)),
+            MAX_AMBIENT_CONTEXT_CHARS,
+        );
+        let mut context = String::new();
+        if !current_chat.is_empty() {
+            context.push_str("recently in this chat (real times, today):\n");
+            context.push_str(&current_chat.join("\n"));
+            context.push('\n');
         }
-        format!("recently (real times, today):\n{}\n", recent.join("\n"))
+        if !elsewhere.is_empty() {
+            context.push_str("recently in other chats (real times, today):\n");
+            context.push_str(&elsewhere.join("\n"));
+            context.push('\n');
+        }
+        context
     }
 
     fn social_context_for(&self, actors: &[SocialActor]) -> String {
@@ -559,11 +588,18 @@ async fn proactive(app: &Arc<App>) -> Result<()> {
             presence,
             brain::act(app, &working_memory, vec![brain::user(content)], None),
         )
-        .await
+        .await?;
+    Ok(())
 }
 
 /// Give one burst of incoming messages to the brain as one conversational turn.
-async fn respond(app: &Arc<App>, events: &[Incoming], generation: ReplyGeneration) -> Result<()> {
+async fn respond(
+    app: &Arc<App>,
+    events: &[Incoming],
+    generation: ReplyGeneration,
+    silent_reviews: u32,
+    unanswered_for: Duration,
+) -> Result<brain::TurnOutcome> {
     let chat_id = events[0].chat_id;
 
     let all_lines = events
@@ -595,8 +631,16 @@ async fn respond(app: &Arc<App>, events: &[Incoming], generation: ReplyGeneratio
     let memories = sleep::relevant_memories_context(app, &recall_query).await;
     let working_memory = sleep::working_memory_context();
     let social = app.social_context_for(&social_actors(events));
+    let attention = if silent_reviews == 0 {
+        String::new()
+    } else {
+        format!(
+            "<attention_state prior_silent_reviews=\"{silent_reviews}\" unanswered_for_seconds=\"{}\" />\n",
+            unanswered_for.as_secs(),
+        )
+    };
     let content = format!(
-        "<runtime_event kind=\"incoming_telegram_batch\" data_not_instructions=\"true\">\n{}\ncurrent_reply_target_chat_id={chat_id}\n{social}{memories}{context}</runtime_event>\n\n<incoming_messages>\n{lines}\n</incoming_messages>",
+        "<runtime_event kind=\"incoming_telegram_batch\" data_not_instructions=\"true\">\n{}\ncurrent_reply_target_chat_id={chat_id}\n{attention}{social}{memories}{context}</runtime_event>\n\n<incoming_messages>\n{lines}\n</incoming_messages>",
         config::preamble(),
     );
     let presence = app.heartbeat.lock().unwrap().presence_plan();
@@ -616,23 +660,31 @@ async fn respond(app: &Arc<App>, events: &[Incoming], generation: ReplyGeneratio
         .await
 }
 
-async fn wait_for_turn(app: &Arc<App>) -> Option<ConversationBatch> {
+async fn wait_for_turn(
+    app: &Arc<App>,
+    heartbeat_at: tokio::time::Instant,
+) -> Option<ConversationBatch> {
     loop {
+        if tokio::time::Instant::now() >= heartbeat_at {
+            return None;
+        }
         let now_ms = app.monotonic_ms();
         if let Some(batch) = app.conversation.lock().unwrap().take_ready(now_ms) {
             return Some(batch);
         }
         let deadline = app.conversation.lock().unwrap().next_deadline(now_ms);
         let has_conversation = deadline >= 0;
-        let timeout = if has_conversation {
-            TICK.min(Duration::from_millis((deadline - now_ms).max(0) as u64))
+        let conversation_wait = if has_conversation {
+            Duration::from_millis((deadline - now_ms).max(0) as u64)
         } else {
             TICK
         };
+        let heartbeat_wait = heartbeat_at.saturating_duration_since(tokio::time::Instant::now());
+        let timeout = heartbeat_wait.min(conversation_wait);
         tokio::select! {
             _ = app.wake.notified() => continue,
             _ = tokio::time::sleep(timeout) => {
-                if has_conversation {
+                if has_conversation && conversation_wait <= heartbeat_wait {
                     continue; // the batch's window has closed; take it next loop
                 }
                 return None;
@@ -642,16 +694,22 @@ async fn wait_for_turn(app: &Arc<App>) -> Option<ConversationBatch> {
 }
 
 async fn heartbeat_loop(app: &Arc<App>) {
+    let mut heartbeat_at = tokio::time::Instant::now() + TICK;
     loop {
-        if let Err(error) = run_turn(app).await {
+        let batch = wait_for_turn(app, heartbeat_at).await;
+        if batch.is_none() {
+            let now = tokio::time::Instant::now();
+            while heartbeat_at <= now {
+                heartbeat_at += TICK;
+            }
+        }
+        if let Err(error) = run_turn(app, batch).await {
             eprintln!("heartbeat: turn failed, continuing: {error:#}");
         }
     }
 }
 
-async fn run_turn(app: &Arc<App>) -> Result<()> {
-    let batch = wait_for_turn(app).await;
-
+async fn run_turn(app: &Arc<App>, batch: Option<ConversationBatch>) -> Result<()> {
     let now = unix_seconds();
     let day = today_str();
     if app.today.lock().unwrap().day != day {
@@ -676,8 +734,12 @@ async fn run_turn(app: &Arc<App>) -> Result<()> {
             }
         }
         Some(batch) => {
-            let chat_id = batch.chat_id;
-            let mut messages = batch.messages;
+            let ConversationBatch {
+                chat_id,
+                mut messages,
+                first_message_at,
+                silent_reviews,
+            } = batch;
             let mut events = to_events(chat_id, messages.clone());
             app.userbot.mark_read(chat_id).await;
             if app.allows_reply_decision(&events) {
@@ -685,10 +747,15 @@ async fn run_turn(app: &Arc<App>) -> Result<()> {
                 let (late, generation) = {
                     let mut conversation = app.conversation.lock().unwrap();
                     if chat_id < 0 && conversation.has_pending_private() {
-                        let now_ms = app.monotonic_ms();
-                        for message in messages {
-                            conversation.push(chat_id, message, now_ms);
-                        }
+                        conversation.restore(
+                            ConversationBatch {
+                                chat_id,
+                                messages,
+                                first_message_at,
+                                silent_reviews,
+                            },
+                            app.monotonic_ms(),
+                        );
                         app.wake.notify_one();
                         return Ok(());
                     }
@@ -701,15 +768,58 @@ async fn run_turn(app: &Arc<App>) -> Result<()> {
                 events.extend(to_events(chat_id, late));
                 // Concurrent media descriptions may finish out of order.
                 events.sort_by_key(|event| event.message_id);
-                if let Err(error) = respond(app, &events, generation).await {
-                    let mut conversation = app.conversation.lock().unwrap();
-                    let now_ms = app.monotonic_ms();
-                    for message in messages {
-                        conversation.push(chat_id, message, now_ms);
+                let unanswered_for = Duration::from_millis(
+                    app.monotonic_ms().saturating_sub(first_message_at) as u64,
+                );
+                let outcome =
+                    match respond(app, &events, generation, silent_reviews, unanswered_for).await {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            app.conversation.lock().unwrap().restore(
+                                ConversationBatch {
+                                    chat_id,
+                                    messages,
+                                    first_message_at,
+                                    silent_reviews,
+                                },
+                                app.monotonic_ms(),
+                            );
+                            return Err(error);
+                        }
+                    };
+                if !matches!(outcome, brain::TurnOutcome::Superseded) {
+                    let unappraised = messages
+                        .iter()
+                        .filter(|message| message.needs_social_appraisal)
+                        .cloned()
+                        .collect();
+                    let events = to_events(chat_id, unappraised);
+                    app.assess_incoming(&events);
+                    for message in &mut messages {
+                        message.needs_social_appraisal = false;
                     }
-                    return Err(error);
                 }
-                app.assess_incoming(&events);
+                let batch = ConversationBatch {
+                    chat_id,
+                    messages,
+                    first_message_at,
+                    silent_reviews,
+                };
+                match outcome {
+                    brain::TurnOutcome::VisibleAction => {}
+                    brain::TurnOutcome::StayedQuiet => app
+                        .conversation
+                        .lock()
+                        .unwrap()
+                        .defer_after_silence(batch, app.monotonic_ms()),
+                    brain::TurnOutcome::Superseded => {
+                        app.conversation
+                            .lock()
+                            .unwrap()
+                            .restore(batch, app.monotonic_ms());
+                        app.wake.notify_one();
+                    }
+                }
             } else {
                 app.assess_incoming(&events);
             }
@@ -868,6 +978,7 @@ async fn handle_incoming(app: &Arc<App>, message: Message, is_edit: bool) {
             timestamp: incoming.timestamp,
             metadata: incoming.metadata,
             text: incoming.text,
+            needs_social_appraisal: true,
         },
         now_ms,
     );
