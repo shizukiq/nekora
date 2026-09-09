@@ -191,6 +191,8 @@ impl ProviderChain {
             bail!("search result limit must be between 1 and {MAX_RESULTS}");
         }
 
+        let requested_url = exact_query_url(query);
+
         let mut failures = Vec::new();
         let mut attempted = false;
         for slot in &self.providers {
@@ -202,6 +204,20 @@ impl ProviderChain {
                 Ok(results) if results.results.is_empty() => {
                     slot.clear_cooldown();
                     failures.push(format!("{}: no results", slot.provider.name()));
+                }
+                Ok(results)
+                    if requested_url.as_ref().is_some_and(|requested_url| {
+                        !results
+                            .results
+                            .iter()
+                            .any(|result| same_page(requested_url, &result.url))
+                    }) =>
+                {
+                    slot.clear_cooldown();
+                    failures.push(format!(
+                        "{}: requested URL was not in the results",
+                        slot.provider.name()
+                    ));
                 }
                 Ok(results) => {
                     slot.clear_cooldown();
@@ -238,6 +254,26 @@ impl ProviderChain {
             failures.join("; ")
         ))
     }
+}
+
+pub(crate) fn exact_query_url(query: &str) -> Option<Url> {
+    let url = Url::parse(query.trim()).ok()?;
+    if url.host_str().is_some() && matches!(url.scheme(), "http" | "https") {
+        Some(url)
+    } else {
+        None
+    }
+}
+
+fn same_page(expected: &Url, actual: &str) -> bool {
+    let Ok(actual) = Url::parse(actual) else {
+        return false;
+    };
+    expected.scheme() == actual.scheme()
+        && expected.host_str() == actual.host_str()
+        && expected.port_or_known_default() == actual.port_or_known_default()
+        && expected.path().trim_end_matches('/') == actual.path().trim_end_matches('/')
+        && expected.query() == actual.query()
 }
 
 impl ProviderSlot {

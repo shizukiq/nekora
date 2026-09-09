@@ -7,8 +7,8 @@ use serde_json::json;
 use crate::config;
 
 use super::{
-    append_path, parse_http_url, response_json, transport_error, SearchError, SearchFuture,
-    SearchProvider, SearchResult, SearchResults, MAX_RESULTS, MAX_SNIPPET_CHARS,
+    append_path, exact_query_url, parse_http_url, response_json, transport_error, SearchError,
+    SearchFuture, SearchProvider, SearchResult, SearchResults, MAX_RESULTS, MAX_SNIPPET_CHARS,
 };
 
 const DEFAULT_API_BASE: &str = "https://openrouter.ai/api/v1";
@@ -103,13 +103,22 @@ impl SearchProvider for OpenRouterProvider {
                 .message;
 
             let mut seen_urls = HashSet::new();
-            let results = message
+            let mut results = message
                 .annotations
                 .into_iter()
                 .filter_map(Annotation::into_result)
                 .filter(|result| seen_urls.insert(result.url.clone()))
                 .take(limit)
                 .collect::<Vec<_>>();
+            if results.is_empty() {
+                if let (Some(url), Some(content)) = (exact_query_url(query), message.content) {
+                    if let Some(result) =
+                        SearchResult::from_parts(Some(url.as_str()), url.as_str(), Some(&content))
+                    {
+                        results.push(result);
+                    }
+                }
+            }
             Ok(SearchResults { results })
         })
     }
@@ -128,6 +137,8 @@ struct Choice {
 
 #[derive(Deserialize)]
 struct Message {
+    #[serde(default)]
+    content: Option<String>,
     #[serde(default)]
     annotations: Vec<Annotation>,
 }

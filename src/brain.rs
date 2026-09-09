@@ -288,22 +288,21 @@ impl Brain {
             builder.tools(tools.to_vec());
         }
         let request = builder.build()?;
-        let mut reply = self
-            .retry(
-                || async {
-                    let response = client.chat().create(request.clone()).await?;
-                    response
-                        .choices
-                        .into_iter()
-                        .next()
-                        .map(|choice| choice.message)
-                        .ok_or_else(|| anyhow!("brain returned no choices"))
-                },
-                |_| true,
-            )
-            .await?;
-        normalize_dsml_tool_calls(&mut reply)?;
-        Ok(reply)
+        self.retry(
+            || async {
+                let response = client.chat().create(request.clone()).await?;
+                let mut reply = response
+                    .choices
+                    .into_iter()
+                    .next()
+                    .map(|choice| choice.message)
+                    .ok_or_else(|| anyhow!("brain returned no choices"))?;
+                normalize_dsml_tool_calls(&mut reply)?;
+                Ok(reply)
+            },
+            |_| true,
+        )
+        .await
     }
 
     /// Describe an incoming image so the text-only turn can "see" it. OpenRouter
@@ -610,6 +609,7 @@ fn is_transient(error: &anyhow::Error) -> bool {
         "internal error",
         "unavailable",
         "network",
+        "dsml",
         "502",
         "503",
         "504",
