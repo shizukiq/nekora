@@ -68,6 +68,43 @@ pub fn schema() -> Vec<ChatCompletionTools> {
                 "required": ["user_id", "name", "username"]}),
         ),
         (
+            "inspect_own_profile",
+            "See your own current Telegram name, username, bio, Premium status, emoji status, and profile photos. Set avatar_limit to how many recent avatars you actually need to look at.",
+            json!({"type": "object", "properties": {
+                "avatar_limit": {"type": "integer", "minimum": 1, "maximum": 4, "description": "number of recent profile photos to inspect; defaults to 1"}}}),
+        ),
+        (
+            "list_received_gifts",
+            "See Telegram gifts received by your account. This is read-only: it cannot convert, transfer, sell, pin, hide, or otherwise change a gift.",
+            json!({"type": "object", "properties": {
+                "offset": {"type": "string", "description": "pagination offset returned by Telegram; empty for the first page"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 20, "description": "number of gifts; defaults to 20"}}}),
+        ),
+        (
+            "list_sticker_sets",
+            "List sticker or custom emoji sets installed on your Telegram account. Open a returned set with list_stickers before sending an item from it.",
+            json!({"type": "object", "properties": {
+                "kind": {"type": "string", "enum": ["sticker", "custom_emoji"]}},
+                "required": ["kind"]}),
+        ),
+        (
+            "list_stickers",
+            "Look through one installed sticker or custom emoji set. Use a set_id returned by list_sticker_sets; optionally narrow it to one ordinary emoji.",
+            json!({"type": "object", "properties": {
+                "set_id": {"type": "integer"},
+                "emoji": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "number of items; defaults to 20"}},
+                "required": ["set_id"]}),
+        ),
+        (
+            "find_custom_emojis",
+            "Find Telegram custom emoji variants for one ordinary emoji. Returned document_id values can be used with send_custom_emoji or react_to_message.",
+            json!({"type": "object", "properties": {
+                "emoji": {"type": "string", "description": "one ordinary emoji to find variants for"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 20, "description": "number of variants; defaults to 10"}},
+                "required": ["emoji"]}),
+        ),
+        (
             "inspect_message_media",
             "Look closely at a photo, sticker, GIF, or video preview from a recent message using its chat_id and message_id.",
             json!({"type": "object", "properties": {
@@ -97,6 +134,25 @@ pub fn schema() -> Vec<ChatCompletionTools> {
                 "text": {"type": "string"},
                 "reply_to_message_id": {"type": "integer", "description": "message_id from Telegram context; omit for a normal message"}},
                 "required": ["chat_id", "text"]}),
+        ),
+        (
+            "send_sticker",
+            "Send one sticker that you previously selected with list_stickers. Set reply_to_message_id only when it should reply to one specific message.",
+            json!({"type": "object", "properties": {
+                "chat_id": {"type": "integer"},
+                "document_id": {"type": "integer", "description": "document_id returned by list_stickers"},
+                "reply_to_message_id": {"type": "integer"}},
+                "required": ["chat_id", "document_id"]}),
+        ),
+        (
+            "send_custom_emoji",
+            "Send one Telegram Premium custom emoji that you previously found or selected. Pass the ordinary emoji exactly as returned with its document_id.",
+            json!({"type": "object", "properties": {
+                "chat_id": {"type": "integer"},
+                "document_id": {"type": "integer"},
+                "emoji": {"type": "string"},
+                "reply_to_message_id": {"type": "integer"}},
+                "required": ["chat_id", "document_id", "emoji"]}),
         ),
         (
             "react_to_message",
@@ -281,6 +337,54 @@ async fn dispatch(
                 &app.userbot.inspect_user(user_id, name, username).await?,
             )?)
         }
+        "inspect_own_profile" => {
+            let avatar_limit = args
+                .get("avatar_limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(1) as usize;
+            Ok(serde_json::to_string(
+                &app.userbot.inspect_own_profile(avatar_limit).await?,
+            )?)
+        }
+        "list_received_gifts" => {
+            let offset = args.get("offset").and_then(Value::as_str).unwrap_or("");
+            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize;
+            Ok(serde_json::to_string(
+                &app.userbot.received_gifts(offset, limit).await?,
+            )?)
+        }
+        "list_sticker_sets" => {
+            let kind = str_arg(&args, "kind")?;
+            let custom_emoji = match kind {
+                "sticker" => false,
+                "custom_emoji" => true,
+                _ => return Err(anyhow!("kind must be sticker or custom_emoji")),
+            };
+            Ok(serde_json::to_string(
+                &app.userbot.sticker_sets(custom_emoji).await?,
+            )?)
+        }
+        "list_stickers" => {
+            let set_id = args
+                .get("set_id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| anyhow!("missing set_id"))?;
+            let emoji = args
+                .get("emoji")
+                .and_then(Value::as_str)
+                .filter(|emoji| !emoji.trim().is_empty());
+            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize;
+            Ok(serde_json::to_string(
+                &app.userbot.stickers_in_set(set_id, emoji, limit).await?,
+            )?)
+        }
+        "find_custom_emojis" => {
+            let emoji = str_arg(&args, "emoji")?;
+            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
+            Ok(serde_json::to_string(
+                &app.userbot.find_custom_emojis(emoji, limit).await?,
+            )?)
+        }
         "inspect_message_media" => {
             let chat_id = args
                 .get("chat_id")
@@ -356,6 +460,56 @@ async fn dispatch(
                 .send(app, chat_id, text, reply_to_message_id, generation)
                 .await?;
             Ok("sent".to_string())
+        }
+        "send_sticker" => {
+            let chat_id = args
+                .get("chat_id")
+                .and_then(Value::as_i64)
+                .or_else(|| generation.map(|generation| generation.chat_id()))
+                .ok_or_else(|| anyhow!("missing chat_id"))?;
+            if generation.is_some_and(|generation| generation.chat_id() != chat_id) {
+                return Err(anyhow!(
+                    "a conversational turn can only answer its current chat"
+                ));
+            }
+            let document_id = args
+                .get("document_id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| anyhow!("missing document_id"))?;
+            let reply_to_message_id = optional_message_id(&args, "reply_to_message_id")?;
+            app.userbot
+                .send_sticker(app, chat_id, document_id, reply_to_message_id, generation)
+                .await?;
+            Ok("sent sticker".to_string())
+        }
+        "send_custom_emoji" => {
+            let chat_id = args
+                .get("chat_id")
+                .and_then(Value::as_i64)
+                .or_else(|| generation.map(|generation| generation.chat_id()))
+                .ok_or_else(|| anyhow!("missing chat_id"))?;
+            if generation.is_some_and(|generation| generation.chat_id() != chat_id) {
+                return Err(anyhow!(
+                    "a conversational turn can only answer its current chat"
+                ));
+            }
+            let document_id = args
+                .get("document_id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| anyhow!("missing document_id"))?;
+            let emoji = str_arg(&args, "emoji")?;
+            let reply_to_message_id = optional_message_id(&args, "reply_to_message_id")?;
+            app.userbot
+                .send_custom_emoji(
+                    app,
+                    chat_id,
+                    document_id,
+                    emoji,
+                    reply_to_message_id,
+                    generation,
+                )
+                .await?;
+            Ok("sent custom emoji".to_string())
         }
         "react_to_message" => {
             let chat_id = args

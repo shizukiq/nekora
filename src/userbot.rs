@@ -84,6 +84,65 @@ pub struct UserInspection {
 }
 
 #[derive(Serialize)]
+pub struct OwnProfile {
+    pub user_id: i64,
+    pub name: String,
+    pub username: Option<String>,
+    pub bio: Option<String>,
+    pub premium: bool,
+    pub emoji_status_document_id: Option<i64>,
+    pub profile_photo_count: usize,
+    pub avatars: Vec<AvatarInspection>,
+}
+
+#[derive(Serialize)]
+pub struct AvatarInspection {
+    pub photo_id: i64,
+    pub date: Option<i32>,
+    pub description: String,
+}
+
+#[derive(Serialize)]
+pub struct ReceivedGift {
+    pub gift_id: i64,
+    pub title: Option<String>,
+    pub slug: Option<String>,
+    pub number: Option<i32>,
+    pub emoji: Option<String>,
+    pub appearance: Vec<String>,
+    pub from_user_id: Option<i64>,
+    pub sender_hidden: bool,
+    pub date: i32,
+    pub message: Option<String>,
+    pub saved_to_profile: bool,
+    pub pinned: bool,
+    pub refunded: bool,
+}
+
+#[derive(Serialize)]
+pub struct ReceivedGifts {
+    pub total: i32,
+    pub next_offset: Option<String>,
+    pub gifts: Vec<ReceivedGift>,
+}
+
+#[derive(Serialize)]
+pub struct StickerSetSummary {
+    pub set_id: i64,
+    pub title: String,
+    pub short_name: String,
+    pub kind: &'static str,
+    pub count: i32,
+}
+
+#[derive(Serialize)]
+pub struct TelegramAsset {
+    pub document_id: i64,
+    pub emoji: String,
+    pub kind: &'static str,
+}
+
+#[derive(Serialize)]
 pub struct MediaInspection {
     pub kind: String,
     pub emoji: Option<String>,
@@ -104,6 +163,13 @@ struct Presence {
     revision: u64,
 }
 
+#[derive(Clone)]
+struct CachedTelegramAsset {
+    document: tl::enums::InputDocument,
+    emoji: String,
+    custom_emoji: bool,
+}
+
 pub struct Userbot {
     client: Client,
     account_user_id: i64,
@@ -112,6 +178,8 @@ pub struct Userbot {
     brain: Arc<Brain>,
     peers: Mutex<HashMap<i64, PeerRef>>,
     private_contacts: Mutex<HashSet<i64>>,
+    sticker_sets: Mutex<HashMap<i64, tl::enums::InputStickerSet>>,
+    telegram_assets: Mutex<HashMap<i64, CachedTelegramAsset>>,
     presence: Mutex<Presence>,
 }
 
@@ -129,6 +197,8 @@ impl Userbot {
             brain,
             peers: Mutex::new(HashMap::new()),
             private_contacts: Mutex::new(HashSet::new()),
+            sticker_sets: Mutex::new(HashMap::new()),
+            telegram_assets: Mutex::new(HashMap::new()),
             presence: Mutex::new(Presence::default()),
         }
     }
@@ -141,6 +211,10 @@ impl Userbot {
         }
 
         let caption = clean(message.text());
+        let service_event = (!message.outgoing())
+            .then(|| message.action())
+            .flatten()
+            .and_then(describe_gift_action);
         let media = match message.media() {
             Some(Media::Photo(_)) => Some(self.describe_photo(message).await),
             Some(Media::Sticker(sticker)) => Some(self.describe_sticker(&sticker).await),
@@ -154,6 +228,7 @@ impl Userbot {
         let text = match media {
             Some(media) if !caption.is_empty() => format!("{media}\n{caption}"),
             Some(media) => media,
+            None if caption.is_empty() => service_event.unwrap_or_default(),
             None => caption,
         };
         let sender_peer = message.sender();
@@ -597,6 +672,351 @@ impl Userbot {
         })
     }
 
+    pub async fn inspect_own_profile(&self, avatar_limit: usize) -> Result<OwnProfile> {
+        if !(1..=4).contains(&avatar_limit) {
+            return Err(anyhow!("avatar_limit must be between 1 and 4"));
+        }
+        let me = self.client.get_me().await?;
+        let full: tl::types::users::UserFull = self
+            .client
+            .invoke(&tl::functions::users::GetFullUser {
+                id: tl::enums::InputUser::UserSelf,
+            })
+            .await?
+            .into();
+        let tl::enums::UserFull::Full(full_user) = full.full_user;
+        let raw_me = full.users.into_iter().find_map(|user| match user {
+            tl::enums::User::User(user) if user.id == self.account_user_id => Some(user),
+            _ => None,
+        });
+        let premium = raw_me.as_ref().is_some_and(|user| user.premium);
+        let emoji_status_document_id = raw_me
+            .as_ref()
+            .and_then(|user| user.emoji_status.as_ref())
+            .and_then(emoji_status_document_id);
+
+        let photos = self
+            .client
+            .invoke(&tl::functions::photos::GetUserPhotos {
+                user_id: tl::enums::InputUser::UserSelf,
+                offset: 0,
+                max_id: 0,
+                limit: avatar_limit as i32,
+            })
+            .await?;
+        let (profile_photo_count, photos) = match photos {
+            tl::enums::photos::Photos::Photos(photos) => (photos.photos.len(), photos.photos),
+            tl::enums::photos::Photos::Slice(photos) => {
+                (photos.count.max(0) as usize, photos.photos)
+            }
+        };
+        let mut avatars = Vec::with_capacity(photos.len());
+        for raw in photos {
+            let (photo_id, date) = match &raw {
+                tl::enums::Photo::Photo(photo) => (photo.id, Some(photo.date)),
+                tl::enums::Photo::Empty(photo) => (photo.id, None),
+            };
+            let photo = grammers_client::media::Photo::from_raw(raw);
+            let description = match self.download_media(&photo).await {
+                Ok(bytes) => self
+                    .brain
+                    .caption_image(&bytes)
+                    .await
+                    .unwrap_or_else(|error| {
+                        eprintln!("own avatar caption failed: {error:#}");
+                        "profile photo exists, but could not be viewed right now".to_string()
+                    }),
+                Err(error) => {
+                    eprintln!("own avatar download failed: {error:#}");
+                    "profile photo exists, but could not be viewed right now".to_string()
+                }
+            };
+            avatars.push(AvatarInspection {
+                photo_id,
+                date,
+                description,
+            });
+        }
+
+        Ok(OwnProfile {
+            user_id: self.account_user_id,
+            name: me.full_name(),
+            username: me.username().map(str::to_string),
+            bio: full_user.about,
+            premium,
+            emoji_status_document_id,
+            profile_photo_count,
+            avatars,
+        })
+    }
+
+    pub async fn received_gifts(&self, offset: &str, limit: usize) -> Result<ReceivedGifts> {
+        if !(1..=20).contains(&limit) {
+            return Err(anyhow!("limit must be between 1 and 20"));
+        }
+        let response: tl::types::payments::SavedStarGifts = self
+            .client
+            .invoke(&tl::functions::payments::GetSavedStarGifts {
+                exclude_unsaved: false,
+                exclude_saved: false,
+                exclude_unlimited: false,
+                exclude_unique: false,
+                sort_by_value: false,
+                exclude_upgradable: false,
+                exclude_unupgradable: false,
+                peer_color_available: false,
+                exclude_hosted: false,
+                peer: tl::enums::InputPeer::PeerSelf,
+                collection_id: None,
+                offset: offset.to_string(),
+                limit: limit as i32,
+            })
+            .await?
+            .into();
+
+        let total = response.count;
+        let next_offset = response.next_offset;
+        let gifts = response
+            .gifts
+            .into_iter()
+            .map(|gift| {
+                let tl::enums::SavedStarGift::Gift(gift) = gift;
+                let (gift_id, title, slug, number, emoji, appearance) = match gift.gift {
+                    tl::enums::StarGift::Gift(star_gift) => (
+                        star_gift.id,
+                        star_gift.title,
+                        None,
+                        None,
+                        document_emoji(&star_gift.sticker),
+                        Vec::new(),
+                    ),
+                    tl::enums::StarGift::Unique(star_gift) => {
+                        let appearance = star_gift
+                            .attributes
+                            .iter()
+                            .filter_map(|attribute| match attribute {
+                                tl::enums::StarGiftAttribute::Model(attribute) => {
+                                    Some(format!("model: {}", attribute.name))
+                                }
+                                tl::enums::StarGiftAttribute::Pattern(attribute) => {
+                                    Some(format!("pattern: {}", attribute.name))
+                                }
+                                tl::enums::StarGiftAttribute::Backdrop(attribute) => {
+                                    Some(format!("backdrop: {}", attribute.name))
+                                }
+                                tl::enums::StarGiftAttribute::OriginalDetails(_) => None,
+                            })
+                            .collect();
+                        (
+                            star_gift.id,
+                            Some(star_gift.title),
+                            Some(star_gift.slug),
+                            Some(star_gift.num),
+                            None,
+                            appearance,
+                        )
+                    }
+                };
+                ReceivedGift {
+                    gift_id,
+                    title,
+                    slug,
+                    number,
+                    emoji,
+                    appearance,
+                    from_user_id: gift.from_id.as_ref().and_then(raw_user_id),
+                    sender_hidden: gift.name_hidden,
+                    date: gift.date,
+                    message: gift.message.map(|message| {
+                        let tl::enums::TextWithEntities::Entities(message) = message;
+                        message.text
+                    }),
+                    saved_to_profile: !gift.unsaved,
+                    pinned: gift.pinned_to_top,
+                    refunded: gift.refunded,
+                }
+            })
+            .collect();
+        Ok(ReceivedGifts {
+            total,
+            next_offset,
+            gifts,
+        })
+    }
+
+    pub async fn sticker_sets(&self, custom_emoji: bool) -> Result<Vec<StickerSetSummary>> {
+        let response = if custom_emoji {
+            self.client
+                .invoke(&tl::functions::messages::GetEmojiStickers { hash: 0 })
+                .await?
+        } else {
+            self.client
+                .invoke(&tl::functions::messages::GetAllStickers { hash: 0 })
+                .await?
+        };
+        let tl::enums::messages::AllStickers::Stickers(response) = response else {
+            return Ok(Vec::new());
+        };
+        let kind = if custom_emoji {
+            "custom_emoji"
+        } else {
+            "sticker"
+        };
+        let mut cache = self.sticker_sets.lock().unwrap();
+        Ok(response
+            .sets
+            .into_iter()
+            .take(50)
+            .map(|set| {
+                let tl::enums::StickerSet::Set(set) = set;
+                cache.insert(
+                    set.id,
+                    tl::types::InputStickerSetId {
+                        id: set.id,
+                        access_hash: set.access_hash,
+                    }
+                    .into(),
+                );
+                StickerSetSummary {
+                    set_id: set.id,
+                    title: set.title,
+                    short_name: set.short_name,
+                    kind,
+                    count: set.count,
+                }
+            })
+            .collect())
+    }
+
+    pub async fn stickers_in_set(
+        &self,
+        set_id: i64,
+        emoji: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<TelegramAsset>> {
+        if !(1..=50).contains(&limit) {
+            return Err(anyhow!("limit must be between 1 and 50"));
+        }
+        let sticker_set = self
+            .sticker_sets
+            .lock()
+            .unwrap()
+            .get(&set_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("list sticker sets before opening one"))?;
+        let response = self
+            .client
+            .invoke(&tl::functions::messages::GetStickerSet {
+                stickerset: sticker_set,
+                hash: 0,
+            })
+            .await?;
+        let tl::enums::messages::StickerSet::Set(response) = response else {
+            return Ok(Vec::new());
+        };
+        let wanted = emoji.map(str::trim).filter(|emoji| !emoji.is_empty());
+        let mut assets = Vec::new();
+        let mut cache = self.telegram_assets.lock().unwrap();
+        for document in response.documents {
+            let tl::enums::Document::Document(document) = document else {
+                continue;
+            };
+            let Some((asset_emoji, custom_emoji)) = document_asset_kind(&document) else {
+                continue;
+            };
+            if wanted.is_some_and(|wanted| !asset_emoji.contains(wanted)) {
+                continue;
+            }
+            let input = tl::types::InputDocument {
+                id: document.id,
+                access_hash: document.access_hash,
+                file_reference: document.file_reference,
+            }
+            .into();
+            cache.insert(
+                document.id,
+                CachedTelegramAsset {
+                    document: input,
+                    emoji: asset_emoji.clone(),
+                    custom_emoji,
+                },
+            );
+            assets.push(TelegramAsset {
+                document_id: document.id,
+                emoji: asset_emoji,
+                kind: if custom_emoji {
+                    "custom_emoji"
+                } else {
+                    "sticker"
+                },
+            });
+            if assets.len() == limit {
+                break;
+            }
+        }
+        Ok(assets)
+    }
+
+    pub async fn find_custom_emojis(
+        &self,
+        emoji: &str,
+        limit: usize,
+    ) -> Result<Vec<TelegramAsset>> {
+        if emoji.trim().is_empty() {
+            return Err(anyhow!("emoji must not be empty"));
+        }
+        if !(1..=20).contains(&limit) {
+            return Err(anyhow!("limit must be between 1 and 20"));
+        }
+        let ids = match self
+            .client
+            .invoke(&tl::functions::messages::SearchCustomEmoji {
+                emoticon: emoji.trim().to_string(),
+                hash: 0,
+            })
+            .await?
+        {
+            tl::enums::EmojiList::List(list) => list.document_id,
+            tl::enums::EmojiList::NotModified => Vec::new(),
+        };
+        let documents = self
+            .client
+            .invoke(&tl::functions::messages::GetCustomEmojiDocuments {
+                document_id: ids.into_iter().take(limit).collect(),
+            })
+            .await?;
+        let mut assets = Vec::new();
+        let mut cache = self.telegram_assets.lock().unwrap();
+        for document in documents {
+            let tl::enums::Document::Document(document) = document else {
+                continue;
+            };
+            let Some((asset_emoji, true)) = document_asset_kind(&document) else {
+                continue;
+            };
+            let input = tl::types::InputDocument {
+                id: document.id,
+                access_hash: document.access_hash,
+                file_reference: document.file_reference,
+            }
+            .into();
+            cache.insert(
+                document.id,
+                CachedTelegramAsset {
+                    document: input,
+                    emoji: asset_emoji.clone(),
+                    custom_emoji: true,
+                },
+            );
+            assets.push(TelegramAsset {
+                document_id: document.id,
+                emoji: asset_emoji,
+                kind: "custom_emoji",
+            });
+        }
+        Ok(assets)
+    }
+
     pub async fn inspect_message_media(
         &self,
         chat_id: i64,
@@ -898,6 +1318,9 @@ impl Userbot {
         reply_to_message_id: Option<i64>,
         generation: Option<ReplyGeneration>,
     ) -> Result<()> {
+        if text.contains("DSML |") && text.contains("invoke name=\"") {
+            return Err(anyhow!("refusing to send internal tool-call markup"));
+        }
         if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
             return Ok(());
         }
@@ -1007,6 +1430,116 @@ impl Userbot {
             } else {
                 &caption
             },
+            reply_to_message_id,
+        );
+        Ok(())
+    }
+
+    pub async fn send_sticker(
+        &self,
+        app: &App,
+        chat_id: i64,
+        document_id: i64,
+        reply_to_message_id: Option<i64>,
+        generation: Option<ReplyGeneration>,
+    ) -> Result<()> {
+        if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
+            return Ok(());
+        }
+        let asset = self
+            .telegram_assets
+            .lock()
+            .unwrap()
+            .get(&document_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("list the sticker before sending it"))?;
+        if asset.custom_emoji {
+            return Err(anyhow!(
+                "document_id belongs to a custom emoji, not a sticker"
+            ));
+        }
+        let peer = self.resolve_contact_scoped_peer(chat_id).await?;
+        let reply_to = reply_to_message_id
+            .map(|message_id| {
+                i32::try_from(message_id)
+                    .map_err(|_| anyhow!("reply_to_message_id is outside Telegram's range"))
+            })
+            .transpose()?;
+        if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
+            return Ok(());
+        }
+        let message = InputMessage::new()
+            .media(tl::types::InputMediaDocument {
+                spoiler: false,
+                id: asset.document,
+                video_cover: None,
+                video_timestamp: None,
+                ttl_seconds: None,
+                query: None,
+            })
+            .reply_to(reply_to);
+        self.client.send_message(peer, message).await?;
+        app.record_outgoing(
+            chat_id,
+            &format!("[sticker] {}", asset.emoji),
+            reply_to_message_id,
+        );
+        Ok(())
+    }
+
+    pub async fn send_custom_emoji(
+        &self,
+        app: &App,
+        chat_id: i64,
+        document_id: i64,
+        emoji: &str,
+        reply_to_message_id: Option<i64>,
+        generation: Option<ReplyGeneration>,
+    ) -> Result<()> {
+        if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
+            return Ok(());
+        }
+        let asset = self
+            .telegram_assets
+            .lock()
+            .unwrap()
+            .get(&document_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("find or list the custom emoji before sending it"))?;
+        if !asset.custom_emoji {
+            return Err(anyhow!(
+                "document_id belongs to a sticker, not a custom emoji"
+            ));
+        }
+        let emoji = emoji.trim();
+        if emoji != asset.emoji {
+            return Err(anyhow!("emoji must match the selected custom emoji"));
+        }
+        let length = i32::try_from(emoji.encode_utf16().count())
+            .map_err(|_| anyhow!("emoji is too long"))?;
+        let peer = self.resolve_contact_scoped_peer(chat_id).await?;
+        let reply_to = reply_to_message_id
+            .map(|message_id| {
+                i32::try_from(message_id)
+                    .map_err(|_| anyhow!("reply_to_message_id is outside Telegram's range"))
+            })
+            .transpose()?;
+        if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
+            return Ok(());
+        }
+        let message = InputMessage::new()
+            .text(emoji)
+            .fmt_entities([tl::types::MessageEntityCustomEmoji {
+                offset: 0,
+                length,
+                document_id,
+            }
+            .into()])
+            .reply_to(reply_to);
+        self.client.send_message(peer, message).await?;
+        app.record_outgoing(
+            chat_id,
+            &format!("[custom emoji] {emoji}"),
             reply_to_message_id,
         );
         Ok(())
@@ -1428,6 +1961,65 @@ fn reaction_label(reaction: &tl::enums::Reaction) -> String {
         }
         tl::enums::Reaction::Paid => "paid".to_string(),
     }
+}
+
+fn emoji_status_document_id(status: &tl::enums::EmojiStatus) -> Option<i64> {
+    match status {
+        tl::enums::EmojiStatus::Status(status) => Some(status.document_id),
+        tl::enums::EmojiStatus::Collectible(status) => Some(status.document_id),
+        tl::enums::EmojiStatus::Empty | tl::enums::EmojiStatus::InputEmojiStatusCollectible(_) => {
+            None
+        }
+    }
+}
+
+fn raw_user_id(peer: &tl::enums::Peer) -> Option<i64> {
+    match peer {
+        tl::enums::Peer::User(peer) => Some(peer.user_id),
+        tl::enums::Peer::Chat(_) | tl::enums::Peer::Channel(_) => None,
+    }
+}
+
+fn document_emoji(document: &tl::enums::Document) -> Option<String> {
+    let tl::enums::Document::Document(document) = document else {
+        return None;
+    };
+    document_asset_kind(document).map(|(emoji, _)| emoji)
+}
+
+fn document_asset_kind(document: &tl::types::Document) -> Option<(String, bool)> {
+    document
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            tl::enums::DocumentAttribute::Sticker(sticker) => Some((sticker.alt.clone(), false)),
+            tl::enums::DocumentAttribute::CustomEmoji(emoji) => Some((emoji.alt.clone(), true)),
+            _ => None,
+        })
+}
+
+fn describe_gift_action(action: &tl::enums::MessageAction) -> Option<String> {
+    let gift = match action {
+        tl::enums::MessageAction::StarGift(action) => &action.gift,
+        tl::enums::MessageAction::StarGiftUnique(action) => &action.gift,
+        _ => return None,
+    };
+    Some(match gift {
+        tl::enums::StarGift::Gift(gift) => {
+            match (gift.title.as_deref(), document_emoji(&gift.sticker)) {
+                (Some(title), Some(emoji)) => format!("[Telegram gift received: {title}, {emoji}]"),
+                (Some(title), None) => format!("[Telegram gift received: {title}]"),
+                (None, Some(emoji)) => format!("[Telegram gift received: {emoji}]"),
+                (None, None) => "[Telegram gift received]".to_string(),
+            }
+        }
+        tl::enums::StarGift::Unique(gift) => {
+            format!(
+                "[Telegram collectible gift received: {} #{}]",
+                gift.title, gift.num
+            )
+        }
+    })
 }
 
 fn compact_context_text(text: &str) -> String {

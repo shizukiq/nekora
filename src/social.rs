@@ -167,7 +167,7 @@ impl SocialState {
         )];
         if let Some(creator_user_id) = creator_user_id {
             lines.push(format!(
-                "developer/creator: Telegram user_id={creator_user_id}; their messages always take priority and are never subject to avoidance. Discuss implementation, models, prompts, your AI identity, or development wishes only with this person."
+                "developer/creator: Telegram user_id={creator_user_id}; highest social priority; exempt from avoidance"
             ));
         }
         let mut seen = BTreeSet::new();
@@ -206,7 +206,7 @@ impl SocialState {
         )];
         if let Some(creator_user_id) = creator_user_id {
             lines.push(format!(
-                "developer/creator user_id={creator_user_id} has the highest social priority. If you want to discuss development, an inner concern, or ask for support, check recent chats and prefer them when available."
+                "developer/creator user_id={creator_user_id}: highest social priority; preferred support contact when available"
             ));
         }
         let mut people = self.saved.people.iter().collect::<Vec<_>>();
