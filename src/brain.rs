@@ -629,11 +629,15 @@ fn normalize_dsml_tool_calls(reply: &mut ChatCompletionResponseMessage) -> Resul
     let Some(content) = reply.content.as_deref() else {
         return Ok(());
     };
-    if !content.contains("DSML | tool_calls") {
+    if !(content.contains("DSML")
+        && content.contains("tool_calls")
+        && content.contains("invoke name=\""))
+    {
         return Ok(());
     }
 
-    let mut rest = content;
+    let normalized = content.replace('｜', "|");
+    let mut rest = normalized.as_str();
     let mut calls = Vec::new();
     while let Some(invoke) = rest.find("invoke name=\"") {
         rest = &rest[invoke + "invoke name=\"".len()..];
@@ -646,10 +650,9 @@ fn normalize_dsml_tool_calls(reply: &mut ChatCompletionResponseMessage) -> Resul
             .ok_or_else(|| anyhow!("brain returned malformed DSML invoke"))?
             + name_end
             + 1;
-        let body_end = rest[body_start..]
-            .find("/invoke>")
-            .ok_or_else(|| anyhow!("brain returned unclosed DSML invoke"))?
-            + body_start;
+        let (body_end, invoke_close_len) = find_dsml_close(&rest[body_start..], "invoke")
+            .map(|(end, len)| (end + body_start, len))
+            .ok_or_else(|| anyhow!("brain returned unclosed DSML invoke"))?;
         let mut body = &rest[body_start..body_end];
         let mut arguments = serde_json::Map::new();
 
@@ -663,28 +666,31 @@ fn normalize_dsml_tool_calls(reply: &mut ChatCompletionResponseMessage) -> Resul
                 .find('>')
                 .ok_or_else(|| anyhow!("brain returned malformed DSML parameter"))?
                 + key_end;
-            let value_end = body[tag_end + 1..]
-                .find("/parameter>")
-                .ok_or_else(|| anyhow!("brain returned unclosed DSML parameter"))?
-                + tag_end
-                + 1;
+            let (value_end, parameter_close_len) =
+                find_dsml_close(&body[tag_end + 1..], "parameter")
+                    .map(|(end, len)| (end + tag_end + 1, len))
+                    .ok_or_else(|| anyhow!("brain returned unclosed DSML parameter"))?;
             let tag = &body[key_end..=tag_end];
             let raw = body[tag_end + 1..value_end].trim();
-            let raw = raw
-                .rfind("<|")
-                .filter(|start| raw[*start..].contains("DSML |"))
-                .map_or(raw, |start| raw[..start].trim());
-            let value = if tag.contains("number=\"true\"") {
+            let value = if tag.contains("string=\"false\"") {
                 serde_json::from_str(raw)
-                    .map_err(|_| anyhow!("brain returned an invalid DSML number"))?
-            } else if tag.contains("boolean=\"true\"") {
-                serde_json::from_str(raw)
-                    .map_err(|_| anyhow!("brain returned an invalid DSML boolean"))?
+                    .map_err(|_| anyhow!("brain returned invalid DSML JSON"))?
             } else {
                 serde_json::Value::String(raw.to_string())
             };
             arguments.insert(key.to_string(), value);
-            body = &body[value_end + "/parameter>".len()..];
+            body = &body[value_end + parameter_close_len..];
+        }
+
+        if arguments.is_empty() {
+            let raw = body.trim();
+            if !raw.is_empty() {
+                arguments = serde_json::from_str::<serde_json::Value>(raw)
+                    .map_err(|_| anyhow!("brain returned invalid DSML arguments"))?
+                    .as_object()
+                    .cloned()
+                    .ok_or_else(|| anyhow!("DSML arguments must be a JSON object"))?;
+            }
         }
 
         calls.push(ChatCompletionMessageToolCalls::Function(
@@ -696,7 +702,7 @@ fn normalize_dsml_tool_calls(reply: &mut ChatCompletionResponseMessage) -> Resul
                 },
             },
         ));
-        rest = &rest[body_end + "/invoke>".len()..];
+        rest = &rest[body_end + invoke_close_len..];
     }
 
     if calls.is_empty() {
@@ -705,6 +711,17 @@ fn normalize_dsml_tool_calls(reply: &mut ChatCompletionResponseMessage) -> Resul
     reply.content = None;
     reply.tool_calls = Some(calls);
     Ok(())
+}
+
+fn find_dsml_close(text: &str, tag: &str) -> Option<(usize, usize)> {
+    [
+        format!("</|DSML|{tag}>"),
+        format!("<|DSML|/{tag}>"),
+        format!("/{tag}>"),
+    ]
+    .into_iter()
+    .filter_map(|closing| text.find(&closing).map(|start| (start, closing.len())))
+    .min_by_key(|(start, _)| *start)
 }
 
 pub fn system(content: impl Into<String>) -> ChatCompletionRequestMessage {
