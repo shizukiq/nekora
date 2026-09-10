@@ -20,12 +20,14 @@ use crate::config::env_or;
 const DEFAULT_OPENROUTER_API_BASE: &str = "https://openrouter.ai/api/v1";
 const DEFAULT_VISION_MODEL: &str = "qwen/qwen3-vl-32b-instruct";
 const MAX_IMAGE_ATTEMPTS: usize = 3;
+const IMAGE_REQUEST_ATTEMPTS: usize = 3;
 const MAX_IMAGE_REFERENCES: usize = 4;
 const IMAGE_REFERENCES_DIR: &str = "references";
 const MAX_ERROR_CHARS: usize = 500;
 const TEMPERATURE: f32 = 0.2;
 const MAX_COMPLETION_TOKENS: u32 = 2_000;
 const VISION_NUM_PREDICT: u32 = 300;
+const IMAGE_RETRY_WAIT: Duration = Duration::from_secs(5);
 const IMAGE_PROMPT_ENGINEER_SYSTEM: &str = r#"Create the scene-specific replacement for the literal
 {SCENE_REQUEST} marker in the canonical image prompt. The canonical prompt is fixed: preserve every
 identity, style, and negative tag outside that marker. Use the requested image and any previous
@@ -225,6 +227,27 @@ impl ImageGenerator {
     }
 
     async fn request_openrouter_image(&self, model: &str, prompt: &str) -> Result<GeneratedImage> {
+        let mut last_error = None;
+        for attempt in 0..IMAGE_REQUEST_ATTEMPTS {
+            match self.request_openrouter_image_once(model, prompt).await {
+                Ok(image) => return Ok(image),
+                Err(error)
+                    if is_retryable_image_error(&error) && attempt + 1 < IMAGE_REQUEST_ATTEMPTS =>
+                {
+                    last_error = Some(error);
+                    tokio::time::sleep(IMAGE_RETRY_WAIT).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("image generation failed after retries")))
+    }
+
+    async fn request_openrouter_image_once(
+        &self,
+        model: &str,
+        prompt: &str,
+    ) -> Result<GeneratedImage> {
         let url = format!("{}/images", self.openrouter_api_base);
         let input_references: Vec<_> = self
             .image_references
@@ -243,12 +266,18 @@ impl ImageGenerator {
             })
             .collect();
         let payload = if input_references.is_empty() {
-            serde_json::json!({"model": model, "prompt": prompt, "n": 1})
+            serde_json::json!({
+                "model": model,
+                "prompt": prompt,
+                "n": 1,
+                "provider": {"allow_fallbacks": true},
+            })
         } else {
             serde_json::json!({
                 "model": model,
                 "prompt": prompt,
                 "n": 1,
+                "provider": {"allow_fallbacks": true},
                 "input_references": input_references,
             })
         };
@@ -455,6 +484,24 @@ fn compose_image_prompt(template: &str, scene: &str) -> String {
         return template.replace("{SCENE_REQUEST}", scene);
     }
     format!("{template}\n\n{scene}")
+}
+
+fn is_retryable_image_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    [
+        "returned 408",
+        "returned 425",
+        "returned 429",
+        "returned 500",
+        "returned 502",
+        "returned 503",
+        "returned 504",
+        "timed out",
+        "error sending request",
+        "connection reset",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
 }
 
 fn parse_image_assessment(content: &str) -> Result<ImageAssessment> {

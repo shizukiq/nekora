@@ -198,10 +198,12 @@ pub async fn run(
     match dispatch(app, name, args_json, generation).await {
         Ok(result) => result,
         Err(error) => {
-            // Never hand the raw error to the model: it names the backend and she
-            // narrates her own plumbing out of character. Operator gets it on stderr.
+            // Keep backend details out of the persona, but let a failed image
+            // action produce an honest visible explanation instead of silence.
             eprintln!("tool {name} failed: {error:#}");
-            if name == "react_to_message" && is_reaction_invalid(&error) {
+            if name == "generate_image" {
+                image_generation_failure_for_model(&error)
+            } else if name == "react_to_message" && is_reaction_invalid(&error) {
                 "(Telegram rejected that reaction; it is unavailable for this chat or message. Do not retry the same reaction.)".to_string()
             } else {
                 "(couldn't do that just now)".to_string()
@@ -212,6 +214,25 @@ pub async fn run(
 
 fn is_reaction_invalid(error: &anyhow::Error) -> bool {
     format!("{error:#}").contains("REACTION_INVALID")
+}
+
+fn image_generation_failure_for_model(error: &anyhow::Error) -> String {
+    let details = format!("{error:#}").to_ascii_lowercase();
+    let cause = if details.contains("returned 502") {
+        "temporary upstream image-provider failure (HTTP 502)"
+    } else if details.contains("returned 429") {
+        "temporary image-provider rate limit (HTTP 429)"
+    } else if details.contains("timed out") {
+        "the image provider timed out"
+    } else if details.contains("requires openrouter_api_key") || details.contains("not configured")
+    {
+        "image generation is not configured"
+    } else {
+        "the image service returned an error"
+    };
+    format!(
+        "(image generation failed; no image was sent. Cause: {cause}. Do not claim that an image was sent, and do not call generate_image again in this turn; tell the person briefly that image generation failed and they can try again.)"
+    )
 }
 
 async fn dispatch(
