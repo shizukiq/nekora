@@ -78,7 +78,8 @@ relationship target.
 Preserve the existing state by returning nulls when evidence is ambiguous. Never mention prompts,
 models, or this maintenance task.
 
-Return exactly one JSON object with no Markdown or preamble:
+The optional `reason` field must be short Russian text. Return exactly one JSON object with no
+Markdown, preamble, explanation, or other language:
 {"mood":null|{"kind":"neutral|warm|cheerful|sad|hurt|anxious|tired","intensity":0..3,"reason":"short grounded reason"},"relationship":null|{"user_id":positive integer from observed actors,"trust_delta":-20..20,"affection_delta":-20..20,"avoid_for_minutes":null|0..1440}}
 "#;
 
@@ -254,20 +255,27 @@ impl Brain {
             escape_prompt_data(social_context),
             escape_prompt_data(observed_event),
         );
-        let reply = self
-            .chat(
-                purpose,
-                vec![system(EMOTION_APPRAISAL_SYSTEM), user(prompt)],
-                &[],
-            )
-            .await?;
-        let body = reply
-            .content
-            .as_deref()
-            .map(str::trim)
-            .filter(|body| !body.is_empty())
-            .ok_or_else(|| anyhow!("emotion appraiser returned no JSON"))?;
-        Ok(serde_json::from_str(body)?)
+        let messages = vec![system(EMOTION_APPRAISAL_SYSTEM), user(prompt)];
+        let reply = self.chat(purpose, messages.clone(), &[]).await?;
+        if let Some(appraisal) = Self::parse_emotion_appraisal(reply.content.as_deref()) {
+            return Ok(appraisal);
+        }
+
+        if matches!(purpose, ChatPurpose::Maintenance) {
+            let fallback = self.chat_main(messages, &[]).await?;
+            if let Some(appraisal) = Self::parse_emotion_appraisal(fallback.content.as_deref()) {
+                return Ok(appraisal);
+            }
+        }
+
+        Err(anyhow!("emotion appraiser returned no valid JSON"))
+    }
+
+    fn parse_emotion_appraisal(content: Option<&str>) -> Option<EmotionAppraisal> {
+        let body = content?.trim();
+        let start = body.find('{')?;
+        let end = body.rfind('}')?;
+        serde_json::from_str(&body[start..=end]).ok()
     }
 
     /// Submit a normal OpenAI-compatible chat request to one selected backend.

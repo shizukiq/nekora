@@ -220,6 +220,7 @@ impl ProviderChain {
 
         let mut failures = Vec::new();
         let mut attempted = false;
+        let mut had_search_response = false;
         for slot in &self.providers {
             if slot.is_cooling_down() {
                 continue;
@@ -227,6 +228,7 @@ impl ProviderChain {
             attempted = true;
             match slot.provider.search(provider_query, limit).await {
                 Ok(results) if results.results.is_empty() => {
+                    had_search_response = true;
                     slot.clear_cooldown();
                     failures.push(format!("{}: no results", slot.provider.name()));
                 }
@@ -240,11 +242,8 @@ impl ProviderChain {
                         })
                     }) =>
                 {
+                    had_search_response = true;
                     slot.clear_cooldown();
-                    failures.push(format!(
-                        "{}: requested URL was not in the results",
-                        slot.provider.name()
-                    ));
                 }
                 Ok(results) => {
                     slot.clear_cooldown();
@@ -272,6 +271,13 @@ impl ProviderChain {
 
         if !attempted {
             bail!("all configured web search providers are cooling down");
+        }
+        if requested_url.is_some() && had_search_response {
+            // A provider answering without the requested page means "not found", not a provider
+            // outage. Do not surface unrelated citations as an exact-URL match.
+            return Ok(SearchResults {
+                results: Vec::new(),
+            });
         }
         if failures.is_empty() {
             bail!("all configured web search providers failed");
