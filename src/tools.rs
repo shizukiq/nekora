@@ -112,6 +112,82 @@ pub fn schema() -> Vec<ChatCompletionTools> {
                 "required": ["chat_id", "message_id"]}),
         ),
         (
+            "search_messages",
+            "Search Telegram message text. If chat_id is omitted, search across chats that are in Nekora's contact scope and return the chat_id with every match.",
+            json!({"type": "object", "properties": {
+                "chat_id": {"type": "integer", "description": "optional chat to search; omit for a scoped global search"},
+                "query": {"type": "string", "description": "text to search for"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "maximum number of matches; defaults to 20"}},
+                "required": ["query"]}),
+        ),
+        (
+            "search_chats",
+            "Find recent Telegram dialogs by title or public username without leaving Nekora's contact scope.",
+            json!({"type": "object", "properties": {
+                "query": {"type": "string", "description": "part of a chat title or username"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 20, "description": "maximum number of chats; defaults to 10"}},
+                "required": ["query"]}),
+        ),
+        (
+            "view_messages_around",
+            "Read a bounded slice of Telegram history around one known message_id. Use this to recover context instead of guessing from an old message.",
+            json!({"type": "object", "properties": {
+                "chat_id": {"type": "integer"},
+                "message_id": {"type": "integer"},
+                "before": {"type": "integer", "minimum": 0, "maximum": 50, "description": "messages before the target; defaults to 5"},
+                "after": {"type": "integer", "minimum": 0, "maximum": 50, "description": "messages after the target; defaults to 5"}},
+                "required": ["chat_id", "message_id"]}),
+        ),
+        (
+            "edit_message",
+            "Edit one of Nekora's own Telegram messages after checking the exact message_id. Do not use this to rewrite someone else's message.",
+            json!({"type": "object", "properties": {
+                "chat_id": {"type": "integer"},
+                "message_id": {"type": "integer"},
+                "text": {"type": "string", "description": "the complete replacement text"}},
+                "required": ["chat_id", "message_id", "text"]}),
+        ),
+        (
+            "remove_message",
+            "Delete one exact Telegram message after checking its chat_id and message_id. This is destructive; use it only when deletion is clearly intended.",
+            json!({"type": "object", "properties": {
+                "chat_id": {"type": "integer"},
+                "message_id": {"type": "integer"}},
+                "required": ["chat_id", "message_id"]}),
+        ),
+        (
+            "forward_message",
+            "Forward one exact Telegram message between chats in Nekora's contact scope. Keep source_chat_id, destination_chat_id, and message_id from Telegram context or search results.",
+            json!({"type": "object", "properties": {
+                "source_chat_id": {"type": "integer"},
+                "destination_chat_id": {"type": "integer"},
+                "message_id": {"type": "integer"}},
+                "required": ["source_chat_id", "destination_chat_id", "message_id"]}),
+        ),
+        (
+            "join_chat",
+            "Join a public Telegram group or channel by its username. This changes account membership; never join an unrequested or suspicious chat.",
+            json!({"type": "object", "properties": {
+                "username": {"type": "string", "description": "public @username without an invite link"}},
+                "required": ["username"]}),
+        ),
+        (
+            "leave_chat",
+            "Leave a known Telegram group or channel by chat_id or its username from the current dialogs. This changes account membership and must be intentional.",
+            json!({"type": "object", "properties": {
+                "chat_id": {"type": "integer"},
+                "username": {"type": "string"}}}),
+        ),
+        (
+            "ban_user",
+            "Ban or temporarily restrict one Telegram user in a group where Nekora has permission. Use only for a clear moderation case, never for an argument or an unverified accusation.",
+            json!({"type": "object", "properties": {
+                "chat_id": {"type": "integer", "description": "group or supergroup id"},
+                "user_id": {"type": "integer", "description": "positive Telegram user id"},
+                "duration_minutes": {"type": "integer", "minimum": 0, "maximum": 43200, "description": "0 for permanent, otherwise temporary duration"}},
+                "required": ["chat_id", "user_id"]}),
+        ),
+        (
             "get_current_time",
             "Ask Telegram for the current server time and return it in UTC+04:00.",
             json!({"type": "object", "properties": {}}),
@@ -420,6 +496,174 @@ async fn dispatch(
                     .inspect_message_media(chat_id, message_id)
                     .await?,
             )?)
+        }
+        "search_messages" => {
+            let chat_id = args
+                .get("chat_id")
+                .and_then(Value::as_i64)
+                .or_else(|| generation.map(|generation| generation.chat_id()));
+            let query = str_arg(&args, "query")?;
+            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize;
+            Ok(serde_json::to_string(
+                &app.userbot.search_messages(chat_id, query, limit).await?,
+            )?)
+        }
+        "search_chats" => {
+            let query = str_arg(&args, "query")?;
+            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
+            Ok(serde_json::to_string(
+                &app.userbot.search_chats(query, limit).await?,
+            )?)
+        }
+        "view_messages_around" => {
+            let chat_id = args
+                .get("chat_id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| anyhow!("missing chat_id"))?;
+            let message_id = args
+                .get("message_id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| anyhow!("missing message_id"))?;
+            let before = args.get("before").and_then(Value::as_u64).unwrap_or(5) as usize;
+            let after = args.get("after").and_then(Value::as_u64).unwrap_or(5) as usize;
+            Ok(serde_json::to_string(
+                &app.userbot
+                    .view_messages_around(chat_id, message_id, before, after)
+                    .await?,
+            )?)
+        }
+        "edit_message" => {
+            let chat_id = args
+                .get("chat_id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| anyhow!("missing chat_id"))?;
+            if generation.is_some_and(|generation| generation.chat_id() != chat_id) {
+                return Err(anyhow!(
+                    "a conversational turn can only edit its current chat"
+                ));
+            }
+            let message_id = args
+                .get("message_id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| anyhow!("missing message_id"))?;
+            let text = str_arg(&args, "text")?;
+            app.userbot
+                .edit_message(app, chat_id, message_id, text, generation)
+                .await?;
+            Ok("edited".to_string())
+        }
+        "remove_message" => {
+            let chat_id = args
+                .get("chat_id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| anyhow!("missing chat_id"))?;
+            if generation.is_some_and(|generation| generation.chat_id() != chat_id) {
+                return Err(anyhow!(
+                    "a conversational turn can only remove a message in its current chat"
+                ));
+            }
+            let message_id = args
+                .get("message_id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| anyhow!("missing message_id"))?;
+            if app
+                .userbot
+                .remove_message(app, chat_id, message_id, generation)
+                .await?
+            {
+                Ok("removed".to_string())
+            } else {
+                Ok("turn became outdated before the message was removed".to_string())
+            }
+        }
+        "forward_message" => {
+            let source_chat_id = args
+                .get("source_chat_id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| anyhow!("missing source_chat_id"))?;
+            let destination_chat_id = args
+                .get("destination_chat_id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| anyhow!("missing destination_chat_id"))?;
+            if generation.is_some_and(|generation| generation.chat_id() != destination_chat_id) {
+                return Err(anyhow!(
+                    "a conversational turn can only forward into its current chat"
+                ));
+            }
+            let message_id = args
+                .get("message_id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| anyhow!("missing message_id"))?;
+            let count = app
+                .userbot
+                .forward_message(
+                    app,
+                    source_chat_id,
+                    destination_chat_id,
+                    message_id,
+                    generation,
+                )
+                .await?;
+            Ok(if count == 0 {
+                "turn became outdated before the message was forwarded".to_string()
+            } else {
+                format!("forwarded {count} message")
+            })
+        }
+        "join_chat" => {
+            let username = str_arg(&args, "username")?;
+            Ok(
+                match app.userbot.join_chat(app, username, generation).await? {
+                    Some(chat) => serde_json::to_string(&chat)?,
+                    None => "turn became outdated before the chat was joined".to_string(),
+                },
+            )
+        }
+        "leave_chat" => {
+            let chat_id = args.get("chat_id").and_then(Value::as_i64);
+            let username = args.get("username").and_then(Value::as_str);
+            if chat_id.is_none() && username.is_none() {
+                return Err(anyhow!("missing chat_id or username"));
+            }
+            Ok(
+                if app
+                    .userbot
+                    .leave_chat(app, chat_id, username, generation)
+                    .await?
+                {
+                    "left chat".to_string()
+                } else {
+                    "turn became outdated before the chat was left".to_string()
+                },
+            )
+        }
+        "ban_user" => {
+            let chat_id = args
+                .get("chat_id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| anyhow!("missing chat_id"))?;
+            if generation.is_some_and(|generation| generation.chat_id() != chat_id) {
+                return Err(anyhow!(
+                    "a conversational turn can only moderate its current chat"
+                ));
+            }
+            let user_id = args
+                .get("user_id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| anyhow!("missing user_id"))?;
+            let duration_minutes = args
+                .get("duration_minutes")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            if app
+                .userbot
+                .ban_user(app, chat_id, user_id, duration_minutes, generation)
+                .await?
+            {
+                Ok("user banned".to_string())
+            } else {
+                Ok("turn became outdated before the user was banned".to_string())
+            }
         }
         "get_current_time" => Ok(serde_json::to_string(&app.userbot.current_time().await?)?),
         "generate_image" => {

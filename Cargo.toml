@@ -8,7 +8,7 @@ license = "GPL-3"
 # One binary, one Nekora. The old Python "hand" and C++ "core" are now one Rust
 # process: the core modules (heartbeat, conversation, diary, persistence) stay
 # local and never touch the network; the I/O modules (brain, tools, userbot,
-# sleep) do every request through a library, never hand-rolled HTTP.
+# sleep) own their external boundaries, including the optional OpenAI-compatible proxy.
 [[bin]]
 name = "nekora"
 path = "src/main.rs"
@@ -16,7 +16,7 @@ path = "src/main.rs"
 [dependencies]
 # The async runtime that replaces asyncio: the heartbeat loop, timers, the
 # Telegram update stream, and owning the local Ollama child process all live on it.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "sync", "signal", "io-std", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "sync", "signal", "io-std", "io-util", "net"] }
 
 # The userbot: a real Telegram account over MTProto (never the Bot API). grammers
 # is the Rust equivalent of Telethon -- login, updates, sending, actions, raw TL.

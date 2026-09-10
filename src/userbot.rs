@@ -31,6 +31,9 @@ const BUBBLE_DELAY_PER_WORD_MS: u64 = 220;
 
 const RECENT_CHATS: usize = 20;
 const LAST_LINE_CHARS: usize = 120;
+const MAX_MESSAGE_SEARCH_RESULTS: usize = 50;
+const MAX_CHAT_SEARCH_RESULTS: usize = 20;
+const MAX_MESSAGES_AROUND: usize = 50;
 const MAX_TEXT_DOCUMENT_BYTES: usize = 96 * 1024;
 const MAX_MEDIA_BYTES: usize = 32 * 1024 * 1024;
 const MAX_CONTEXT_ITEMS: usize = 16;
@@ -74,6 +77,22 @@ pub struct ChatSummary {
     pub name: String,
     pub username: Option<String>,
     pub last: String,
+}
+
+#[derive(Serialize)]
+pub struct TelegramMessageSummary {
+    pub chat_id: i64,
+    pub message_id: i64,
+    pub sender_id: i64,
+    pub sender: String,
+    pub username: Option<String>,
+    pub timestamp: String,
+    pub text: String,
+    pub outgoing: bool,
+    pub reply_to_message_id: Option<i64>,
+    pub edited: bool,
+    pub forwarded: bool,
+    pub media: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1059,6 +1078,363 @@ impl Userbot {
         })
     }
 
+    pub async fn search_messages(
+        &self,
+        chat_id: Option<i64>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<TelegramMessageSummary>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Err(anyhow!("query must not be empty"));
+        }
+        if !(1..=MAX_MESSAGE_SEARCH_RESULTS).contains(&limit) {
+            return Err(anyhow!(
+                "limit must be between 1 and {MAX_MESSAGE_SEARCH_RESULTS}"
+            ));
+        }
+
+        let mut results = Vec::with_capacity(limit);
+        if let Some(chat_id) = chat_id {
+            let peer = self.resolve_contact_scoped_peer(chat_id).await?;
+            let mut messages = self.client.search_messages(peer).query(query).limit(limit);
+            while let Some(message) = messages.next().await? {
+                self.cache_message_peer(&message).await;
+                results.push(summarize_message(&message));
+            }
+            return Ok(results);
+        }
+
+        let mut messages = self
+            .client
+            .search_all_messages()
+            .query(query)
+            .limit(limit.saturating_mul(3).min(MAX_MESSAGE_SEARCH_RESULTS));
+        while let Some(message) = messages.next().await? {
+            let message_chat_id = self.cache_message_peer(&message).await;
+            if self.chat_is_in_contact_scope(message_chat_id).await {
+                results.push(summarize_message(&message));
+                if results.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    pub async fn view_messages_around(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        before: usize,
+        after: usize,
+    ) -> Result<Vec<TelegramMessageSummary>> {
+        if before > MAX_MESSAGES_AROUND || after > MAX_MESSAGES_AROUND {
+            return Err(anyhow!(
+                "before and after must be at most {MAX_MESSAGES_AROUND}"
+            ));
+        }
+        let message_id = i32::try_from(message_id)
+            .map_err(|_| anyhow!("message_id is outside Telegram's range"))?;
+        if message_id <= 0 {
+            return Err(anyhow!("message_id must be positive"));
+        }
+        let peer = self.resolve_contact_scoped_peer(chat_id).await?;
+        let center = self
+            .client
+            .get_messages_by_id(peer, &[message_id])
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| anyhow!("message not found"))?;
+        self.cache_message_peer(&center).await;
+
+        let mut around = Vec::with_capacity(before + after + 1);
+        if before > 0 {
+            let mut messages = self
+                .client
+                .iter_messages(peer)
+                .offset_id(message_id)
+                .limit(before);
+            while let Some(message) = messages.next().await? {
+                if message.id() < message_id {
+                    self.cache_message_peer(&message).await;
+                    around.push(message);
+                }
+            }
+        }
+        around.push(center);
+        if after > 0 {
+            let mut messages = self
+                .client
+                .iter_messages(peer)
+                .reverse(true)
+                .offset_id(message_id)
+                .limit(after);
+            while let Some(message) = messages.next().await? {
+                if message.id() > message_id {
+                    self.cache_message_peer(&message).await;
+                    around.push(message);
+                }
+            }
+        }
+        around.sort_by_key(TelegramMessage::id);
+        Ok(around.iter().map(summarize_message).collect())
+    }
+
+    pub async fn edit_message(
+        &self,
+        app: &App,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+        generation: Option<ReplyGeneration>,
+    ) -> Result<()> {
+        if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
+            return Ok(());
+        }
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(anyhow!("text must not be empty"));
+        }
+        if text.contains("DSML") && text.contains("invoke name=\"") {
+            return Err(anyhow!("refusing to edit internal tool-call markup"));
+        }
+        if text.len() > MAX_BUBBLE_BYTES {
+            return Err(anyhow!(
+                "edited text is too long; Telegram allows at most {MAX_BUBBLE_BYTES} bytes"
+            ));
+        }
+        let message_id = i32::try_from(message_id)
+            .map_err(|_| anyhow!("message_id is outside Telegram's range"))?;
+        let peer = self.resolve_contact_scoped_peer(chat_id).await?;
+        let target = self
+            .client
+            .get_messages_by_id(peer, &[message_id])
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| anyhow!("message not found"))?;
+        if !target.outgoing() {
+            return Err(anyhow!("only Nekora's own messages can be edited"));
+        }
+        if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
+            return Ok(());
+        }
+        self.client
+            .edit_message(peer, message_id, InputMessage::new().text(text))
+            .await?;
+        app.record_outgoing(
+            chat_id,
+            &format!("[edited message_id={message_id}] {text}"),
+            None,
+        );
+        Ok(())
+    }
+
+    pub async fn remove_message(
+        &self,
+        app: &App,
+        chat_id: i64,
+        message_id: i64,
+        generation: Option<ReplyGeneration>,
+    ) -> Result<bool> {
+        if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
+            return Ok(false);
+        }
+        let message_id = i32::try_from(message_id)
+            .map_err(|_| anyhow!("message_id is outside Telegram's range"))?;
+        let peer = self.resolve_contact_scoped_peer(chat_id).await?;
+        self.client
+            .get_messages_by_id(peer, &[message_id])
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| anyhow!("message not found"))?;
+        if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
+            return Ok(false);
+        }
+        let deleted = self.client.delete_messages(peer, &[message_id]).await?;
+        if deleted == 0 {
+            return Ok(false);
+        }
+        app.record_outgoing(chat_id, &format!("[removed message_id={message_id}]"), None);
+        Ok(true)
+    }
+
+    pub async fn forward_message(
+        &self,
+        app: &App,
+        source_chat_id: i64,
+        destination_chat_id: i64,
+        message_id: i64,
+        generation: Option<ReplyGeneration>,
+    ) -> Result<usize> {
+        if generation.is_some_and(|generation| {
+            generation.chat_id() != destination_chat_id || !app.generation_is_current(generation)
+        }) {
+            return Ok(0);
+        }
+        let message_id = i32::try_from(message_id)
+            .map_err(|_| anyhow!("message_id is outside Telegram's range"))?;
+        let source = self.resolve_contact_scoped_peer(source_chat_id).await?;
+        let destination = self
+            .resolve_contact_scoped_peer(destination_chat_id)
+            .await?;
+        self.client
+            .get_messages_by_id(source, &[message_id])
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| anyhow!("message not found"))?;
+        if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
+            return Ok(0);
+        }
+        let forwarded = self
+            .client
+            .forward_messages(destination, &[message_id], source)
+            .await?;
+        let count = forwarded.into_iter().flatten().count();
+        if count > 0 {
+            app.record_outgoing(
+                destination_chat_id,
+                &format!("[forwarded message_id={message_id} from_chat_id={source_chat_id}]"),
+                None,
+            );
+        }
+        Ok(count)
+    }
+
+    pub async fn join_chat(
+        &self,
+        app: &App,
+        username: &str,
+        generation: Option<ReplyGeneration>,
+    ) -> Result<Option<ChatSummary>> {
+        if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
+            return Ok(None);
+        }
+        let username = username.trim().trim_start_matches('@');
+        if username.is_empty() {
+            return Err(anyhow!("username must not be empty"));
+        }
+        let peer = self
+            .client
+            .resolve_username(username)
+            .await?
+            .ok_or_else(|| anyhow!("username not found: @{username}"))?;
+        if peer.id().kind() == PeerKind::User {
+            return Err(anyhow!("username does not point to a group or channel"));
+        }
+        let peer_ref = peer
+            .to_ref()
+            .await
+            .map_err(|error| anyhow!("could not resolve chat reference: {error}"))?
+            .ok_or_else(|| anyhow!("chat has no usable access hash"))?;
+        if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
+            return Ok(None);
+        }
+        let joined = self.client.join_chat(peer_ref).await?;
+        let peer = joined.unwrap_or(peer);
+        let chat_id = peer.id().bot_api_dialog_id_unchecked();
+        if let Some(peer_ref) = peer
+            .to_ref()
+            .await
+            .map_err(|error| anyhow!("could not cache joined chat: {error}"))?
+        {
+            self.peers.lock().unwrap().insert(chat_id, peer_ref);
+        }
+        Ok(Some(ChatSummary {
+            id: chat_id,
+            name: display_name(&peer),
+            username: peer.username().map(str::to_string),
+            last: String::new(),
+        }))
+    }
+
+    pub async fn leave_chat(
+        &self,
+        app: &App,
+        chat_id: Option<i64>,
+        username: Option<&str>,
+        generation: Option<ReplyGeneration>,
+    ) -> Result<bool> {
+        if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
+            return Ok(false);
+        }
+        let (chat_id, peer_ref) = if let Some(username) = username {
+            let username = username.trim().trim_start_matches('@');
+            if username.is_empty() {
+                return Err(anyhow!("username must not be empty"));
+            }
+            self.resolve_dialog_username(username).await?
+        } else {
+            let chat_id = chat_id.ok_or_else(|| anyhow!("missing chat_id or username"))?;
+            let peer_ref = self.resolve_contact_scoped_peer(chat_id).await?;
+            (chat_id, peer_ref)
+        };
+        if peer_ref.id.kind() == PeerKind::User {
+            return Err(anyhow!("a private chat cannot be left with leave_chat"));
+        }
+        if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
+            return Ok(false);
+        }
+        self.client.delete_dialog(peer_ref).await?;
+        self.peers.lock().unwrap().remove(&chat_id);
+        Ok(true)
+    }
+
+    pub async fn ban_user(
+        &self,
+        app: &App,
+        chat_id: i64,
+        user_id: i64,
+        duration_minutes: usize,
+        generation: Option<ReplyGeneration>,
+    ) -> Result<bool> {
+        if chat_id >= 0 {
+            return Err(anyhow!("ban_user only works in group chats"));
+        }
+        if user_id <= 0 || user_id == self.account_user_id {
+            return Err(anyhow!(
+                "user_id must identify another positive Telegram user"
+            ));
+        }
+        if duration_minutes > 30 * 24 * 60 {
+            return Err(anyhow!("duration_minutes must be at most 43200"));
+        }
+        if generation.is_some_and(|generation| {
+            generation.chat_id() != chat_id || !app.generation_is_current(generation)
+        }) {
+            return Ok(false);
+        }
+        let chat = self.resolve_contact_scoped_peer(chat_id).await?;
+        if duration_minutes > 0 && chat.id.kind() == PeerKind::Chat {
+            return Err(anyhow!(
+                "temporary bans are unavailable for legacy Telegram groups"
+            ));
+        }
+        let user = self.resolve_user_peer(user_id).await?;
+        let mut ban = self
+            .client
+            .set_banned_rights(chat, user)
+            .view_messages(false);
+        if duration_minutes > 0 {
+            ban = ban.duration(Duration::from_secs(duration_minutes as u64 * 60));
+        }
+        ban.await?;
+        app.record_outgoing(
+            chat_id,
+            &format!("[banned user_id={user_id} duration_minutes={duration_minutes}]"),
+            None,
+        );
+        Ok(true)
+    }
+
     async fn describe_photo(&self, message: &Message) -> String {
         let Some(photo) = message.photo() else {
             return "[photo] (you glance at it but can't quite make it out right now)".to_string();
@@ -1584,11 +1960,39 @@ impl Userbot {
     }
 
     pub async fn recent_chats(&self) -> Result<Vec<ChatSummary>> {
+        self.chats(None, RECENT_CHATS).await
+    }
+
+    pub async fn search_chats(&self, query: &str, limit: usize) -> Result<Vec<ChatSummary>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Err(anyhow!("query must not be empty"));
+        }
+        if !(1..=MAX_CHAT_SEARCH_RESULTS).contains(&limit) {
+            return Err(anyhow!(
+                "limit must be between 1 and {MAX_CHAT_SEARCH_RESULTS}"
+            ));
+        }
+        self.chats(Some(query), limit).await
+    }
+
+    async fn chats(&self, query: Option<&str>, limit: usize) -> Result<Vec<ChatSummary>> {
         let mut dialogs = self.client.iter_dialogs();
         let mut out = Vec::new();
         while let Some(dialog) = dialogs.next().await? {
             let id = dialog.peer.id().bot_api_dialog_id_unchecked();
             if !peer_is_in_contact_scope(&dialog.peer) {
+                continue;
+            }
+            let name = display_name(&dialog.peer);
+            let username = dialog.peer.username().map(str::to_string);
+            if query.is_some_and(|query| {
+                let query = query.to_lowercase();
+                !name.to_lowercase().contains(&query)
+                    && !username
+                        .as_deref()
+                        .is_some_and(|username| username.to_lowercase().contains(&query))
+            }) {
                 continue;
             }
             self.peers.lock().unwrap().insert(id, dialog.peer_ref());
@@ -1602,15 +2006,54 @@ impl Userbot {
                 .collect();
             out.push(ChatSummary {
                 id,
-                name: display_name(&dialog.peer),
-                username: dialog.peer.username().map(str::to_string),
+                name,
+                username,
                 last,
             });
-            if out.len() == RECENT_CHATS {
+            if out.len() == limit {
                 break;
             }
         }
         Ok(out)
+    }
+
+    async fn cache_message_peer(&self, message: &TelegramMessage) -> i64 {
+        let chat_id = message.peer_id().bot_api_dialog_id_unchecked();
+        if let Ok(Some(peer_ref)) = message.peer_ref().await {
+            self.peers.lock().unwrap().insert(chat_id, peer_ref);
+        }
+        chat_id
+    }
+
+    async fn resolve_user_peer(&self, user_id: i64) -> Result<PeerRef> {
+        let peer_ref = self.resolve(user_id).await?;
+        if !matches!(self.client.resolve_peer(peer_ref).await?, Peer::User(_)) {
+            return Err(anyhow!("user_id does not identify a Telegram user"));
+        }
+        Ok(peer_ref)
+    }
+
+    async fn resolve_dialog_username(&self, username: &str) -> Result<(i64, PeerRef)> {
+        let username = username.trim_start_matches('@');
+        let mut dialogs = self.client.iter_dialogs();
+        while let Some(dialog) = dialogs.next().await? {
+            if !peer_is_in_contact_scope(&dialog.peer) {
+                continue;
+            }
+            if dialog
+                .peer
+                .username()
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(username))
+            {
+                return Ok((
+                    dialog.peer.id().bot_api_dialog_id_unchecked(),
+                    dialog.peer_ref(),
+                ));
+            }
+        }
+        Err(anyhow!(
+            "chat @{username} is not in the current Telegram dialogs; use its chat_id"
+        ))
     }
 
     async fn resolve_contact_scoped_peer(&self, chat_id: i64) -> Result<PeerRef> {
@@ -2044,6 +2487,52 @@ fn display_name(peer: &Peer) -> String {
         "someone".to_string()
     } else {
         name
+    }
+}
+
+fn summarize_message(message: &TelegramMessage) -> TelegramMessageSummary {
+    let chat_id = message.peer_id().bot_api_dialog_id_unchecked();
+    let sender_id = message
+        .sender_id()
+        .and_then(|id| id.bot_api_dialog_id())
+        .unwrap_or(0);
+    let sender = message
+        .sender()
+        .map(display_name)
+        .unwrap_or_else(|| "someone".to_string());
+    let username = message
+        .sender()
+        .and_then(|peer| peer.username())
+        .map(str::to_string);
+    let media = message.media().map(|media| match media {
+        Media::Photo(_) => "photo",
+        Media::Sticker(_) => "sticker",
+        Media::Document(_) => "document",
+        Media::Contact(_) => "contact",
+        Media::Poll(_) => "poll",
+        Media::Geo(_) => "location",
+        Media::Dice(_) => "dice",
+        Media::Venue(_) => "venue",
+        Media::GeoLive(_) => "live_location",
+        Media::WebPage(_) => "web_page",
+        _ => "media",
+    });
+    TelegramMessageSummary {
+        chat_id,
+        message_id: i64::from(message.id()),
+        sender_id,
+        sender,
+        username,
+        timestamp: message
+            .date()
+            .with_timezone(&config::nekora_utc_offset())
+            .to_rfc3339(),
+        text: compact_context_text(message.text()),
+        outgoing: message.outgoing(),
+        reply_to_message_id: message.reply_to_message_id().map(i64::from),
+        edited: message.edit_date().is_some(),
+        forwarded: message.forward_header().is_some(),
+        media: media.map(str::to_string),
     }
 }
 

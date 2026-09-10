@@ -6,6 +6,7 @@ mod heartbeat;
 mod imagegen;
 mod ollama;
 mod persistence;
+mod proxy;
 mod sleep;
 mod social;
 mod tools;
@@ -1077,15 +1078,20 @@ async fn handle_update(app: &Arc<App>, update: Update) {
 
 async fn run() -> Result<()> {
     let brain = Arc::new(Brain::from_env()?);
-    let image_generator = ImageGenerator::from_env()?;
-    let web_search = ProviderChain::from_env()?;
-    // Kept alive for the whole run: dropping this stops a managed Ollama.
-    let _ollama = ollama::start_if_managed(&brain.local_vision_model).await?;
-
     let mut diary = Diary::new(config::vault_dir());
     if !diary.open() {
         bail!("could not open vault at {:?}", config::vault_dir());
     }
+    if config::env_or("NEKORA_PROXY_ONLY", "") == "1" {
+        // Keep a managed Ollama alive for diary embeddings while the standalone
+        // endpoint is serving, when the user explicitly enabled that mode.
+        let _ollama = ollama::start_if_managed(&brain.local_vision_model).await?;
+        return proxy::serve_standalone(brain, diary).await;
+    }
+    let image_generator = ImageGenerator::from_env()?;
+    let web_search = ProviderChain::from_env()?;
+    // Kept alive for the whole run: dropping this stops a managed Ollama.
+    let _ollama = ollama::start_if_managed(&brain.local_vision_model).await?;
 
     let api_id: i32 = config::env_or("TELEGRAM_API_ID", "0").parse().unwrap_or(0);
     let session_path = format!("{}.session", config::env_or("NEKORA_SESSION", "nekora"));
@@ -1126,14 +1132,15 @@ async fn run() -> Result<()> {
     ));
 
     println!("nekora is up; waiting on her own clock");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => eprintln!("bye"),
+    let run_result = tokio::select! {
+        _ = tokio::signal::ctrl_c() => { eprintln!("bye"); Ok(()) },
+        proxy_result = proxy::serve(Arc::clone(&app)) => Ok(proxy_result?),
         _ = async {
             tokio::join!(ingest(&app, &mut update_stream), heartbeat_loop(&app));
-        } => {}
-    }
+        } => Ok(()),
+    };
     pool_task.abort();
-    Ok(())
+    run_result
 }
 
 #[tokio::main]

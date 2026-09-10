@@ -120,9 +120,18 @@ The brain can use only this bounded tool set:
 | `archive_memory`        | remove a mutable memory and delete its note                                            |
 | `inspect_user`          | inspect a Telegram profile and avatar                                                  |
 | `inspect_message_media` | look closely at recent media                                                           |
+| `search_chats`          | find dialogs by title or public username                                               |
+| `search_messages`       | search one chat or the scoped global message history                                   |
+| `view_messages_around`  | read a bounded slice of history around a known message                                |
 | `get_current_time`      | ask Telegram for its server time in UTC+04:00                                          |
 | `generate_image`        | generate, quality-check, and send one image when explicitly configured                 |
 | `send_message`          | send a visible Telegram reply or a proactive message; optionally reply to a message ID |
+| `edit_message`          | edit one of Nekora's own messages                                                      |
+| `remove_message`        | delete one exact message after checking its chat and message IDs                      |
+| `forward_message`       | forward one exact message between scoped chats                                         |
+| `join_chat`             | join a public group or channel by username                                             |
+| `leave_chat`            | leave a group or channel by chat ID or username                                        |
+| `ban_user`              | ban or temporarily restrict a user when Telegram permissions allow it                 |
 | `react_to_message`      | add or remove Nekora's reaction on a message                                           |
 | `list_chats`            | inspect recent chats before choosing someone to contact                                |
 | `stay_quiet`            | choose silence deliberately                                                            |
@@ -208,6 +217,30 @@ cargo run --release
 The process prints `nekora is up; waiting on her own clock` after login and once the vault is open. Leave it running:
 the process itself is the 24/7 presence.
 
+### OpenAI-compatible proxy
+
+The same process can expose a separate local HTTP endpoint for OpenAI-compatible clients. It is disabled unless
+`NEKORA_PROXY_ADDR` is set:
+
+```dotenv
+NEKORA_PROXY_ADDR=127.0.0.1:10434
+NEKORA_PROXY_TOKEN=replace-with-a-long-random-token
+```
+
+It provides `GET /health`, `GET /v1/models`, and `POST /v1/chat/completions`. In the normal process it shares Nekora's
+character, diary recall, and bounded Telegram tools; `stream: true` returns a compatible SSE response after the completion
+is ready. Set `NEKORA_PROXY_ONLY=1` to run only the proxy without Telegram login; that mode keeps persona and diary context
+but has no Telegram tools. Keep the listener on loopback or set `NEKORA_PROXY_TOKEN` before binding it to another interface.
+
+Example request:
+
+```sh
+curl http://127.0.0.1:10434/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer replace-with-a-long-random-token' \
+  -d '{"model":"nekora","messages":[{"role":"user","content":"Привет"}]}'
+```
+
 ### Docker
 
 The included image builds the Rust binary, installs Ollama, starts it, pulls missing local models, and keeps runtime
@@ -276,6 +309,9 @@ variables win over it.
 | `NEKORA_REQUEST_TIMEOUT`       | `120`                               | seconds allowed for a model request                                                                       |
 | `NEKORA_NAME`                  | `Nekora`                            | name used in the character preamble                                                                       |
 | `PAPIK_NAME`                   | `your person`                       | the person's name used in the character preamble                                                          |
+| `NEKORA_PROXY_ADDR`            | unset                               | optional OpenAI-compatible listener, for example `127.0.0.1:10434`                                       |
+| `NEKORA_PROXY_TOKEN`           | empty                               | optional bearer token; required when the proxy is exposed beyond loopback                                |
+| `NEKORA_PROXY_ONLY`            | unset                               | set to `1` to skip Telegram login and run the standalone proxy only                                       |
 | `NEKORA_CREATOR_USER_ID`       | empty                               | positive Telegram user ID of the privileged developer chat                                                |
 | `NEKORA_VAULT`                 | `vault`                             | directory for Markdown memories and runtime state                                                         |
 | `NEKORA_SESSION`               | `nekora`                            | session path base; `.session` is appended                                                                 |
@@ -331,6 +367,7 @@ excludes `.env`, session files, the vault, and build output.
 | `src/sleep.rs`                | working-memory refresh and diary consolidation                    |
 | `src/social.rs`               | persistent mood, relationships, social incidents, and intentions |
 | `src/userbot.rs`              | MTProto login, updates, media, and paced sending                  |
+| `src/proxy.rs`                | bounded OpenAI-compatible HTTP endpoint and SSE response          |
 | `src/persistence.rs`          | atomic filesystem operations for the vault                        |
 | `src/config.rs`               | environment, identity, core prompt, and character profile loading |
 
