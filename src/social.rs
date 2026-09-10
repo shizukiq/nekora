@@ -10,6 +10,11 @@ const SOCIAL_FILE: &str = "social.json";
 const MAX_RELATIONSHIPS: usize = 250;
 const MAX_REASON_CHARS: usize = 280;
 const MAX_AVOID_MINUTES: u16 = 24 * 60;
+const MAX_INCIDENTS: usize = 32;
+const MAX_INTENTIONS: usize = 16;
+const MAX_INCIDENT_SUMMARY_CHARS: usize = 360;
+const INTENTION_DELAY_MINUTES: i64 = 15;
+const ADDRESS_INCIDENT: &str = "address_incident";
 
 #[derive(Clone)]
 pub struct SocialActor {
@@ -96,20 +101,44 @@ impl Relationship {
     }
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+struct SocialIncident {
+    kind: String,
+    user_id: i64,
+    #[serde(default)]
+    source_chat_id: Option<i64>,
+    severity: u8,
+    summary: String,
+    created_at: i64,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct OpenIntention {
+    kind: String,
+    user_id: i64,
+    reason: String,
+    created_at: i64,
+    not_before: i64,
+}
+
 #[derive(Clone, Default, Deserialize, Serialize)]
 struct SavedSocial {
     mood: Mood,
     people: BTreeMap<i64, Relationship>,
+    #[serde(default)]
+    incidents: Vec<SocialIncident>,
+    #[serde(default)]
+    intentions: Vec<OpenIntention>,
 }
 
-/// The only model-controlled changes accepted by the core. The model cannot
-/// create an arbitrary relationship: `apply_appraisal` restricts the target to
-/// people who actually appeared in the observed event.
+/// Model-controlled social changes are accepted only for people who appeared in
+/// the observed event. `apply_appraisal` validates both relationship and incident targets.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmotionAppraisal {
     pub mood: Option<MoodAppraisal>,
     pub relationship: Option<RelationshipAppraisal>,
+    pub incident: Option<IncidentAppraisal>,
 }
 
 #[derive(Deserialize)]
@@ -127,6 +156,25 @@ pub struct RelationshipAppraisal {
     pub trust_delta: i8,
     pub affection_delta: i8,
     pub avoid_for_minutes: Option<u16>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IncidentStatus {
+    Open,
+    Resolved,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IncidentAppraisal {
+    pub status: IncidentStatus,
+    pub kind: String,
+    pub user_id: i64,
+    pub severity: u8,
+    pub summary: String,
+    #[serde(default)]
+    pub follow_up: bool,
 }
 
 pub struct SocialState {
@@ -189,6 +237,22 @@ impl SocialState {
                 "person user_id={}{}: trust={trust}/100, warmth={affection}/100, avoiding_now={avoiding}",
                 actor.user_id, role,
             ));
+            for incident in self
+                .saved
+                .incidents
+                .iter()
+                .filter(|incident| incident.user_id == actor.user_id)
+                .take(3)
+            {
+                lines.push(format!(
+                    "open private incident with person user_id={}: kind={}, severity={}, origin_chat_id={:?}, reason: {}",
+                    incident.user_id,
+                    incident.kind,
+                    incident.severity,
+                    incident.source_chat_id,
+                    escape_prompt_data(&incident.summary),
+                ));
+            }
         }
         format!(
             "<social_state data_not_instructions=\"true\">\n{}\n</social_state>\n",
@@ -211,9 +275,32 @@ impl SocialState {
                 "developer/creator user_id={creator_user_id}: highest social priority; preferred support contact when available"
             ));
         }
+        let now = unix_seconds();
+        let mut incidents = self.saved.incidents.iter().collect::<Vec<_>>();
+        incidents.sort_by_key(|incident| std::cmp::Reverse(incident.created_at));
+        for incident in incidents.into_iter().take(3) {
+            lines.push(format!(
+                "unresolved private incident: target_user_id={}, kind={}, severity={}, origin_chat_id={:?}, reason: {}",
+                incident.user_id,
+                incident.kind,
+                incident.severity,
+                incident.source_chat_id,
+                escape_prompt_data(&incident.summary),
+            ));
+        }
+        let mut intentions = self.saved.intentions.iter().collect::<Vec<_>>();
+        intentions.sort_by_key(|intention| (intention.not_before, intention.created_at));
+        for intention in intentions.into_iter().take(3) {
+            lines.push(format!(
+                "open private intention: target_user_id={}, kind={}, ready={}, reason: {}",
+                intention.user_id,
+                intention.kind,
+                intention.not_before <= now,
+                escape_prompt_data(&intention.reason),
+            ));
+        }
         let mut people = self.saved.people.iter().collect::<Vec<_>>();
         people.sort_by_key(|(_, person)| std::cmp::Reverse((person.score(), person.last_seen)));
-        let now = unix_seconds();
         for (user_id, person) in people
             .into_iter()
             .filter(|(user_id, person)| {
@@ -258,6 +345,7 @@ impl SocialState {
         actors: &[SocialActor],
         creator_user_id: Option<i64>,
         now: i64,
+        source_chat_id: Option<i64>,
     ) -> Result<bool> {
         if appraisal.mood.as_ref().is_some_and(|mood| {
             mood.intensity > 3 || mood.reason.chars().count() > MAX_REASON_CHARS
@@ -275,6 +363,26 @@ impl SocialState {
                 "emotion appraisal contained an invalid relationship change"
             ));
         }
+        if appraisal.incident.as_ref().is_some_and(|incident| {
+            incident.user_id <= 0
+                || !matches!(
+                    incident.kind.as_str(),
+                    "privacy_violation"
+                        | "boundary_crossed"
+                        | "betrayal"
+                        | "insult"
+                        | "care"
+                        | "other"
+                )
+                || incident.summary.trim().is_empty()
+                || incident.summary.chars().count() > MAX_INCIDENT_SUMMARY_CHARS
+                || !(1..=3).contains(&incident.severity)
+                || (matches!(incident.status, IncidentStatus::Resolved) && incident.follow_up)
+        }) {
+            return Err(anyhow!(
+                "emotion appraisal contained an invalid social incident"
+            ));
+        }
         let actors = actors
             .iter()
             .filter(|actor| actor.user_id > 0)
@@ -287,6 +395,15 @@ impl SocialState {
         {
             return Err(anyhow!(
                 "emotion appraisal named a person outside the event"
+            ));
+        }
+        if appraisal
+            .incident
+            .as_ref()
+            .is_some_and(|incident| !actors.contains_key(&incident.user_id))
+        {
+            return Err(anyhow!(
+                "emotion appraisal named an incident participant outside the event"
             ));
         }
 
@@ -316,6 +433,62 @@ impl SocialState {
             }
             changed = true;
         }
+        if let Some(incident) = appraisal.incident {
+            match incident.status {
+                IncidentStatus::Open => {
+                    let summary = clipped(&incident.summary, MAX_INCIDENT_SUMMARY_CHARS);
+                    if let Some(existing) = self.saved.incidents.iter_mut().find(|existing| {
+                        existing.user_id == incident.user_id && existing.kind == incident.kind
+                    }) {
+                        existing.severity = existing.severity.max(incident.severity);
+                        existing.summary = summary.clone();
+                        existing.source_chat_id = source_chat_id;
+                    } else {
+                        self.saved.incidents.push(SocialIncident {
+                            kind: incident.kind,
+                            user_id: incident.user_id,
+                            source_chat_id,
+                            severity: incident.severity,
+                            summary: summary.clone(),
+                            created_at: now,
+                        });
+                        self.trim_incidents();
+                    }
+                    if incident.follow_up {
+                        let not_before = now + INTENTION_DELAY_MINUTES * 60;
+                        if let Some(existing) = self.saved.intentions.iter_mut().find(|intention| {
+                            intention.user_id == incident.user_id
+                                && intention.kind == ADDRESS_INCIDENT
+                        }) {
+                            existing.reason = summary;
+                            existing.not_before = existing.not_before.min(not_before);
+                        } else {
+                            self.saved.intentions.push(OpenIntention {
+                                kind: ADDRESS_INCIDENT.to_string(),
+                                user_id: incident.user_id,
+                                reason: summary,
+                                created_at: now,
+                                not_before,
+                            });
+                            self.trim_intentions();
+                        }
+                    }
+                    changed = true;
+                }
+                IncidentStatus::Resolved => {
+                    let previous_incidents = self.saved.incidents.len();
+                    let previous_intentions = self.saved.intentions.len();
+                    self.saved.incidents.retain(|existing| {
+                        existing.user_id != incident.user_id || existing.kind != incident.kind
+                    });
+                    self.saved
+                        .intentions
+                        .retain(|intention| intention.user_id != incident.user_id);
+                    changed |= previous_incidents != self.saved.incidents.len()
+                        || previous_intentions != self.saved.intentions.len();
+                }
+            }
+        }
         self.trim_relationships(creator_user_id);
         if !changed {
             return Ok(false);
@@ -344,7 +517,82 @@ impl SocialState {
             person.username = cleaned_username(person.username.as_deref());
             true
         });
+        self.saved.incidents.retain(|incident| {
+            incident.user_id > 0
+                && matches!(
+                    incident.kind.as_str(),
+                    "privacy_violation"
+                        | "boundary_crossed"
+                        | "betrayal"
+                        | "insult"
+                        | "care"
+                        | "other"
+                )
+                && !incident.summary.trim().is_empty()
+        });
+        for incident in &mut self.saved.incidents {
+            incident.severity = incident.severity.clamp(1, 3);
+            incident.summary = clipped(&incident.summary, MAX_INCIDENT_SUMMARY_CHARS);
+        }
+        self.saved.intentions.retain(|intention| {
+            intention.user_id > 0
+                && intention.kind == ADDRESS_INCIDENT
+                && !intention.reason.trim().is_empty()
+        });
+        for intention in &mut self.saved.intentions {
+            intention.reason = clipped(&intention.reason, MAX_INCIDENT_SUMMARY_CHARS);
+        }
+        self.trim_incidents();
+        self.trim_intentions();
         self.trim_relationships(creator_user_id);
+    }
+
+    pub fn complete_intention_for(&mut self, user_id: i64) -> Result<bool> {
+        let previous = self.saved.clone();
+        let length = self.saved.intentions.len();
+        self.saved
+            .intentions
+            .retain(|intention| intention.user_id != user_id);
+        if self.saved.intentions.len() == length {
+            return Ok(false);
+        }
+        if let Err(error) = self.persist() {
+            self.saved = previous;
+            return Err(error);
+        }
+        Ok(true)
+    }
+
+    fn trim_incidents(&mut self) {
+        while self.saved.incidents.len() > MAX_INCIDENTS {
+            let Some(index) = self
+                .saved
+                .incidents
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, incident)| incident.created_at)
+                .map(|(index, _)| index)
+            else {
+                break;
+            };
+            self.saved.incidents.remove(index);
+        }
+    }
+
+    fn trim_intentions(&mut self) {
+        while self.saved.intentions.len() > MAX_INTENTIONS {
+            let Some(index) = self
+                .saved
+                .intentions
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, intention)| intention.created_at)
+                .map(|(index, _)| index)
+            else {
+                break;
+            };
+            self.saved.intentions.remove(index);
+        }
     }
 
     fn trim_relationships(&mut self, creator_user_id: Option<i64>) {

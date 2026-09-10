@@ -459,6 +459,9 @@ async fn dispatch(
             app.userbot
                 .send(app, chat_id, text, reply_to_message_id, generation)
                 .await?;
+            if generation.is_none() {
+                app.social.lock().unwrap().complete_intention_for(chat_id)?;
+            }
             Ok("sent".to_string())
         }
         "send_sticker" => {

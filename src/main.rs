@@ -66,6 +66,7 @@ struct TodaySnapshot {
 struct PendingSocialAppraisal {
     purpose: brain::ChatPurpose,
     actors: Vec<SocialActor>,
+    source_chat_id: Option<i64>,
     observed_event: String,
     completed: Option<oneshot::Sender<()>>,
 }
@@ -390,6 +391,7 @@ impl App {
         &self,
         purpose: brain::ChatPurpose,
         actors: &[SocialActor],
+        source_chat_id: Option<i64>,
         observed_event: &str,
     ) {
         let social_context = self.social_context_for(actors);
@@ -410,6 +412,7 @@ impl App {
             actors,
             self.creator_user_id,
             now,
+            source_chat_id,
         ) {
             eprintln!("emotion appraisal was rejected, keeping social state: {error:#}");
         }
@@ -440,6 +443,7 @@ impl App {
         self.queue_social_appraisal(PendingSocialAppraisal {
             purpose: brain::ChatPurpose::Conversation,
             actors,
+            source_chat_id: events.first().map(|event| event.chat_id),
             observed_event,
             completed: None,
         });
@@ -485,10 +489,11 @@ impl App {
             let PendingSocialAppraisal {
                 purpose,
                 actors,
+                source_chat_id,
                 observed_event,
                 completed,
             } = appraisal;
-            self.assess_social_event(purpose, &actors, &observed_event)
+            self.assess_social_event(purpose, &actors, source_chat_id, &observed_event)
                 .await;
             if let Some(completed) = completed {
                 let _ = completed.send(());
@@ -505,6 +510,7 @@ impl App {
         self.queue_social_appraisal(PendingSocialAppraisal {
             purpose: brain::ChatPurpose::Maintenance,
             actors: Vec::new(),
+            source_chat_id: None,
             observed_event,
             completed: Some(completed),
         });
