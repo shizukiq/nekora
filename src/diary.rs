@@ -14,6 +14,25 @@ const MAX_LISTED_MEMORIES: usize = 100;
 const MAX_LISTED_MEMORY_CHARS: usize = 12_000;
 const WORKING_MEMORY_FILE: &str = "working_memory";
 const MIN_GENERATED_MEMORY_CHARS: usize = 8;
+const FORBIDDEN_DIARY_LABELS: &[&str] = &[
+    "source",
+    "outcome",
+    "entities",
+    "topics",
+    "emotion / relationship",
+    "emotion",
+    "importance",
+    "uncertainty",
+    "источник",
+    "итог",
+    "сущности",
+    "темы",
+    "эмоция / отношения",
+    "эмоции",
+    "важность",
+    "неопределённость",
+    "неопределенность",
+];
 
 struct DiaryEntry {
     id: String,
@@ -94,6 +113,9 @@ pub fn is_valid_generated_memory(memory: &str) -> bool {
     if body_chars < MIN_GENERATED_MEMORY_CHARS {
         return false;
     }
+    if memory.lines().take(index).any(has_forbidden_diary_label) {
+        return false;
+    }
     if memory
         .lines()
         .skip(index + 1)
@@ -110,6 +132,18 @@ pub fn is_valid_generated_memory(memory: &str) -> bool {
         .filter(|cue| !cue.is_empty())
         .count();
     (3..=7).contains(&count)
+}
+
+fn has_forbidden_diary_label(line: &str) -> bool {
+    let line = line
+        .trim_start()
+        .trim_start_matches(|character: char| matches!(character, '#' | '*' | '_'))
+        .trim()
+        .to_lowercase();
+    FORBIDDEN_DIARY_LABELS.iter().any(|label| {
+        line.strip_prefix(label)
+            .is_some_and(|rest| rest.trim_start().starts_with(':'))
+    })
 }
 
 fn relatedness(a: &[f32], b: &[f32]) -> f64 {
