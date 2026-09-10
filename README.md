@@ -66,7 +66,7 @@ proxy for the Mistral API.
 | Embeddings           | `bge-m3` on Ollama                         | fixed local vector space for diary recall                                                                    |
 | Vision               | `mistral-small-2603` via direct Mistral API | Mistral first, then `qwen/qwen3-vl-32b-instruct` on OpenRouter, then `qwen2.5vl:3b` locally                |
 | Web search           | Ollama Cloud, then OpenRouter              | provider order is configurable; results are normalized before entering the turn                              |
-| Image generation     | disabled                                   | requires separate OpenRouter prompt and image models; every image passes a vision quality gate               |
+| Image generation     | disabled                                   | requires separate OpenRouter prompt and image models; explicit quality rejections trigger a retry            |
 
 If `MISTRAL_API_KEY` is empty, private maintenance uses the main model and vision skips directly to its configured
 OpenRouter or local fallback. `MISTRAL_API_BASE` defaults to `https://api.mistral.ai/v1`, so Mistral is used directly,

@@ -166,9 +166,15 @@ impl ImageGenerator {
                 .engineer_image_prompt(client, prompt_model, description, feedback.as_deref())
                 .await?;
             let image = self.request_openrouter_image(image_model, &prompt).await?;
-            let assessment = self
+            // A failed quality check must not discard an image that OpenRouter already generated.
+            // An explicit rejection still triggers another generation attempt.
+            let assessment = match self
                 .assess_generated_image(client, &image.bytes, description, &prompt)
-                .await?;
+                .await
+            {
+                Ok(assessment) => assessment,
+                Err(_) => return Ok(image),
+            };
             if assessment.accepted {
                 return Ok(image);
             }
