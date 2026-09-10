@@ -137,7 +137,7 @@ pub fn is_valid_generated_memory(memory: &str) -> bool {
 fn has_forbidden_diary_label(line: &str) -> bool {
     let line = line
         .trim_start()
-        .trim_start_matches(|character: char| matches!(character, '#' | '*' | '_'))
+        .trim_start_matches(['#', '*', '_'])
         .trim()
         .to_lowercase();
     FORBIDDEN_DIARY_LABELS.iter().any(|label| {

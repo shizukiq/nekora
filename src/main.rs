@@ -6,6 +6,7 @@ mod heartbeat;
 mod imagegen;
 mod ollama;
 mod persistence;
+mod promptsall;
 mod proxy;
 mod sleep;
 mod social;
@@ -169,6 +170,7 @@ pub struct App {
 }
 
 impl App {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         brain: Arc<Brain>,
         userbot: Arc<Userbot>,
@@ -582,7 +584,13 @@ fn truncate_chars(value: &str, limit: usize) -> String {
 /// An "act" tick with nobody talking: reflect on an old page, then let her act.
 async fn proactive(app: &Arc<App>) -> Result<()> {
     let recent = app.recent_context(None, &[]);
-    let thought = sleep::reflect(app, &recent).await?;
+    let thought = match sleep::reflect(app, &recent).await {
+        Ok(thought) => thought,
+        Err(error) => {
+            eprintln!("autonomous reflection skipped: {error:#}");
+            None
+        }
+    };
     let reflection = match thought {
         Some(thought) => format!(
             "<private_reflection>\n{}\n</private_reflection>",

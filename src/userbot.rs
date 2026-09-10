@@ -770,6 +770,42 @@ impl Userbot {
         })
     }
 
+    pub async fn change_profile_photo(
+        &self,
+        app: &App,
+        image: GeneratedImage,
+        generation: Option<ReplyGeneration>,
+    ) -> Result<bool> {
+        if image.bytes.is_empty() {
+            return Err(anyhow!("generated avatar is empty"));
+        }
+        if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
+            return Ok(false);
+        }
+
+        let image_len = image.bytes.len();
+        let mut stream = Cursor::new(image.bytes);
+        let uploaded = self
+            .client
+            .upload_stream(&mut stream, image_len, image.filename)
+            .await?;
+        if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
+            return Ok(false);
+        }
+
+        self.client
+            .invoke(&tl::functions::photos::UploadProfilePhoto {
+                fallback: false,
+                bot: None,
+                file: Some(uploaded.raw),
+                video: None,
+                video_start_ts: None,
+                video_emoji_markup: None,
+            })
+            .await?;
+        Ok(true)
+    }
+
     pub async fn received_gifts(&self, offset: &str, limit: usize) -> Result<ReceivedGifts> {
         if !(1..=20).contains(&limit) {
             return Err(anyhow!("limit must be between 1 and 20"));

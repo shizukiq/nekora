@@ -55,8 +55,8 @@ Questions, updates, and the living Nekora instance:
 
 ## Model routing
 
-Conversation, maintenance, vision, embeddings, search, and image generation are separate paths. Private maintenance and
-the first vision attempt use Mistral directly. OpenRouter is only an optional vision/search/image fallback; it is not a
+Conversation, maintenance, vision, embeddings, search, and image generation are separate paths. Private maintenance uses
+Mistral directly. Image recognition tries OpenRouter first, then Mistral, and finally local Ollama; OpenRouter is not a
 proxy for the Mistral API.
 
 | Path                 | Default                                    | Notes                                                                                                        |
@@ -64,13 +64,12 @@ proxy for the Mistral API.
 | Visible conversation | `deepseek-v4-flash`                        | OpenAI-compatible main endpoint; also appraises incoming social events                                       |
 | Private maintenance  | `mistral-small-2603` via direct Mistral API  | configurable with `NEKORA_REASONING_MODEL`; an empty value disables it, and request failures fall back to the main model |
 | Embeddings           | `bge-m3` on Ollama                         | fixed local vector space for diary recall                                                                    |
-| Vision               | `mistral-small-2603` via direct Mistral API | Mistral first, then `qwen/qwen3-vl-32b-instruct` on OpenRouter, then `qwen2.5vl:3b` locally                |
+| Vision               | `qwen/qwen3-vl-32b-instruct` on OpenRouter | OpenRouter first, then `mistral-small-2603` via Mistral, then `qwen2.5vl:3b` locally                       |
 | Web search           | Ollama Cloud, then OpenRouter              | provider order is configurable; results are normalized before entering the turn                              |
 | Image generation     | disabled                                   | requires separate OpenRouter prompt and image models; explicit quality rejections trigger a retry            |
 
-If `MISTRAL_API_KEY` is empty, private maintenance uses the main model and vision skips directly to its configured
-OpenRouter or local fallback. `MISTRAL_API_BASE` defaults to `https://api.mistral.ai/v1`, so Mistral is used directly,
-without OpenRouter in between.
+If `MISTRAL_API_KEY` is empty, private maintenance uses the main model and vision goes from OpenRouter directly to the
+local fallback. `MISTRAL_API_BASE` defaults to `https://api.mistral.ai/v1`.
 
 Do not change the embedding model for an existing vault: old and new vectors would no longer be comparable. Changing
 `NEKORA_REASONING_MODEL` does not move visible conversations to Mistral.
@@ -125,6 +124,7 @@ The brain can use only this bounded tool set:
 | `view_messages_around`  | read a bounded slice of history around a known message                                |
 | `get_current_time`      | ask Telegram for its server time in UTC+04:00                                          |
 | `generate_image`        | generate, quality-check, and send one image when explicitly configured                 |
+| `change_avatar`         | generate and set a new profile photo, including during an autonomous heartbeat tick       |
 | `send_message`          | send a visible Telegram reply or a proactive message; optionally reply to a message ID |
 | `edit_message`          | edit one of Nekora's own messages                                                      |
 | `remove_message`        | delete one exact message after checking its chat and message IDs                      |
@@ -146,8 +146,8 @@ inspected by the vision path.
 - `*.session` is equivalent to a logged-in Telegram account. Never publish or share it.
 - The main provider receives conversation text, recalled memories, and runtime context used for a turn.
 - When configured, Mistral may receive diary and working-memory data for maintenance, public search results for
-  emotional appraisal, and incoming images for primary vision analysis. Requests go directly to `MISTRAL_API_BASE`.
-- When configured, OpenRouter may receive images after Mistral vision fails, configured image references during
+  emotional appraisal, and incoming images after OpenRouter vision fails. Requests go directly to `MISTRAL_API_BASE`.
+- When configured, OpenRouter may receive incoming images before Mistral, configured image references during
   generation, plus generation prompts and generated images.
 - Configured search providers receive search queries.
 - Local Ollama receives diary text for embeddings and media for fallback vision.
@@ -166,8 +166,8 @@ For a local build you need:
 - a Telegram API ID and API hash
 - a DeepSeek API key, or another OpenAI-compatible main endpoint
 - Ollama with `bge-m3` and the configured fallback vision model
-- a Mistral API key for direct maintenance and primary vision
-- an OpenRouter key only if OpenRouter vision fallback, OpenRouter search, or image generation is enabled
+- a Mistral API key for direct maintenance and the second vision attempt
+- an OpenRouter key for primary cloud vision, or when OpenRouter search/image generation is enabled
 - credentials for at least one provider in `NEKORA_WEB_SEARCH_CHAIN`
 
 Get the Telegram API credentials from Telegram's developer portal. Nekora uses an account phone number and an
@@ -232,6 +232,9 @@ character, diary recall, and bounded Telegram tools; `stream: true` returns a co
 is ready. Set `NEKORA_PROXY_ONLY=1` to run only the proxy without Telegram login; that mode keeps persona and diary context
 but has no Telegram tools. Keep the listener on loopback or set `NEKORA_PROXY_TOKEN` before binding it to another interface.
 
+`NEKORA_PROXY_ADDR` is only the local listener address. `NEKORA_PROXY_TOKEN` is the optional Bearer password for clients
+of that endpoint; neither value is a Telegram credential and Nekora must never ask a person to send either one in chat.
+
 Example request:
 
 ```sh
@@ -282,19 +285,19 @@ variables win over it.
 | `DEEPSEEK_API_KEY`             | empty                               | key for the main OpenAI-compatible endpoint                                                               |
 | `NEKORA_MAIN_API_BASE`         | `https://api.deepseek.com/v1`       | main chat endpoint                                                                                        |
 | `NEKORA_MAIN_MODEL`            | `deepseek-v4-flash`                 | main chat model                                                                                           |
-| `MISTRAL_API_KEY`              | empty                               | direct Mistral key for private maintenance and primary vision                                             |
+| `MISTRAL_API_KEY`              | empty                               | direct Mistral key for private maintenance and second vision attempt                                     |
 | `MISTRAL_API_BASE`             | `https://api.mistral.ai/v1`         | direct Mistral OpenAI-compatible endpoint                                                                |
 | `NEKORA_WEB_SEARCH_CHAIN`      | `ollama,openrouter`                 | ordered cloud search providers                                                                            |
 | `OLLAMA_API_KEY`               | empty                               | Ollama Cloud web search key                                                                               |
 | `OLLAMA_WEB_SEARCH_URL`        | `https://ollama.com/api/web_search` | Ollama Search endpoint                                                                                    |
-| `OPENROUTER_API_KEY`           | empty                               | optional OpenRouter key for vision fallback, web search, and images                                       |
+| `OPENROUTER_API_KEY`           | empty                               | optional OpenRouter key for primary vision, web search, and images                                        |
 | `OPENROUTER_API_BASE`          | `https://openrouter.ai/api/v1`      | OpenRouter API base                                                                                       |
 | `OPENROUTER_WEB_SEARCH_MODEL`  | `openai/gpt-4.1-mini`               | model used by the OpenRouter search tool                                                                  |
 | `OPENROUTER_WEB_SEARCH_ENGINE` | `auto`                              | OpenRouter search engine selection                                                                        |
-| `NEKORA_VISION_MODEL`          | `qwen/qwen3-vl-32b-instruct`        | OpenRouter vision fallback model                                                                          |
+| `NEKORA_VISION_MODEL`          | `qwen/qwen3-vl-32b-instruct`        | OpenRouter primary vision model                                                                            |
 | `NEKORA_LOCAL_VISION_MODEL`    | `qwen2.5vl:3b`                      | local Ollama vision fallback                                                                              |
 | `NEKORA_REASONING_MODEL`       | `mistral-small-2603`               | Mistral model for private maintenance and public-result appraisal; set empty to use the main model       |
-| `NEKORA_MISTRAL_VISION_MODEL`  | `mistral-small-2603`               | primary Mistral model for analyzing incoming images                                                       |
+| `NEKORA_MISTRAL_VISION_MODEL`  | `mistral-small-2603`               | second cloud model for analyzing incoming images                                                          |
 | `NEKORA_IMAGE_MODEL`           | empty                               | OpenRouter model slug for the dedicated `/images` API                                                     |
 | `NEKORA_IMAGE_PROMPT_MODEL`    | empty                               | OpenRouter chat model that engineers generation prompts                                                   |
 | `NEKORA_IMAGE_REFERENCES`      | image files in `references/` (up to 4) | comma-separated local reference image paths; unset uses supported images in `references/`                |
@@ -325,6 +328,10 @@ canonical image template and returns only the scene-specific `{SCENE_REQUEST}` t
 anti-drift sections are assembled by Rust. Set `NEKORA_IMAGE_MODEL` and `NEKORA_IMAGE_PROMPT_MODEL` explicitly before
 using `generate_image`, because image requests may incur provider charges. Image generation has its own
 `NEKORA_IMAGE_TIMEOUT` because it can take longer than an ordinary model request.
+
+Incoming image recognition tries OpenRouter first, then Mistral, and uses local Ollama only when both cloud providers
+fail. The same generator and references are used by `change_avatar`; the tool uploads the result as Nekora's Telegram
+profile photo.
 
 Conversational requests keep only the core workflow and character profile in the stable system prefix. Working memory is
 runtime-derived data and follows in its own untrusted user-role block, before per-turn time, recalled diary notes,
@@ -369,7 +376,8 @@ excludes `.env`, session files, the vault, and build output.
 | `src/userbot.rs`              | MTProto login, updates, media, and paced sending                  |
 | `src/proxy.rs`                | bounded OpenAI-compatible HTTP endpoint and SSE response          |
 | `src/persistence.rs`          | atomic filesystem operations for the vault                        |
-| `src/config.rs`               | environment, identity, core prompt, and character profile loading |
+| `src/promptsall.rs`           | centralized model instructions, persona, maintenance, and tool prompts |
+| `src/config.rs`               | environment, identity, and character profile loading              |
 
 ## Development
 
