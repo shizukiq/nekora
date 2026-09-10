@@ -19,6 +19,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_COOLDOWN_SECS: u64 = 5 * 60;
 const MAX_TIMEOUT_SECS: u64 = 5 * 60;
 const MAX_COOLDOWN_SECS: u64 = 60 * 60;
+const MAX_REDIRECTS: usize = 10;
 
 pub(crate) const MAX_QUERY_CHARS: usize = 500;
 pub(crate) const MAX_RESULTS: usize = 10;
@@ -126,6 +127,7 @@ struct ProviderSlot {
 }
 
 pub(crate) struct ProviderChain {
+    client: Client,
     providers: Vec<ProviderSlot>,
     cooldown: Duration,
 }
@@ -144,6 +146,7 @@ impl ProviderChain {
         )?;
         let client = Client::builder()
             .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
             .user_agent("nekora/0.1")
             .build()
             .context("could not create web search HTTP client")?;
@@ -174,6 +177,7 @@ impl ProviderChain {
         }
 
         Ok(Self {
+            client,
             providers,
             cooldown,
         })
@@ -191,7 +195,21 @@ impl ProviderChain {
             bail!("search result limit must be between 1 and {MAX_RESULTS}");
         }
 
+        // Search providers may treat an exact URL as a lookup key and not follow its redirect.
         let requested_url = exact_query_url(query);
+        let resolved_url = if let Some(url) = requested_url.as_ref() {
+            Some(
+                resolve_requested_url(&self.client, url)
+                    .await
+                    .unwrap_or_else(|_| url.clone()),
+            )
+        } else {
+            None
+        };
+        let provider_query = resolved_url
+            .as_ref()
+            .map(|url| url.as_str())
+            .unwrap_or(query);
 
         let mut failures = Vec::new();
         let mut attempted = false;
@@ -200,17 +218,19 @@ impl ProviderChain {
                 continue;
             }
             attempted = true;
-            match slot.provider.search(query, limit).await {
+            match slot.provider.search(provider_query, limit).await {
                 Ok(results) if results.results.is_empty() => {
                     slot.clear_cooldown();
                     failures.push(format!("{}: no results", slot.provider.name()));
                 }
                 Ok(results)
                     if requested_url.as_ref().is_some_and(|requested_url| {
-                        !results
-                            .results
-                            .iter()
-                            .any(|result| same_page(requested_url, &result.url))
+                        !results.results.iter().any(|result| {
+                            same_page(requested_url, &result.url)
+                                || resolved_url.as_ref().is_some_and(|resolved_url| {
+                                    same_page(resolved_url, &result.url)
+                                })
+                        })
                     }) =>
                 {
                     slot.clear_cooldown();
@@ -254,6 +274,14 @@ impl ProviderChain {
             failures.join("; ")
         ))
     }
+}
+
+async fn resolve_requested_url(
+    client: &Client,
+    url: &Url,
+) -> std::result::Result<Url, reqwest::Error> {
+    let response = client.get(url.clone()).send().await?;
+    Ok(response.url().clone())
 }
 
 pub(crate) fn exact_query_url(query: &str) -> Option<Url> {
