@@ -138,8 +138,8 @@ inspected by the vision path.
 - The main provider receives conversation text, recalled memories, and runtime context used for a turn.
 - When configured, Mistral may receive diary and working-memory data for maintenance, public search results for
   emotional appraisal, and incoming images for primary vision analysis. Requests go directly to `MISTRAL_API_BASE`.
-- When configured, OpenRouter may receive images only after Mistral vision fails, plus generation prompts and generated
-  images.
+- When configured, OpenRouter may receive images after Mistral vision fails, configured image references during
+  generation, plus generation prompts and generated images.
 - Configured search providers receive search queries.
 - Local Ollama receives diary text for embeddings and media for fallback vision.
 - The vault contains message checkpoints, social state, working memory, diary notes, and embeddings. Back it up as
@@ -264,7 +264,8 @@ variables win over it.
 | `NEKORA_MISTRAL_VISION_MODEL`  | `mistral-small-2603`               | primary Mistral model for analyzing incoming images                                                       |
 | `NEKORA_IMAGE_MODEL`           | empty                               | OpenRouter model slug for the dedicated `/images` API                                                     |
 | `NEKORA_IMAGE_PROMPT_MODEL`    | empty                               | OpenRouter chat model that engineers generation prompts                                                   |
-| `NEKORA_IMAGE_PROMPT`          | empty                               | optional canonical appearance prompt for generated images                                                 |
+| `NEKORA_IMAGE_REFERENCES`      | image files in `references/` (up to 4) | comma-separated local reference image paths; unset uses supported images in `references/`                |
+| `NEKORA_IMAGE_PROMPT`          | built-in Nekora template            | optional full canonical image prompt override; `{SCENE_REQUEST}` is replaced per image                   |
 | `NEKORA_VISION_API_TIMEOUT`    | `30`                                | seconds allowed for each cloud vision attempt before the next provider is tried                           |
 | `NEKORA_WEB_SEARCH_TIMEOUT`    | `30`                                | seconds allowed for one search request                                                                    |
 | `NEKORA_WEB_SEARCH_COOLDOWN`   | `300`                               | seconds to skip a rate-limited provider                                                                   |
@@ -281,6 +282,11 @@ variables win over it.
 To change her personality, create `prompts/system.md`. When that file is not present, the built-in Nekora persona is
 used. This file supplies the character profile; the core Telegram, context, and tool workflow remains built in so a
 personality edit cannot remove it accidentally. The prompt is read relative to the current working directory.
+
+Image generation uses the local reference images as OpenRouter `input_references`. The prompt engineer receives the
+canonical image template and returns only the scene-specific `{SCENE_REQUEST}` text; the fixed identity, rendering, and
+anti-drift sections are assembled by Rust. Set `NEKORA_IMAGE_MODEL` and `NEKORA_IMAGE_PROMPT_MODEL` explicitly before
+using `generate_image`, because image requests may incur provider charges.
 
 Conversational requests keep only the core workflow and character profile in the stable system prefix. Working memory is
 runtime-derived data and follows in its own untrusted user-role block, before per-turn time, recalled diary notes,
