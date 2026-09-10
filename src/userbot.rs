@@ -18,10 +18,11 @@ use rand::Rng;
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::brain::{Brain, GeneratedImage};
+use crate::brain::Brain;
 use crate::config::{self, env_or};
 use crate::conversation::{split_message, ReplyGeneration};
 use crate::heartbeat::PresencePlan;
+use crate::imagegen::GeneratedImage;
 use crate::App;
 
 const BUBBLE_DELAY_MIN_MS: u64 = 500;

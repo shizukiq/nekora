@@ -3,6 +3,7 @@ mod config;
 mod conversation;
 mod diary;
 mod heartbeat;
+mod imagegen;
 mod ollama;
 mod persistence;
 mod sleep;
@@ -30,6 +31,7 @@ use brain::Brain;
 use conversation::{Conversation, ConversationBatch, ConversationMessage, ReplyGeneration};
 use diary::Diary;
 use heartbeat::Heartbeat;
+use imagegen::ImageGenerator;
 use social::{SocialActor, SocialState};
 use userbot::{Incoming, Userbot};
 use websearch::ProviderChain;
@@ -150,6 +152,7 @@ impl Today {
 pub struct App {
     pub brain: Arc<Brain>,
     pub userbot: Arc<Userbot>,
+    pub(crate) image_generator: ImageGenerator,
     pub(crate) web_search: ProviderChain,
     pub diary: Mutex<Diary>,
     social: Mutex<SocialState>,
@@ -168,6 +171,7 @@ impl App {
     fn new(
         brain: Arc<Brain>,
         userbot: Arc<Userbot>,
+        image_generator: ImageGenerator,
         web_search: ProviderChain,
         diary: Diary,
         today: Today,
@@ -177,6 +181,7 @@ impl App {
         Self {
             brain,
             userbot,
+            image_generator,
             web_search,
             diary: Mutex::new(diary),
             social: Mutex::new(social),
@@ -1072,6 +1077,7 @@ async fn handle_update(app: &Arc<App>, update: Update) {
 
 async fn run() -> Result<()> {
     let brain = Arc::new(Brain::from_env()?);
+    let image_generator = ImageGenerator::from_env()?;
     let web_search = ProviderChain::from_env()?;
     // Kept alive for the whole run: dropping this stops a managed Ollama.
     let _ollama = ollama::start_if_managed(&brain.local_vision_model).await?;
@@ -1111,6 +1117,7 @@ async fn run() -> Result<()> {
     let app = Arc::new(App::new(
         brain,
         userbot,
+        image_generator,
         web_search,
         diary,
         today,

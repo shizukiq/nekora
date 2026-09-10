@@ -266,6 +266,7 @@ variables win over it.
 | `NEKORA_IMAGE_PROMPT_MODEL`    | empty                               | OpenRouter chat model that engineers generation prompts                                                   |
 | `NEKORA_IMAGE_REFERENCES`      | image files in `references/` (up to 4) | comma-separated local reference image paths; unset uses supported images in `references/`                |
 | `NEKORA_IMAGE_PROMPT`          | built-in Nekora template            | optional full canonical image prompt override; `{SCENE_REQUEST}` is replaced per image                   |
+| `NEKORA_IMAGE_TIMEOUT`         | `300`                               | seconds allowed for one OpenRouter image generation request                                               |
 | `NEKORA_VISION_API_TIMEOUT`    | `30`                                | seconds allowed for each cloud vision attempt before the next provider is tried                           |
 | `NEKORA_WEB_SEARCH_TIMEOUT`    | `30`                                | seconds allowed for one search request                                                                    |
 | `NEKORA_WEB_SEARCH_COOLDOWN`   | `300`                               | seconds to skip a rate-limited provider                                                                   |
@@ -286,7 +287,8 @@ personality edit cannot remove it accidentally. The prompt is read relative to t
 Image generation uses the local reference images as OpenRouter `input_references`. The prompt engineer receives the
 canonical image template and returns only the scene-specific `{SCENE_REQUEST}` text; the fixed identity, rendering, and
 anti-drift sections are assembled by Rust. Set `NEKORA_IMAGE_MODEL` and `NEKORA_IMAGE_PROMPT_MODEL` explicitly before
-using `generate_image`, because image requests may incur provider charges.
+using `generate_image`, because image requests may incur provider charges. Image generation has its own
+`NEKORA_IMAGE_TIMEOUT` because it can take longer than an ordinary model request.
 
 Conversational requests keep only the core workflow and character profile in the stable system prefix. Working memory is
 runtime-derived data and follows in its own untrusted user-role block, before per-turn time, recalled diary notes,
@@ -324,6 +326,7 @@ excludes `.env`, session files, the vault, and build output.
 | `src/websearch/mod.rs`        | provider chain, fallback policy, and normalized results           |
 | `src/websearch/ollama.rs`     | Ollama Cloud Search adapter                                       |
 | `src/websearch/openrouter.rs` | OpenRouter web-search adapter                                     |
+| `src/imagegen/mod.rs`         | OpenRouter image generation, references, and quality gate         |
 | `src/diary.rs`                | Markdown notes, compact metadata, recall, and confidence          |
 | `src/sleep.rs`                | working-memory refresh and diary consolidation                    |
 | `src/social.rs`               | persistent mood, relationships, social incidents, and intentions |

@@ -421,7 +421,7 @@ async fn dispatch(
             }
             .to_string();
             let reply_to_message_id = optional_message_id(&args, "reply_to_message_id")?;
-            let image = app.brain.generate_image(description).await?;
+            let image = app.image_generator.generate(description).await?;
             // Generation may be cancelled when a newer message arrives. Once
             // Telegram sending begins it must finish its own generation checks
             // and record a successful send even if the calling turn is dropped.
