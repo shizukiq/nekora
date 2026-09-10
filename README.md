@@ -61,14 +61,14 @@ back or remain disabled instead of silently changing the visible conversation mo
 | Path                 | Default                                    | Notes                                                                                                        |
 |----------------------|--------------------------------------------|--------------------------------------------------------------------------------------------------------------|
 | Visible conversation | `deepseek-v4-flash`                        | OpenAI-compatible main endpoint; also appraises incoming social events                                       |
-| Private maintenance  | `openai/gpt-5.6-luna` on OpenRouter        | configurable with `NEKORA_REASONING_MODEL`; an empty value disables it, and failures fall back to the main model |
+| Private maintenance  | `mistral-small-2603` on direct Mistral API  | configurable with `NEKORA_REASONING_MODEL`; an empty value disables it, and failures fall back to the main model |
 | Embeddings           | `bge-m3` on Ollama                         | fixed local vector space for diary recall                                                                    |
-| Vision               | `qwen/qwen3-vl-32b-instruct` on OpenRouter | falls back to `qwen2.5vl:3b` on local Ollama                                                                 |
+| Vision               | `mistral-small-2603` on direct Mistral API | falls back to `qwen/qwen3-vl-32b-instruct` on OpenRouter, then `qwen2.5vl:3b` locally                       |
 | Web search           | Ollama Cloud, then OpenRouter              | provider order is configurable; results are normalized before entering the turn                              |
 | Image generation     | disabled                                   | requires separate OpenRouter prompt and image models; every image passes a vision quality gate               |
 
 Do not change the embedding model for an existing vault: old and new vectors would no longer be comparable. Changing
-`NEKORA_REASONING_MODEL` does not move visible conversations to OpenRouter.
+`NEKORA_REASONING_MODEL` does not move visible conversations to Mistral.
 
 ## Memory and social state
 
@@ -130,8 +130,10 @@ inspected by the vision path.
 
 - `*.session` is equivalent to a logged-in Telegram account. Never publish or share it.
 - The main provider receives conversation text, recalled memories, and runtime context used for a turn.
-- When configured, OpenRouter may receive images for vision, diary and working memory data for maintenance, public
-  search results for emotional appraisal, generation prompts, and generated images.
+- When configured, Mistral may receive diary and working-memory data for maintenance, public search results for
+  emotional appraisal, and incoming images for primary vision analysis.
+- When configured, OpenRouter may receive images after Mistral vision fails, plus generation prompts and generated
+  images.
 - Configured search providers receive search queries.
 - Local Ollama receives diary text for embeddings and media for fallback vision.
 - The vault contains message checkpoints, social state, working memory, diary notes, and embeddings. Back it up as
@@ -149,7 +151,8 @@ For a local build you need:
 - a Telegram API ID and API hash
 - a DeepSeek API key, or another OpenAI-compatible main endpoint
 - Ollama with `bge-m3` and the configured fallback vision model
-- an OpenRouter key if cloud vision, OpenRouter search, reasoning, or image generation is enabled
+- a Mistral API key if direct maintenance or Mistral vision fallback is enabled
+- an OpenRouter key if cloud vision, OpenRouter search, or image generation is enabled
 - credentials for at least one provider in `NEKORA_WEB_SEARCH_CHAIN`
 
 Get the Telegram API credentials from Telegram's developer portal. Nekora uses an account phone number and an
@@ -172,12 +175,14 @@ TELEGRAM_API_ID=123456
 TELEGRAM_API_HASH=your_telegram_api_hash
 TELEGRAM_PHONE=+10000000000
 DEEPSEEK_API_KEY=your_deepseek_api_key
+MISTRAL_API_KEY=your_mistral_api_key
 OPENROUTER_API_KEY=your_openrouter_api_key
 NEKORA_WEB_SEARCH_CHAIN=ollama,openrouter
 OLLAMA_API_KEY=your_ollama_cloud_api_key
 NEKORA_VISION_MODEL=qwen/qwen3-vl-32b-instruct
 NEKORA_LOCAL_VISION_MODEL=qwen2.5vl:3b
-NEKORA_REASONING_MODEL=openai/gpt-5.6-luna
+NEKORA_REASONING_MODEL=mistral-small-2603
+NEKORA_MISTRAL_VISION_MODEL=mistral-small-2603
 
 PAPIK_NAME=your name
 NEKORA_NAME=Nekora
@@ -237,20 +242,23 @@ variables win over it.
 | `DEEPSEEK_API_KEY`             | empty                               | key for the main OpenAI-compatible endpoint                                                               |
 | `NEKORA_MAIN_API_BASE`         | `https://api.deepseek.com/v1`       | main chat endpoint                                                                                        |
 | `NEKORA_MAIN_MODEL`            | `deepseek-v4-flash`                 | main chat model                                                                                           |
+| `MISTRAL_API_KEY`              | empty                               | direct Mistral key for private maintenance and vision fallback                                           |
+| `MISTRAL_API_BASE`             | `https://api.mistral.ai/v1`         | direct Mistral OpenAI-compatible endpoint                                                                |
 | `NEKORA_WEB_SEARCH_CHAIN`      | `ollama,openrouter`                 | ordered cloud search providers                                                                            |
 | `OLLAMA_API_KEY`               | empty                               | Ollama Cloud web search key                                                                               |
 | `OLLAMA_WEB_SEARCH_URL`        | `https://ollama.com/api/web_search` | Ollama Search endpoint                                                                                    |
-| `OPENROUTER_API_KEY`           | empty                               | OpenRouter key for vision, optional reasoning, web search, and images                                     |
+| `OPENROUTER_API_KEY`           | empty                               | OpenRouter key for vision, web search, and images                                                         |
 | `OPENROUTER_API_BASE`          | `https://openrouter.ai/api/v1`      | OpenRouter API base                                                                                       |
 | `OPENROUTER_WEB_SEARCH_MODEL`  | `openai/gpt-4.1-mini`               | model used by the OpenRouter search tool                                                                  |
 | `OPENROUTER_WEB_SEARCH_ENGINE` | `auto`                              | OpenRouter search engine selection                                                                        |
 | `NEKORA_VISION_MODEL`          | `qwen/qwen3-vl-32b-instruct`        | primary OpenRouter vision model                                                                           |
 | `NEKORA_LOCAL_VISION_MODEL`    | `qwen2.5vl:3b`                      | local Ollama vision fallback                                                                              |
-| `NEKORA_REASONING_MODEL`       | `openai/gpt-5.6-luna`               | OpenRouter model for private maintenance and public-result appraisal; set empty to use the main model     |
+| `NEKORA_REASONING_MODEL`       | `mistral-small-2603`               | Mistral model for private maintenance and public-result appraisal; set empty to use the main model       |
+| `NEKORA_MISTRAL_VISION_MODEL`  | `mistral-small-2603`               | primary Mistral model for analyzing incoming images                                                       |
 | `NEKORA_IMAGE_MODEL`           | empty                               | OpenRouter model slug for the dedicated `/images` API                                                     |
 | `NEKORA_IMAGE_PROMPT_MODEL`    | empty                               | OpenRouter chat model that engineers generation prompts                                                   |
 | `NEKORA_IMAGE_PROMPT`          | empty                               | optional canonical appearance prompt for generated images                                                 |
-| `NEKORA_VISION_API_TIMEOUT`    | `30`                                | seconds before cloud vision falls back to Ollama                                                          |
+| `NEKORA_VISION_API_TIMEOUT`    | `30`                                | seconds allowed for each cloud vision attempt before the next provider is tried                           |
 | `NEKORA_WEB_SEARCH_TIMEOUT`    | `30`                                | seconds allowed for one search request                                                                    |
 | `NEKORA_WEB_SEARCH_COOLDOWN`   | `300`                               | seconds to skip a rate-limited provider                                                                   |
 | `OLLAMA_HOST`                  | `http://127.0.0.1:11434`            | Ollama server address                                                                                     |

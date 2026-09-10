@@ -30,10 +30,11 @@ use crate::social::EmotionAppraisal;
 use crate::{tools, App};
 
 const DEFAULT_MAIN_API_BASE: &str = "https://api.deepseek.com/v1";
+const DEFAULT_MISTRAL_API_BASE: &str = "https://api.mistral.ai/v1";
 const DEFAULT_OPENROUTER_API_BASE: &str = "https://openrouter.ai/api/v1";
 const DEFAULT_VISION_MODEL: &str = "qwen/qwen3-vl-32b-instruct";
 const DEFAULT_LOCAL_VISION_MODEL: &str = "qwen2.5vl:3b";
-const DEFAULT_REASONING_MODEL: &str = "openai/gpt-5.6-luna";
+const DEFAULT_MISTRAL_MODEL: &str = "mistral-small-2603";
 const EMBED_MODEL: &str = "bge-m3";
 
 const TEMPERATURE: f32 = 0.2;
@@ -93,10 +94,12 @@ pub fn required_ollama_models(vision_model: &str) -> [String; 2] {
 
 pub struct Brain {
     openai: Client<OpenAIConfig>,
+    mistral: Option<Client<OpenAIConfig>>,
     vision_openrouter: Option<Client<OpenAIConfig>>,
     ollama: Ollama,
     main_model: String,
     vision_model: String,
+    mistral_vision_model: String,
     reasoning_model: Option<String>,
     image_model: Option<String>,
     image_prompt_model: Option<String>,
@@ -149,6 +152,15 @@ impl Brain {
         let openai_config = OpenAIConfig::new()
             .with_api_base(api_base("NEKORA_MAIN_API_BASE", DEFAULT_MAIN_API_BASE))
             .with_api_key(env_or("DEEPSEEK_API_KEY", ""));
+        let mistral_api_key = env_or("MISTRAL_API_KEY", "");
+        let mistral = if mistral_api_key.trim().is_empty() {
+            None
+        } else {
+            let config = OpenAIConfig::new()
+                .with_api_base(api_base("MISTRAL_API_BASE", DEFAULT_MISTRAL_API_BASE))
+                .with_api_key(mistral_api_key);
+            Some(Client::with_config(config))
+        };
         let openrouter_api_key = env_or("OPENROUTER_API_KEY", "");
         let openrouter_api_base = api_base("OPENROUTER_API_BASE", DEFAULT_OPENROUTER_API_BASE);
         let vision_openrouter = if openrouter_api_key.trim().is_empty() {
@@ -163,6 +175,7 @@ impl Brain {
         let vision_api_timeout_secs: u64 = env_or("NEKORA_VISION_API_TIMEOUT", "30").parse()?;
         Ok(Self {
             openai: Client::with_config(openai_config),
+            mistral,
             vision_openrouter,
             ollama: crate::ollama::client_from_host(&env_or(
                 "OLLAMA_HOST",
@@ -170,7 +183,8 @@ impl Brain {
             )),
             main_model: env_or("NEKORA_MAIN_MODEL", "deepseek-v4-flash"),
             vision_model: env_or("NEKORA_VISION_MODEL", DEFAULT_VISION_MODEL),
-            reasoning_model: Some(env_or("NEKORA_REASONING_MODEL", DEFAULT_REASONING_MODEL))
+            mistral_vision_model: env_or("NEKORA_MISTRAL_VISION_MODEL", DEFAULT_MISTRAL_MODEL),
+            reasoning_model: Some(env_or("NEKORA_REASONING_MODEL", DEFAULT_MISTRAL_MODEL))
                 .filter(|model| !model.trim().is_empty()),
             image_model: nonempty_env("NEKORA_IMAGE_MODEL"),
             image_prompt_model: nonempty_env("NEKORA_IMAGE_PROMPT_MODEL"),
@@ -214,10 +228,7 @@ impl Brain {
         messages: Vec<ChatCompletionRequestMessage>,
         tools: &[ChatCompletionTools],
     ) -> Result<ChatCompletionResponseMessage> {
-        let reasoning = self
-            .vision_openrouter
-            .as_ref()
-            .zip(self.reasoning_model.as_deref());
+        let reasoning = self.mistral.as_ref().zip(self.reasoning_model.as_deref());
         if matches!(purpose, ChatPurpose::Maintenance) {
             if let Some((client, model)) = reasoning {
                 return match self.chat_with(client, model, messages.clone(), tools).await {
@@ -313,31 +324,38 @@ impl Brain {
         .await
     }
 
-    /// Describe an incoming image so the text-only turn can "see" it. OpenRouter
-    /// gets one bounded attempt; any failure falls back to the local model.
+    /// Describe an incoming image so the text-only turn can "see" it. Mistral
+    /// gets the first attempt, then OpenRouter, and local Ollama is the last fallback.
     pub async fn caption_image(&self, image_bytes: &[u8]) -> Result<String> {
         let base64 = base64::engine::general_purpose::STANDARD.encode(image_bytes);
-        let openrouter_error = if let Some(client) = &self.vision_openrouter {
+        let mut errors = Vec::new();
+        if let Some(client) = &self.mistral {
+            match self
+                .caption_image_mistral(client, image_bytes, &base64)
+                .await
+            {
+                Ok(caption) => return Ok(caption),
+                Err(error) => errors.push(format!("mistral vision failed: {error:#}")),
+            }
+        }
+
+        if let Some(client) = &self.vision_openrouter {
             match self
                 .caption_image_openrouter(client, image_bytes, &base64)
                 .await
             {
                 Ok(caption) => return Ok(caption),
-                Err(error) => Some(error),
+                Err(error) => errors.push(format!("openrouter vision failed: {error:#}")),
             }
-        } else {
-            None
-        };
+        }
 
         match self.caption_image_local(&base64).await {
             Ok(caption) => Ok(caption),
-            Err(local_error) => match openrouter_error {
-                Some(openrouter_error) => Err(anyhow!(
-                    "openrouter vision failed: {openrouter_error:#}; \
-                     local vision fallback failed: {local_error:#}"
-                )),
-                None => Err(local_error),
-            },
+            Err(local_error) if errors.is_empty() => Err(local_error),
+            Err(local_error) => Err(anyhow!(
+                "{}; local vision failed: {local_error:#}",
+                errors.join("; ")
+            )),
         }
     }
 
@@ -454,7 +472,14 @@ impl Brain {
             escape_prompt_data(prompt),
         );
         let response = self
-            .ask_openrouter_vision(client, image_bytes, &base64, &assessment_prompt)
+            .ask_vision(
+                client,
+                self.vision_model.as_str(),
+                image_bytes,
+                &base64,
+                &assessment_prompt,
+                "openrouter",
+            )
             .await?;
         let response = response
             .trim()
@@ -465,27 +490,52 @@ impl Brain {
         Ok(serde_json::from_str(response)?)
     }
 
-    #[allow(deprecated)] // OpenRouter documents max_tokens for this model.
     async fn caption_image_openrouter(
         &self,
         client: &Client<OpenAIConfig>,
         image_bytes: &[u8],
         base64: &str,
     ) -> Result<String> {
-        self.ask_openrouter_vision(client, image_bytes, base64, VISION_PROMPT)
-            .await
+        self.ask_vision(
+            client,
+            self.vision_model.as_str(),
+            image_bytes,
+            base64,
+            VISION_PROMPT,
+            "openrouter",
+        )
+        .await
     }
 
-    #[allow(deprecated)] // OpenRouter documents max_tokens for this model.
-    async fn ask_openrouter_vision(
+    async fn caption_image_mistral(
         &self,
         client: &Client<OpenAIConfig>,
         image_bytes: &[u8],
         base64: &str,
+    ) -> Result<String> {
+        self.ask_vision(
+            client,
+            self.mistral_vision_model.as_str(),
+            image_bytes,
+            base64,
+            VISION_PROMPT,
+            "mistral",
+        )
+        .await
+    }
+
+    #[allow(deprecated)] // OpenAI-compatible vision APIs document max_tokens here.
+    async fn ask_vision(
+        &self,
+        client: &Client<OpenAIConfig>,
+        model: &str,
+        image_bytes: &[u8],
+        base64: &str,
         prompt: &str,
+        provider: &str,
     ) -> Result<String> {
         let media_type = image_media_type(image_bytes)
-            .ok_or_else(|| anyhow!("unsupported image format for OpenRouter vision"))?;
+            .ok_or_else(|| anyhow!("unsupported image format for {provider} vision"))?;
         let image_url = format!("data:{media_type};base64,{base64}");
         let content = ChatCompletionRequestUserMessageContent::Array(vec![
             ChatCompletionRequestMessageContentPartText {
@@ -498,14 +548,14 @@ impl Brain {
             .into(),
         ]);
         let request = CreateChatCompletionRequestArgs::default()
-            .model(self.vision_model.as_str())
+            .model(model)
             .temperature(TEMPERATURE)
             .max_tokens(VISION_NUM_PREDICT as u32)
             .messages(vec![ChatCompletionRequestUserMessage::from(content).into()])
             .build()?;
         let response = tokio::time::timeout(self.vision_api_timeout, client.chat().create(request))
             .await
-            .map_err(|_| anyhow!("openrouter vision timed out"))??;
+            .map_err(|_| anyhow!("{provider} vision timed out"))??;
         response
             .choices
             .into_iter()
@@ -513,7 +563,7 @@ impl Brain {
             .and_then(|choice| choice.message.content)
             .map(|caption| caption.trim().to_string())
             .filter(|caption| !caption.is_empty())
-            .ok_or_else(|| anyhow!("openrouter vision returned no caption"))
+            .ok_or_else(|| anyhow!("{provider} vision returned no caption"))
     }
 
     /// A cold local model may need retries, unlike the cloud attempt where a
