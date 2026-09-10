@@ -107,16 +107,23 @@ impl SearchResult {
             return None;
         }
 
+        let title = clip(
+            title
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .unwrap_or("untitled result"),
+            MAX_TITLE_CHARS,
+        );
+        let snippet = snippet
+            .map(str::trim)
+            .filter(|snippet| !snippet.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| title.clone());
+
         Some(Self {
-            title: clip(
-                title
-                    .map(str::trim)
-                    .filter(|title| !title.is_empty())
-                    .unwrap_or("untitled result"),
-                MAX_TITLE_CHARS,
-            ),
-            url: url.to_string(),
-            snippet: clip(snippet.unwrap_or_default().trim(), MAX_SNIPPET_CHARS),
+            title,
+            url: strip_tracking_params(&parsed_url).to_string(),
+            snippet: clip(&snippet, MAX_SNIPPET_CHARS),
         })
     }
 }
@@ -307,11 +314,32 @@ fn same_page(expected: &Url, actual: &str) -> bool {
 fn comparable_query(url: &Url) -> Vec<(String, String)> {
     let mut query = url
         .query_pairs()
-        .filter(|(key, _)| !key.to_ascii_lowercase().starts_with("utm_"))
+        .filter(|(key, _)| !is_tracking_param(key))
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
         .collect::<Vec<_>>();
     query.sort_unstable();
     query
+}
+
+fn strip_tracking_params(url: &Url) -> Url {
+    let retained = url
+        .query_pairs()
+        .filter(|(key, _)| !is_tracking_param(key))
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    let mut cleaned = url.clone();
+    cleaned.set_query(None);
+    if !retained.is_empty() {
+        let mut query = cleaned.query_pairs_mut();
+        for (key, value) in retained {
+            query.append_pair(&key, &value);
+        }
+    }
+    cleaned
+}
+
+fn is_tracking_param(key: &str) -> bool {
+    key.to_ascii_lowercase().starts_with("utm_")
 }
 
 impl ProviderSlot {

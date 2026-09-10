@@ -102,11 +102,14 @@ impl SearchProvider for OpenRouterProvider {
                 })?
                 .message;
 
+            let fallback_snippet = exact_query_url(query)
+                .and(message.content.as_deref())
+                .filter(|content| !content.trim().is_empty());
             let mut seen_urls = HashSet::new();
             let mut results = message
                 .annotations
                 .into_iter()
-                .filter_map(Annotation::into_result)
+                .filter_map(|annotation| annotation.into_result(fallback_snippet))
                 .filter(|result| seen_urls.insert(result.url.clone()))
                 .take(limit)
                 .collect::<Vec<_>>();
@@ -167,7 +170,7 @@ struct Citation {
 }
 
 impl Annotation {
-    fn into_result(self) -> Option<SearchResult> {
+    fn into_result(self, fallback_snippet: Option<&str>) -> Option<SearchResult> {
         if self.kind != "url_citation" {
             return None;
         }
@@ -176,6 +179,10 @@ impl Annotation {
             Some(citation) => (citation.url, citation.title, citation.content),
             None => (self.url?, self.title, self.content),
         };
-        SearchResult::from_parts(title.as_deref(), &url, content.as_deref())
+        let snippet = content
+            .as_deref()
+            .filter(|content| !content.trim().is_empty())
+            .or(fallback_snippet);
+        SearchResult::from_parts(title.as_deref(), &url, snippet)
     }
 }

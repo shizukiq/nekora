@@ -38,14 +38,14 @@ pub fn schema() -> Vec<ChatCompletionTools> {
         ),
         (
             "remember",
-            "Write one self-contained lasting diary note in Russian. Use canonical names; preserve source, outcome, and uncertainty. Format multiple ideas as short Markdown paragraphs separated by blank lines. End with a separate one-line `Retrieval cues: cue one; cue two; cue three` paragraph containing three to five likely search phrases. Use for things worth keeping, not small talk.",
+            "Write one self-contained lasting diary note in Russian, usually 50-220 words. Write from Nekora's first-person perspective: for her own actions and feelings use я/мне/мой; never call her Nekora, она, персонаж, ассистент, AI, or система. Keep other people attributed in the third person. Preserve source, outcome, uncertainty, and one useful detail. End with a separate one-line `Retrieval cues: cue one; cue two; cue three` paragraph containing three to five likely search phrases. Use for things worth keeping, not small talk.",
             json!({"type": "object", "properties": {
                 "text": {"type": "string", "description": "a readable Russian Markdown memory with enough identity and retrieval context to find it later"}},
                 "required": ["text"]}),
         ),
         (
             "revise_memory",
-            "Replace one active diary memory when newer evidence makes it incomplete or false. Use an id returned by recall_memory or list_memories and provide the complete corrected Russian Markdown note, including its Retrieval cues paragraph. The previous version is archived for recovery. Immutable confidence-1 anchors cannot be changed.",
+            "Replace one active diary memory when newer evidence makes it incomplete or false. Use an id returned by recall_memory or list_memories and provide the complete corrected Russian Markdown note, usually 50-220 words, in Nekora's first-person voice. For her own actions and feelings use я/мне/мой; never use Nekora, она, персонаж, ассистент, AI, or система for her. Keep its Retrieval cues paragraph. The previous version is removed. Immutable confidence-1 anchors cannot be changed.",
             json!({"type": "object", "properties": {
                 "memory_id": {"type": "string", "description": "id of the active memory to replace"},
                 "text": {"type": "string", "description": "complete corrected self-contained memory"}},
@@ -53,7 +53,7 @@ pub fn schema() -> Vec<ChatCompletionTools> {
         ),
         (
             "archive_memory",
-            "Archive one active diary memory that is clearly false, obsolete, or fully redundant. Use an id returned by recall_memory or list_memories. Archiving removes it from normal recall but keeps the note recoverable. Immutable confidence-1 anchors cannot be archived.",
+            "Remove one active diary memory that is clearly false, obsolete, or fully redundant. Use an id returned by recall_memory or list_memories. The note is deleted from the vault. Immutable confidence-1 anchors cannot be removed.",
             json!({"type": "object", "properties": {
                 "memory_id": {"type": "string", "description": "id of the active memory to archive"}},
                 "required": ["memory_id"]}),
@@ -298,10 +298,10 @@ async fn dispatch(
                     .revise(memory_id, text, &vector, DEFAULT_CONFIDENCE)?;
             Ok(match revision {
                 MemoryRevision::Replaced(id) => {
-                    format!("revised as {id}; previous memory archived")
+                    format!("revised as {id}; previous memory removed")
                 }
                 MemoryRevision::AlreadyKnown => {
-                    "correction already existed; previous memory archived".to_string()
+                    "correction already existed; previous memory removed".to_string()
                 }
                 MemoryRevision::Unchanged => "memory already says that".to_string(),
                 MemoryRevision::NotEditable => {
@@ -312,7 +312,7 @@ async fn dispatch(
         "archive_memory" => {
             let memory_id = str_arg(&args, "memory_id")?.to_string();
             if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
-                return Ok("turn became outdated before the memory was archived".to_string());
+                return Ok("turn became outdated before the memory was removed".to_string());
             }
             let retired = app
                 .diary
@@ -320,7 +320,7 @@ async fn dispatch(
                 .unwrap()
                 .retire(std::slice::from_ref(&memory_id))?;
             Ok(if retired == 1 {
-                "archived".to_string()
+                "removed".to_string()
             } else {
                 "memory was not active or is an immutable anchor".to_string()
             })

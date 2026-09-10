@@ -1,32 +1,42 @@
 use std::collections::HashSet;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::Rng;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::persistence;
 
 const DEDUP_RELATEDNESS: f64 = 0.95;
 const MAX_LISTED_MEMORIES: usize = 100;
 const MAX_LISTED_MEMORY_CHARS: usize = 12_000;
-const MAX_GRAPH_LINKS: usize = 4;
-const GRAPH_RELATEDNESS: f64 = 0.78;
 const WORKING_MEMORY_FILE: &str = "working_memory";
 const MIN_GENERATED_MEMORY_CHARS: usize = 8;
 
 struct DiaryEntry {
     id: String,
-    file_name: String,
-    title: String,
     body: String,
     embedding: Vec<f32>,
     confidence: f32,
     usage: u32,
     last_used: i64,
     retired: bool,
-    links: Vec<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct StoredMetadata {
+    #[serde(default)]
+    confidence: f32,
+    #[serde(default)]
+    usage: u32,
+    #[serde(default)]
+    last_used: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    embedding: Vec<f32>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    retired: bool,
 }
 
 #[derive(Serialize)]
@@ -143,37 +153,55 @@ impl Diary {
         self.entries.clear();
         self.counter = 0;
         files.sort();
-        let mut occupied: HashSet<String> = files
+        let old_names: HashSet<String> = files
             .iter()
             .filter_map(|path| path.file_stem())
             .map(|stem| stem.to_string_lossy().into_owned())
             .collect();
+        let mut used_ids = HashSet::new();
+        let mut pending = Vec::new();
         for path in files {
-            let old_file_name = path.file_stem().unwrap_or_default().to_string_lossy();
-            if old_file_name == WORKING_MEMORY_FILE {
+            let old_name = path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            if old_name == WORKING_MEMORY_FILE {
                 continue;
             }
             let Some(raw) = persistence::read_file(&path) else {
                 continue;
             };
-            let Some(mut entry) = parse_note(&old_file_name, &raw) else {
+            let Some(mut entry) = parse_note(&old_name, &raw) else {
                 continue;
             };
-            if is_legacy_file_name(&old_file_name) {
-                let new_file_name = unique_file_name(&entry.title, &occupied);
-                if new_file_name != old_file_name {
-                    let new_path = note_path(&self.directory, &new_file_name);
-                    if fs::rename(&path, &new_path).is_ok() {
-                        occupied.insert(new_file_name.clone());
-                        entry.file_name = new_file_name;
-                        let _ = write_note_to(&self.directory, &entry);
-                    }
+            if entry.retired {
+                let _ = fs::remove_file(path);
+                continue;
+            }
+            if !is_canonical_id(&entry.id)
+                || used_ids.contains(&entry.id)
+                || (old_names.contains(&entry.id) && entry.id != old_name)
+            {
+                entry.id = self.next_id_avoiding(&used_ids, &old_names);
+            }
+            used_ids.insert(entry.id.clone());
+            let canonical = old_name == entry.id
+                && raw.starts_with("---\n{")
+                && !raw.contains("\n\nRelated notes:\n");
+            pending.push((path, old_name, entry, canonical));
+        }
+        for (path, old_name, entry, canonical) in pending {
+            if !canonical {
+                if write_note_to(&self.directory, &entry).is_err() {
+                    return false;
+                }
+                if old_name != entry.id && fs::remove_file(path).is_err() {
+                    return false;
                 }
             }
-            occupied.insert(entry.file_name.clone());
             self.entries.push(entry);
         }
-        self.connect_notes();
         true
     }
 
@@ -184,7 +212,7 @@ impl Diary {
         let known = self
             .entries
             .iter()
-            .map(|entry| entry.file_name.as_str())
+            .map(|entry| entry.id.as_str())
             .collect::<HashSet<_>>();
         let has_new_note = files.iter().any(|path| {
             path.file_stem().is_some_and(|stem| {
@@ -226,7 +254,7 @@ impl Diary {
         let Some(source) = self
             .entries
             .iter()
-            .find(|entry| entry.id == id && !entry.retired && entry.confidence < 1.0)
+            .find(|entry| entry.id == id && entry.confidence < 1.0)
         else {
             return Ok(MemoryRevision::NotEditable);
         };
@@ -257,59 +285,24 @@ impl Diary {
         excluded_ids: &[String],
     ) -> std::io::Result<Option<String>> {
         let too_close = self.entries.iter().any(|entry| {
-            !entry.retired
-                && !excluded_ids.iter().any(|id| id == &entry.id)
+            !excluded_ids.iter().any(|id| id == &entry.id)
                 && relatedness(embedding, &entry.embedding) > DEDUP_RELATEDNESS
         });
         if too_close {
             return Ok(None);
         }
-        let title = memory_title(body);
-        let occupied = self
-            .entries
-            .iter()
-            .map(|entry| entry.file_name.clone())
-            .collect::<HashSet<_>>();
-        let file_name = unique_file_name(&title, &occupied);
-        let mut links = self
-            .entries
-            .iter()
-            .filter(|entry| excluded_ids.iter().any(|id| id == &entry.id))
-            .map(|entry| entry.file_name.clone())
-            .take(MAX_GRAPH_LINKS)
-            .collect::<Vec<_>>();
-        for link in self.graph_links(embedding, None, excluded_ids) {
-            if links.len() == MAX_GRAPH_LINKS {
-                break;
-            }
-            if !links.contains(&link) {
-                links.push(link);
-            }
-        }
         let id = self.next_id();
         let entry = DiaryEntry {
             id,
-            file_name,
-            title,
             body: body.to_string(),
             embedding: embedding.to_vec(),
             confidence,
             usage: 0,
             last_used: 0,
             retired: false,
-            links,
         };
         self.write_note(&entry)?;
         let id = entry.id.clone();
-        for existing in &mut self.entries {
-            if entry.links.iter().any(|link| link == &existing.file_name)
-                && !existing.links.contains(&entry.file_name)
-                && existing.links.len() < MAX_GRAPH_LINKS
-            {
-                existing.links.push(entry.file_name.clone());
-                let _ = write_note_to(&self.directory, existing);
-            }
-        }
         self.entries.push(entry);
         Ok(Some(id))
     }
@@ -326,7 +319,7 @@ impl Diary {
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| !entry.retired && !excluded.iter().any(|id| id == &entry.id))
+            .filter(|(_, entry)| !excluded.iter().any(|id| id == &entry.id))
             .map(|(index, entry)| (index, relatedness(embedding, &entry.embedding)))
             .filter(|(_, score)| *score >= minimum_relatedness)
             .collect();
@@ -364,7 +357,6 @@ impl Diary {
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| !entry.retired)
             .map(|(index, _)| index)
             .collect();
         order.sort_by(|&a, &b| self.entries[b].id.cmp(&self.entries[a].id));
@@ -402,7 +394,7 @@ impl Diary {
         let mut anchors: Vec<&DiaryEntry> = self
             .entries
             .iter()
-            .filter(|entry| !entry.retired && entry.confidence >= 1.0)
+            .filter(|entry| entry.confidence >= 1.0)
             .collect();
         anchors.sort_by(|left, right| left.id.cmp(&right.id));
         anchors.truncate(limit);
@@ -418,7 +410,7 @@ impl Diary {
     }
 
     pub fn random_page(&self) -> Option<String> {
-        let active: Vec<&DiaryEntry> = self.entries.iter().filter(|entry| !entry.retired).collect();
+        let active: Vec<&DiaryEntry> = self.entries.iter().collect();
         if active.is_empty() {
             return None;
         }
@@ -430,11 +422,7 @@ impl Diary {
         let active: Vec<&DiaryEntry> = self
             .entries
             .iter()
-            .filter(|entry| {
-                !entry.retired
-                    && entry.confidence < 1.0
-                    && !excluded.iter().any(|id| id == &entry.id)
-            })
+            .filter(|entry| entry.confidence < 1.0 && !excluded.iter().any(|id| id == &entry.id))
             .collect();
         if active.is_empty() {
             return None;
@@ -464,11 +452,7 @@ impl Diary {
         let mut scored: Vec<(&DiaryEntry, f64)> = self
             .entries
             .iter()
-            .filter(|entry| {
-                !entry.retired
-                    && entry.id != target_id
-                    && !excluded.iter().any(|id| id == &entry.id)
-            })
+            .filter(|entry| entry.id != target_id && !excluded.iter().any(|id| id == &entry.id))
             .map(|entry| (entry, relatedness(embedding, &entry.embedding)))
             .filter(|(_, score)| *score >= minimum_relatedness)
             .collect();
@@ -486,19 +470,30 @@ impl Diary {
     }
 
     pub fn retire(&mut self, ids: &[String]) -> std::io::Result<usize> {
-        let directory = self.directory.clone();
-        let mut retired = 0;
-        for entry in &mut self.entries {
-            if ids.iter().any(|id| id == &entry.id) && !entry.retired && entry.confidence < 1.0 {
-                entry.retired = true;
-                if let Err(error) = write_note_to(&directory, entry) {
-                    entry.retired = false;
+        let mut kept = Vec::with_capacity(self.entries.len());
+        let mut removed = 0;
+        let entries = std::mem::take(&mut self.entries);
+        let mut entries = entries.into_iter();
+        while let Some(entry) = entries.next() {
+            let should_remove = ids.iter().any(|id| id == &entry.id) && entry.confidence < 1.0;
+            if !should_remove {
+                kept.push(entry);
+                continue;
+            }
+
+            match fs::remove_file(note_path(&self.directory, &entry.id)) {
+                Ok(()) => removed += 1,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => removed += 1,
+                Err(error) => {
+                    kept.push(entry);
+                    kept.extend(entries);
+                    self.entries = kept;
                     return Err(error);
                 }
-                retired += 1;
             }
         }
-        Ok(retired)
+        self.entries = kept;
+        Ok(removed)
     }
 
     fn touch(&mut self, index: usize, now: i64) {
@@ -512,94 +507,28 @@ impl Diary {
         write_note_to(&self.directory, entry)
     }
 
-    fn graph_links(
-        &self,
-        embedding: &[f32],
-        excluded_file_name: Option<&str>,
-        excluded_ids: &[String],
-    ) -> Vec<String> {
-        if embedding.is_empty() {
-            return Vec::new();
-        }
-        let mut scored = self
-            .entries
-            .iter()
-            .filter(|entry| {
-                !entry.retired
-                    && Some(entry.file_name.as_str()) != excluded_file_name
-                    && !excluded_ids.iter().any(|id| id == &entry.id)
-                    && !entry.embedding.is_empty()
-            })
-            .map(|entry| {
-                (
-                    entry.file_name.clone(),
-                    relatedness(embedding, &entry.embedding),
-                )
-            })
-            .collect::<Vec<_>>();
-        scored.sort_by(|left, right| right.1.total_cmp(&left.1));
-
-        let mut links = scored
-            .iter()
-            .filter(|(_, score)| *score >= GRAPH_RELATEDNESS)
-            .take(MAX_GRAPH_LINKS)
-            .map(|(file_name, _)| file_name.clone())
-            .collect::<Vec<_>>();
-        if links.is_empty() {
-            if let Some((file_name, _)) = scored.first() {
-                links.push(file_name.clone());
-            }
-        }
-        links
-    }
-
-    fn connect_notes(&mut self) {
-        for index in 0..self.entries.len() {
-            if self.entries[index].retired {
-                continue;
-            }
-            let file_name = self.entries[index].file_name.clone();
-            let embedding = self.entries[index].embedding.clone();
-            for link in self.graph_links(&embedding, Some(&file_name), &[]) {
-                if self.entries[index].links.len() >= MAX_GRAPH_LINKS {
-                    break;
-                }
-                if !self.entries[index].links.contains(&link) {
-                    self.entries[index].links.push(link);
-                }
-            }
-        }
-        for index in 0..self.entries.len() {
-            if self.entries[index].retired {
-                continue;
-            }
-            let file_name = self.entries[index].file_name.clone();
-            let links = self.entries[index].links.clone();
-            for link in links {
-                let Some(other) = self
-                    .entries
-                    .iter()
-                    .position(|entry| entry.file_name == link)
-                else {
-                    continue;
-                };
-                if !self.entries[other].links.contains(&file_name)
-                    && self.entries[other].links.len() < MAX_GRAPH_LINKS
-                {
-                    self.entries[other].links.push(file_name.clone());
-                }
-            }
-        }
-        for entry in &self.entries {
-            let _ = write_note_to(&self.directory, entry);
-        }
-    }
-
     fn next_id(&mut self) -> String {
         loop {
-            let id = format!("{}-{}", unix_millis(), self.counter);
+            let id = unix_millis()
+                .saturating_add(u128::from(self.counter))
+                .to_string();
             self.counter += 1;
             if !self.entries.iter().any(|entry| entry.id == id) {
+                return id;
+            }
+        }
+    }
+
+    fn next_id_avoiding(&mut self, used: &HashSet<String>, old_names: &HashSet<String>) -> String {
+        loop {
+            let id = unix_millis()
+                .saturating_add(u128::from(self.counter))
+                .to_string();
+            self.counter += 1;
+            if !used.contains(&id)
+                && !old_names.contains(&id)
+                && !self.entries.iter().any(|entry| entry.id == id)
+            {
                 return id;
             }
         }
@@ -611,33 +540,19 @@ fn note_path(directory: &Path, id: &str) -> PathBuf {
 }
 
 fn write_note_to(directory: &Path, entry: &DiaryEntry) -> std::io::Result<()> {
-    let mut text = format!(
-        "---\nid: {}\ntitle: {}\nconfidence: {}\nusage: {}\nlast_used: {}\nembedding:",
-        entry.id,
-        quote_frontmatter(&entry.title),
-        entry.confidence,
-        entry.usage,
-        entry.last_used
-    );
-    for value in &entry.embedding {
-        text.push(' ');
-        text.push_str(&value.to_string());
-    }
-    if entry.retired {
-        text.push_str("\nretired: true");
-    }
-    text.push_str("\n---\n");
-    text.push_str(&entry.body);
-    if !entry.links.is_empty() {
-        text.push_str("\n\nRelated notes:\n");
-        for link in &entry.links {
-            text.push_str("- [[");
-            text.push_str(link);
-            text.push_str("]]\n");
-        }
-    }
+    let metadata = StoredMetadata {
+        confidence: entry.confidence,
+        usage: entry.usage,
+        last_used: entry.last_used,
+        embedding: entry.embedding.clone(),
+        retired: entry.retired,
+    };
+    let metadata = serde_json::to_string(&metadata)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let mut text = format!("---\n{metadata}\n---\n");
+    text.push_str(entry.body.trim());
     text.push('\n');
-    persistence::write_file_atomic(&note_path(directory, &entry.file_name), &text)
+    persistence::write_file_atomic(&note_path(directory, &entry.id), &text)
 }
 
 fn parse_note(id: &str, raw: &str) -> Option<DiaryEntry> {
@@ -648,15 +563,12 @@ fn parse_note(id: &str, raw: &str) -> Option<DiaryEntry> {
         }
         return Some(DiaryEntry {
             id: id.to_string(),
-            file_name: id.to_string(),
-            title: memory_title(body),
             body: body.to_string(),
             embedding: Vec::new(),
             confidence: 1.0,
             usage: 0,
             last_used: 0,
             retired: false,
-            links: Vec::new(),
         });
     };
     let separator = rest.find("\n---\n")?;
@@ -664,25 +576,29 @@ fn parse_note(id: &str, raw: &str) -> Option<DiaryEntry> {
     let raw_body = rest[separator + "\n---\n".len()..]
         .trim_matches(|c| c == '\n' || c == '\r')
         .to_string();
-    let (body, body_links) = match raw_body
-        .rsplit_once("\n\nRelated notes:\n")
-        .and_then(|(body, links)| related_note_links(links).map(|links| (body, links)))
-    {
-        Some((body, links)) => (body.to_string(), links),
-        None => (raw_body, Vec::new()),
-    };
+    let body = strip_related_notes(&raw_body);
+
+    if header.trim_start().starts_with('{') {
+        let metadata: StoredMetadata = serde_json::from_str(header.trim()).ok()?;
+        return Some(DiaryEntry {
+            id: id.to_string(),
+            body,
+            embedding: metadata.embedding,
+            confidence: metadata.confidence,
+            usage: metadata.usage,
+            last_used: metadata.last_used,
+            retired: metadata.retired,
+        });
+    }
 
     let mut entry = DiaryEntry {
         id: id.to_string(),
-        file_name: id.to_string(),
-        title: String::new(),
         body,
         embedding: Vec::new(),
         confidence: 0.0,
         usage: 0,
         last_used: 0,
         retired: false,
-        links: body_links,
     };
     let mut has_diary_metadata = false;
     for line in header.lines() {
@@ -692,7 +608,6 @@ fn parse_note(id: &str, raw: &str) -> Option<DiaryEntry> {
         let value = value.trim();
         match key.trim() {
             "id" => entry.id = value.to_string(),
-            "title" => entry.title = parse_frontmatter_text(value),
             "confidence" => {
                 has_diary_metadata = true;
                 entry.confidence = parse_finite(value)?;
@@ -709,10 +624,6 @@ fn parse_note(id: &str, raw: &str) -> Option<DiaryEntry> {
                 has_diary_metadata = true;
                 entry.retired = value == "true";
             }
-            "links" => {
-                has_diary_metadata = true;
-                entry.links.extend(parse_links(value));
-            }
             "embedding" => {
                 has_diary_metadata = true;
                 for token in value.split_whitespace() {
@@ -722,124 +633,37 @@ fn parse_note(id: &str, raw: &str) -> Option<DiaryEntry> {
             _ => {}
         }
     }
-    if entry.title.is_empty() {
-        entry.title = memory_title(&entry.body);
-    }
     if !has_diary_metadata {
         entry.confidence = 1.0;
     }
     Some(entry)
 }
 
-fn parse_links(value: &str) -> Vec<String> {
-    value
-        .split("[[")
-        .skip(1)
-        .filter_map(|part| part.split("]]").next())
-        .map(|link| link.split('|').next().unwrap_or(link).trim().to_string())
-        .filter(|link| !link.is_empty())
-        .collect()
-}
-
-fn related_note_links(value: &str) -> Option<Vec<String>> {
-    let lines = value
+fn strip_related_notes(body: &str) -> String {
+    let Some((body, links)) = body.rsplit_once("\n\nRelated notes:\n") else {
+        return body.to_string();
+    };
+    let lines = links
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>();
-    if lines.is_empty()
-        || lines
+    if !lines.is_empty()
+        && lines
             .iter()
-            .any(|line| !line.starts_with("- [[") || !line.ends_with("]]"))
+            .all(|line| line.starts_with("- [[") && line.ends_with("]]"))
     {
-        return None;
+        return body.trim_end().to_string();
     }
-    Some(parse_links(value))
+    body.to_string()
 }
 
-fn memory_title(body: &str) -> String {
-    let line = body
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with('{'))
-        .unwrap_or("memory");
-    let line = line
-        .trim_start_matches(['#', '-', '*', ' '])
-        .trim()
-        .split_once(" — ")
-        .map(|(_, title)| title)
-        .unwrap_or(line);
-    let title = line
-        .chars()
-        .filter(|character| !matches!(character, '[' | ']' | '|'))
-        .take(80)
-        .collect::<String>();
-    if title.is_empty() {
-        "memory".to_string()
-    } else {
-        title
-    }
+fn is_canonical_id(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(|character| character.is_ascii_digit())
 }
 
-fn unique_file_name(title: &str, occupied: &HashSet<String>) -> String {
-    let base = match slugify(title) {
-        base if base.is_empty() => "memory".to_string(),
-        base => base,
-    };
-    if !occupied.contains(&base) {
-        return base;
-    }
-    let mut suffix = 2;
-    loop {
-        let candidate = format!("{base}-{suffix}");
-        if !occupied.contains(&candidate) {
-            return candidate;
-        }
-        suffix += 1;
-    }
-}
-
-fn slugify(title: &str) -> String {
-    let mut slug = String::new();
-    for character in title.chars() {
-        if character.is_alphanumeric() {
-            for lower in character.to_lowercase() {
-                slug.push(lower);
-            }
-        } else if !slug.is_empty() && !slug.ends_with('-') {
-            slug.push('-');
-        }
-    }
-    slug.trim_matches('-').to_string()
-}
-
-fn is_legacy_file_name(file_name: &str) -> bool {
-    let mut parts = file_name.split('-');
-    let Some(timestamp) = parts.next() else {
-        return false;
-    };
-    let Some(counter) = parts.next() else {
-        return false;
-    };
-    parts.next().is_none()
-        && !timestamp.is_empty()
-        && !counter.is_empty()
-        && timestamp
-            .chars()
-            .all(|character| character.is_ascii_digit())
-        && counter.chars().all(|character| character.is_ascii_digit())
-}
-
-fn quote_frontmatter(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
-fn parse_frontmatter_text(value: &str) -> String {
-    value
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-        .map(|value| value.replace("\\\"", "\"").replace("\\\\", "\\"))
-        .unwrap_or_else(|| value.to_string())
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn parse_finite(value: &str) -> Option<f32> {

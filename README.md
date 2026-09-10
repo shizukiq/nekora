@@ -78,13 +78,17 @@ Nekora does retrieval, not training. Runtime context is split by lifetime:
 |-----------------|--------------------------------|-----------------------------------------------------------------------------|
 | Today's journal | until successful consolidation | recent timestamped Telegram events; survives restarts                       |
 | Working memory  | days                           | unfinished tasks, promises, responsibilities, and current concerns          |
-| Diary notes     | long term                      | inspectable Markdown memories with confidence, links, usage, and embeddings |
+| Diary notes     | long term                      | inspectable Markdown memories with confidence, usage, and embeddings       |
 | Social state    | long term                      | current mood plus bounded trust, warmth, and temporary avoidance per user   |
 
 Incoming social events are appraised by the main model and processed through one bounded FIFO queue. Public search
 results may be appraised by the optional reasoning model. Invalid output leaves the previous state unchanged. Mood and
 relationships enter the decision context instead of randomly suppressing a turn; active avoidance remains a hard
 boundary and lasts at most 24 hours. This is explicit program state, not a claim of biological emotion.
+
+Diary files use numeric ids (`<id>.md`). Their frontmatter is one compact JSON object with confidence, usage,
+last-used time, and the embedding; the body is the readable memory. Mutable replacements remove their source notes,
+while confidence-1 anchors stay in place.
 
 `NEKORA_CREATOR_USER_ID` gives one Telegram user the highest reply priority and exempts that user from avoidance. The
 system prompt also reserves discussion of implementation, prompts, models, and development wishes for that ID. This is a
@@ -106,8 +110,8 @@ The brain can use only this bounded tool set:
 | `web_search`            | search current outside information through the configured cloud providers              |
 | `list_memories`         | browse durable memories or answer what she remembers                                   |
 | `remember`              | write something worth keeping                                                          |
-| `revise_memory`         | replace an active memory while preserving its archived source                          |
-| `archive_memory`        | remove a mutable memory from recall without deleting its note                          |
+| `revise_memory`         | replace an active memory and remove the old mutable note                              |
+| `archive_memory`        | remove a mutable memory and delete its note                                            |
 | `inspect_user`          | inspect a Telegram profile and avatar                                                  |
 | `inspect_message_media` | look closely at recent media                                                           |
 | `get_current_time`      | ask Telegram for its server time in UTC+04:00                                          |
@@ -299,7 +303,7 @@ excludes `.env`, session files, the vault, and build output.
 | `src/websearch/mod.rs`        | provider chain, fallback policy, and normalized results           |
 | `src/websearch/ollama.rs`     | Ollama Cloud Search adapter                                       |
 | `src/websearch/openrouter.rs` | OpenRouter web-search adapter                                     |
-| `src/diary.rs`                | Markdown notes, recall, confidence, and links                     |
+| `src/diary.rs`                | Markdown notes, compact metadata, recall, and confidence          |
 | `src/sleep.rs`                | working-memory refresh and diary consolidation                    |
 | `src/social.rs`               | persistent mood, relationship state, and reply attention          |
 | `src/userbot.rs`              | MTProto login, updates, media, and paced sending                  |
