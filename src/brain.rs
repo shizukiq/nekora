@@ -629,10 +629,7 @@ fn normalize_dsml_tool_calls(reply: &mut ChatCompletionResponseMessage) -> Resul
     let Some(content) = reply.content.as_deref() else {
         return Ok(());
     };
-    if !(content.contains("DSML")
-        && content.contains("tool_calls")
-        && content.contains("invoke name=\""))
-    {
+    if !(content.contains("DSML") && content.contains("invoke name=\"")) {
         return Ok(());
     }
 
@@ -715,6 +712,7 @@ fn normalize_dsml_tool_calls(reply: &mut ChatCompletionResponseMessage) -> Resul
 
 fn find_dsml_close(text: &str, tag: &str) -> Option<(usize, usize)> {
     [
+        format!("<|/DSML|{tag}>"),
         format!("</|DSML|{tag}>"),
         format!("<|DSML|/{tag}>"),
         format!("/{tag}>"),

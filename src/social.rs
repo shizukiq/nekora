@@ -180,9 +180,11 @@ impl SocialState {
             let affection = relationship.map_or(50, |person| person.affection);
             let avoiding = Some(actor.user_id) != creator_user_id
                 && relationship.is_some_and(|person| person.avoid_until > unix_seconds());
-            let role = (Some(actor.user_id) == creator_user_id)
-                .then_some(" creator")
-                .unwrap_or("");
+            let role = if Some(actor.user_id) == creator_user_id {
+                " creator"
+            } else {
+                ""
+            };
             lines.push(format!(
                 "person user_id={}{}: trust={trust}/100, warmth={affection}/100, avoiding_now={avoiding}",
                 actor.user_id, role,
@@ -320,7 +322,7 @@ impl SocialState {
         }
         if let Err(error) = self.persist() {
             self.saved = previous;
-            return Err(error.into());
+            return Err(error);
         }
         Ok(true)
     }
@@ -363,9 +365,11 @@ impl SocialState {
 
     fn reason_suffix(&self) -> String {
         let reason = self.saved.mood.reason.trim();
-        (!reason.is_empty())
-            .then(|| format!(", reason: {}", escape_prompt_data(reason)))
-            .unwrap_or_default()
+        if reason.is_empty() {
+            String::new()
+        } else {
+            format!(", reason: {}", escape_prompt_data(reason))
+        }
     }
 }
 

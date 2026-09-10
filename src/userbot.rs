@@ -1318,7 +1318,7 @@ impl Userbot {
         reply_to_message_id: Option<i64>,
         generation: Option<ReplyGeneration>,
     ) -> Result<()> {
-        if text.contains("DSML |") && text.contains("invoke name=\"") {
+        if text.contains("DSML") && text.contains("invoke name=\"") {
             return Err(anyhow!("refusing to send internal tool-call markup"));
         }
         if generation.is_some_and(|generation| !app.generation_is_current(generation)) {

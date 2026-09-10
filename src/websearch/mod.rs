@@ -301,7 +301,17 @@ fn same_page(expected: &Url, actual: &str) -> bool {
         && expected.host_str() == actual.host_str()
         && expected.port_or_known_default() == actual.port_or_known_default()
         && expected.path().trim_end_matches('/') == actual.path().trim_end_matches('/')
-        && expected.query() == actual.query()
+        && comparable_query(expected) == comparable_query(&actual)
+}
+
+fn comparable_query(url: &Url) -> Vec<(String, String)> {
+    let mut query = url
+        .query_pairs()
+        .filter(|(key, _)| !key.to_ascii_lowercase().starts_with("utm_"))
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    query.sort_unstable();
+    query
 }
 
 impl ProviderSlot {
