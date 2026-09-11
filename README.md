@@ -37,8 +37,9 @@ heartbeat ──▶ reflection ──▶ brain + tools ──▶ message, reacti
 ```
 
 Incoming messages wait for a three-second quiet window; typing can extend the window, and a five-second grace catches
-late messages before generation starts. The resulting reply is split into natural Telegram bubbles and sent with typing
-delays. A newer private message invalidates an obsolete in-flight reply. Deliberately unanswered batches remain pending
+late messages before generation starts. One generated reply is the default; when the model deliberately separates two
+or three impulses with a blank line, the existing sender turns them into individual bubbles with typing delays. A newer
+private message invalidates an obsolete in-flight reply. Deliberately unanswered batches remain pending
 and are reconsidered with increasing delays: private chats start at one minute, groups at five, and both cap at the
 27-minute heartbeat interval. A new message makes its pending chat eligible immediately.
 
@@ -335,6 +336,8 @@ panels or labels, replace it with a clean single-frame portrait through `NEKORA_
 
 There is no post-generation vision quality gate: a successful image response is sent as-is. The image request still retries
 temporary transport or provider failures, without generating extra images after a successful response.
+Photo, selfie, and snapshot requests are rendered as one camera-like frame; other requests keep the anime illustration
+style. A multi-panel reference can still leak its layout into an image, so use one clean portrait without text or panels.
 
 Incoming image recognition tries OpenRouter first, then Mistral, and uses local Ollama only when both cloud providers
 fail. The same generator and references are used by `change_avatar`; the tool uploads the result as Nekora's Telegram
