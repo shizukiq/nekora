@@ -83,7 +83,15 @@ pub fn persona() -> String {
 /// The stable core prefix shared by conversational turns. Runtime-derived data
 /// is deliberately kept out of this system message.
 pub fn core_prompt() -> String {
-    format!("{CORE_SYSTEM}\n\n{}", persona().trim())
+    format!(
+        "{CORE_SYSTEM}\n\n{}\n\n{}",
+        persona().trim(),
+        promptsall::INTERACTION_BOUNDARY,
+    )
+}
+
+pub fn proxy_prompt() -> String {
+    format!("{}\n\n{}", core_prompt(), promptsall::PROXY_MODE_SYSTEM)
 }
 
 pub fn nekora_utc_offset() -> FixedOffset {

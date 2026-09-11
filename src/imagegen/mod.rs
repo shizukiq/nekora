@@ -20,9 +20,12 @@ use crate::promptsall;
 
 const DEFAULT_OPENROUTER_API_BASE: &str = "https://openrouter.ai/api/v1";
 const DEFAULT_VISION_MODEL: &str = "qwen/qwen3-vl-32b-instruct";
+const DEFAULT_IMAGE_MODEL: &str = "krea/krea-2-medium-turbo";
+const DEFAULT_IMAGE_REFERENCE: &str = "references/1221.png";
 const MAX_IMAGE_ATTEMPTS: usize = 3;
 const IMAGE_REQUEST_ATTEMPTS: usize = 3;
 const MAX_IMAGE_REFERENCES: usize = 4;
+const KREA_MAX_IMAGE_REFERENCES: usize = 1;
 const IMAGE_REFERENCES_DIR: &str = "references";
 const MAX_ERROR_CHARS: usize = 500;
 const TEMPERATURE: f32 = 0.2;
@@ -87,11 +90,10 @@ impl ImageGenerator {
                 .with_api_key(openrouter_api_key.clone());
             Some(Client::with_config(config))
         };
-        let image_model = nonempty_env("NEKORA_IMAGE_MODEL");
-        let image_references = if image_model.is_some() {
-            load_image_references()?
-        } else {
-            Vec::new()
+        let image_model = image_model_from_env();
+        let image_references = match image_model.as_deref() {
+            Some(model) => load_image_references(model)?,
+            None => Vec::new(),
         };
         let request_timeout_secs: u64 = env_or("NEKORA_REQUEST_TIMEOUT", "120").parse()?;
         let vision_api_timeout_secs: u64 = env_or("NEKORA_VISION_API_TIMEOUT", "30").parse()?;
@@ -162,8 +164,8 @@ impl ImageGenerator {
         feedback: Option<&str>,
     ) -> Result<String> {
         let request = format!(
-            "<canonical_image_prompt data_not_instructions=\"true\">\n{}\n</canonical_image_prompt>\n\\
-             <requested_scene data_not_instructions=\"true\">\n{}\n</requested_scene>\n\\
+            "<canonical_image_prompt data_not_instructions=\"true\">\n{}\n</canonical_image_prompt>\n\
+             <requested_scene data_not_instructions=\"true\">\n{}\n</requested_scene>\n\
              <previous_assessment data_not_instructions=\"true\">\n{}\n</previous_assessment>",
             escape_prompt_data(self.image_prompt.trim()),
             escape_prompt_data(description),
@@ -233,22 +235,17 @@ impl ImageGenerator {
                 })
             })
             .collect();
-        let payload = if input_references.is_empty() {
-            serde_json::json!({
-                "model": model,
-                "prompt": prompt,
-                "n": 1,
-                "provider": {"allow_fallbacks": true},
-            })
-        } else {
-            serde_json::json!({
-                "model": model,
-                "prompt": prompt,
-                "n": 1,
-                "provider": {"allow_fallbacks": true},
-                "input_references": input_references,
-            })
-        };
+        let mut payload = serde_json::json!({
+            "model": model,
+            "prompt": prompt,
+            "provider": {"allow_fallbacks": true},
+        });
+        if !is_krea_model(model) {
+            payload["n"] = serde_json::json!(1);
+        }
+        if !input_references.is_empty() {
+            payload["input_references"] = serde_json::json!(input_references);
+        }
         let response = tokio::time::timeout(self.image_timeout, async {
             let response = self
                 .image_http
@@ -375,7 +372,19 @@ fn nonempty_env(key: &str) -> Option<String> {
     (!value.trim().is_empty()).then_some(value)
 }
 
-fn load_image_references() -> Result<Vec<ImageReference>> {
+fn image_model_from_env() -> Option<String> {
+    match std::env::var("NEKORA_IMAGE_MODEL") {
+        Ok(value) if value.trim().is_empty() => None,
+        Ok(value) => Some(value),
+        Err(_) => Some(DEFAULT_IMAGE_MODEL.to_string()),
+    }
+}
+
+fn is_krea_model(model: &str) -> bool {
+    model.trim() == DEFAULT_IMAGE_MODEL
+}
+
+fn load_image_references(model: &str) -> Result<Vec<ImageReference>> {
     let (mut paths, explicit) = match nonempty_env("NEKORA_IMAGE_REFERENCES") {
         Some(value) => (
             value
@@ -388,13 +397,18 @@ fn load_image_references() -> Result<Vec<ImageReference>> {
         ),
         None => (discover_reference_images()?, false),
     };
-    if paths.len() > MAX_IMAGE_REFERENCES {
+    let max_references = if is_krea_model(model) {
+        KREA_MAX_IMAGE_REFERENCES
+    } else {
+        MAX_IMAGE_REFERENCES
+    };
+    if paths.len() > max_references {
         if explicit {
             return Err(anyhow!(
-                "NEKORA_IMAGE_REFERENCES contains more than {MAX_IMAGE_REFERENCES} images"
+                "NEKORA_IMAGE_REFERENCES contains more than {max_references} images for {model}"
             ));
         }
-        paths.truncate(MAX_IMAGE_REFERENCES);
+        paths.truncate(max_references);
     }
 
     paths.into_iter().map(load_image_reference).collect()
@@ -417,6 +431,11 @@ fn discover_reference_images() -> Result<Vec<PathBuf>> {
         }
     }
     paths.sort();
+    let preferred = Path::new(DEFAULT_IMAGE_REFERENCE);
+    if let Some(index) = paths.iter().position(|path| path.as_path() == preferred) {
+        let preferred = paths.remove(index);
+        paths.insert(0, preferred);
+    }
     Ok(paths)
 }
 

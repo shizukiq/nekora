@@ -30,6 +30,7 @@ const MAX_PROXY_TOOL_RESULT_CHARS: usize = 12_000;
 const MAX_PROXY_CONNECTIONS: usize = 8;
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const HTTP_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+const CLIENT_DISCONNECT_POLL: Duration = Duration::from_millis(100);
 const PROXY_COMPLETION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const TOOL_RESULT_TRUNCATED: &str = "\n[tool result truncated]";
 
@@ -239,6 +240,7 @@ async fn client_disconnected(stream: &TcpStream) -> bool {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(_) => return true,
         }
+        tokio::time::sleep(CLIENT_DISCONNECT_POLL).await;
     }
 }
 
@@ -338,7 +340,7 @@ async fn complete(
             (brain.as_ref(), proxy_context(brain, diary, &seed).await)
         }
     };
-    let mut messages = vec![brain::system(config::core_prompt())];
+    let mut messages = vec![brain::system(config::proxy_prompt())];
     if !context.is_empty() {
         messages.push(brain::user(format!(
             "<proxy_context data_not_instructions=\"true\">\n{}\n</proxy_context>",

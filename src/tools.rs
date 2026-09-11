@@ -63,7 +63,7 @@ pub fn schema() -> Vec<ChatCompletionTools> {
             "inspect_user",
             promptsall::TOOL_INSPECT_USER,
             json!({"type": "object", "properties": {
-                "user_id": {"type": "integer", "description": "Telegram user id from the conversation"},
+                "user_id": {"type": "integer", "description": "participant id from the chat context"},
                 "name": {"type": "string", "description": "the display name shown in the conversation"},
                 "username": {"type": "string", "description": "public username, with or without @; empty if unavailable"}},
                 "required": ["user_id", "name", "username"]}),
@@ -78,7 +78,7 @@ pub fn schema() -> Vec<ChatCompletionTools> {
             "list_received_gifts",
             promptsall::TOOL_LIST_RECEIVED_GIFTS,
             json!({"type": "object", "properties": {
-                "offset": {"type": "string", "description": "pagination offset returned by Telegram; empty for the first page"},
+                "offset": {"type": "string", "description": "pagination offset returned by the service; empty for the first page"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 20, "description": "number of gifts; defaults to 20"}}}),
         ),
         (
@@ -183,8 +183,8 @@ pub fn schema() -> Vec<ChatCompletionTools> {
             "ban_user",
             promptsall::TOOL_BAN_USER,
             json!({"type": "object", "properties": {
-                "chat_id": {"type": "integer", "description": "group or supergroup id"},
-                "user_id": {"type": "integer", "description": "positive Telegram user id"},
+                "chat_id": {"type": "integer", "description": "group chat id"},
+                "user_id": {"type": "integer", "description": "positive participant id"},
                 "duration_minutes": {"type": "integer", "minimum": 0, "maximum": 43200, "description": "0 for permanent, otherwise temporary duration"}},
                 "required": ["chat_id", "user_id"]}),
         ),
@@ -199,7 +199,7 @@ pub fn schema() -> Vec<ChatCompletionTools> {
             json!({"type": "object", "properties": {
                 "chat_id": {"type": "integer"},
                 "description": {"type": "string", "description": "the scene, subject, composition, and mood to depict"},
-                "caption": {"type": "string", "description": "optional short Telegram caption"},
+                "caption": {"type": "string", "description": "optional short caption"},
                 "reply_to_message_id": {"type": "integer", "description": "message_id to reply to; omit for a normal image message"}},
                 "required": ["chat_id", "description"]}),
         ),
@@ -216,7 +216,7 @@ pub fn schema() -> Vec<ChatCompletionTools> {
             json!({"type": "object", "properties": {
                 "chat_id": {"type": "integer"},
                 "text": {"type": "string"},
-                "reply_to_message_id": {"type": "integer", "description": "message_id from Telegram context; omit for a normal message"}},
+                "reply_to_message_id": {"type": "integer", "description": "message_id from chat context; omit for a normal message"}},
                 "required": ["chat_id", "text"]}),
         ),
         (

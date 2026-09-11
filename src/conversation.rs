@@ -53,7 +53,6 @@ struct Pending {
 struct GroupSession {
     last_message_at: i64,
     considered: bool,
-    participating: bool,
 }
 
 impl Pending {
@@ -95,8 +94,8 @@ pub struct Conversation {
 
 impl Conversation {
     /// Treat continuous group chatter as one social session. Once Nekora has
-    /// considered that session and stayed out, only a direct address should
-    /// pull her back in before the room has gone quiet for a while.
+    /// considered that session, background messages stay in the journal and
+    /// only a direct address pulls her back in before the room goes quiet.
     pub fn should_open_group_turn(
         &mut self,
         chat_id: i64,
@@ -106,14 +105,12 @@ impl Conversation {
         let session = self.group_sessions.entry(chat_id).or_insert(GroupSession {
             last_message_at: now_ms,
             considered: false,
-            participating: false,
         });
         if now_ms.saturating_sub(session.last_message_at) >= GROUP_SESSION_GAP_MS {
             session.considered = false;
-            session.participating = false;
         }
         session.last_message_at = now_ms;
-        addressed_to_account || session.participating || !session.considered
+        addressed_to_account || !session.considered
     }
 
     pub fn note_group_participation(&mut self, chat_id: i64, now_ms: i64) {
@@ -123,11 +120,9 @@ impl Conversation {
         let session = self.group_sessions.entry(chat_id).or_insert(GroupSession {
             last_message_at: now_ms,
             considered: true,
-            participating: true,
         });
         session.last_message_at = now_ms;
         session.considered = true;
-        session.participating = true;
     }
 
     /// Invalidate any reply currently being generated for this chat.
@@ -253,9 +248,6 @@ impl Conversation {
     /// to the normal heartbeat interval instead of spinning or forgetting it.
     pub fn defer_after_silence(&mut self, mut batch: ConversationBatch, now_ms: i64) {
         if batch.chat_id < 0 {
-            if let Some(session) = self.group_sessions.get_mut(&batch.chat_id) {
-                session.participating = false;
-            }
             return;
         }
         batch.silent_reviews = batch.silent_reviews.saturating_add(1);

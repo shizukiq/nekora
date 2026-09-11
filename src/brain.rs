@@ -12,7 +12,7 @@ use async_openai::types::chat::{
     ChatCompletionRequestSystemMessage, ChatCompletionRequestToolMessage,
     ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
     ChatCompletionResponseMessage, ChatCompletionTools, CreateChatCompletionRequestArgs,
-    FunctionCall, ImageUrl,
+    FunctionCall, ImageDetail, ImageUrl,
 };
 use async_openai::Client;
 use base64::Engine;
@@ -43,7 +43,7 @@ const MAX_TOOL_CALLS_PER_TURN: usize = 8;
 const MAX_TOOL_RESULT_CHARS_PER_TURN: usize = 12_000;
 const TOOL_RESULT_TRUNCATED: &str = "\n[tool result truncated]";
 const MAX_COMPLETION_TOKENS: u32 = 2_000;
-const VISION_NUM_PREDICT: i32 = 300;
+const VISION_NUM_PREDICT: i32 = 512;
 const VISION_PROMPT: &str = promptsall::VISION_PROMPT;
 const EMOTION_APPRAISAL_SYSTEM: &str = promptsall::EMOTION_APPRAISAL_SYSTEM;
 
@@ -116,7 +116,7 @@ impl Brain {
                 "OLLAMA_HOST",
                 "http://127.0.0.1:11434",
             )),
-            main_model: env_or("NEKORA_MAIN_MODEL", "deepseek-v4-flash"),
+            main_model: env_or("NEKORA_MAIN_MODEL", "deepseek-flash"),
             vision_model: env_or("NEKORA_VISION_MODEL", DEFAULT_VISION_MODEL),
             mistral_vision_model: env_or("NEKORA_MISTRAL_VISION_MODEL", DEFAULT_MISTRAL_MODEL),
             reasoning_model: Some(env_or("NEKORA_REASONING_MODEL", DEFAULT_MISTRAL_MODEL))
@@ -341,7 +341,10 @@ impl Brain {
             }
             .into(),
             ChatCompletionRequestMessageContentPartImage {
-                image_url: ImageUrl::from(image_url),
+                image_url: ImageUrl {
+                    url: image_url,
+                    detail: (provider == "openrouter").then_some(ImageDetail::High),
+                },
             }
             .into(),
         ];

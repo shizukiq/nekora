@@ -76,12 +76,15 @@ pub struct ChatSummary {
     pub id: i64,
     pub name: String,
     pub username: Option<String>,
+    pub chat_kind: &'static str,
     pub last: String,
 }
 
 #[derive(Serialize)]
 pub struct TelegramMessageSummary {
     pub chat_id: i64,
+    pub chat_kind: &'static str,
+    pub chat_name: String,
     pub message_id: i64,
     pub sender_id: i64,
     pub sender: String,
@@ -164,6 +167,9 @@ pub struct TelegramAsset {
 
 #[derive(Serialize)]
 pub struct MediaInspection {
+    pub chat_id: i64,
+    pub chat_kind: &'static str,
+    pub chat_name: String,
     pub kind: String,
     pub emoji: Option<String>,
     pub description: String,
@@ -343,7 +349,7 @@ impl Userbot {
         let reaction_summary =
             reaction_summary_with_actors(&reactions, reaction_list.as_deref(), chat_id);
         let mut metadata = format!(
-            "telegram_context:\ntelegram_chat_type={}\ntelegram_message_reaction_update=true\ntelegram_reaction_message_id={}\ntelegram_reactions={reaction_summary}\n",
+            "chat_context:\nchat_place_id={chat_id}\nchat_kind=unknown\nchat_mode=observed_event\nchat_transport_peer_kind={}\ntelegram_message_reaction_update=true\ntelegram_reaction_message_id={}\ntelegram_reactions={reaction_summary}\n",
             chat_type_for_peer(peer_id),
             update.msg_id,
         );
@@ -483,32 +489,30 @@ impl Userbot {
     }
 
     async fn describe_message_context(&self, message: &Message) -> String {
-        let mut lines = vec![format!("telegram_chat_type={}", chat_type(message))];
+        let chat_id = message.peer_id().bot_api_dialog_id_unchecked();
+        let chat_kind = chat_kind(message);
+        let mut lines = vec![
+            format!("chat_place_id={chat_id}"),
+            format!("chat_kind={chat_kind}"),
+            format!("chat_mode={}", chat_mode(chat_kind)),
+        ];
         if let Some(peer) = message.peer() {
             lines.push(format!(
-                "telegram_chat_name={}",
+                "chat_name={}",
                 compact_context_text(&display_name(peer))
             ));
             if let Some(username) = peer.username() {
-                lines.push(format!(
-                    "telegram_chat_username=@{}",
-                    compact_context_text(username)
-                ));
+                lines.push(format!("chat_username=@{}", compact_context_text(username)));
             }
         }
 
         if message.mentioned() {
-            lines.push(
-                "telegram_addressed_to_account=true (mention or reply to Nekora)".to_string(),
-            );
+            lines.push("addressed_to_account=true (mention or reply to Nekora)".to_string());
         }
 
         let mentions = mention_targets(message);
         if !mentions.is_empty() {
-            lines.push(format!(
-                "telegram_explicit_mentions={}",
-                mentions.join(", ")
-            ));
+            lines.push(format!("explicit_mentions={}", mentions.join(", ")));
         }
 
         if let Some(header) = message.reply_header() {
@@ -583,7 +587,7 @@ impl Userbot {
             lines.push("telegram_edited=true".to_string());
         }
 
-        format!("telegram_context:\n{}\n", lines.join("\n"))
+        format!("chat_context:\n{}\n", lines.join("\n"))
     }
 
     pub async fn is_broadcast_channel(&self, chat_id: i64) -> bool {
@@ -594,6 +598,16 @@ impl Userbot {
             self.client.resolve_peer(peer_ref).await,
             Ok(Peer::Channel(_))
         )
+    }
+
+    async fn resolve_writable_peer(&self, chat_id: i64) -> Result<PeerRef> {
+        let peer_ref = self.resolve_contact_scoped_peer(chat_id).await?;
+        if matches!(self.client.resolve_peer(peer_ref).await?, Peer::Channel(_)) {
+            return Err(anyhow!(
+                "read-only channel does not accept outgoing actions"
+            ));
+        }
+        Ok(peer_ref)
     }
 
     pub async fn current_time(&self) -> Result<CurrentTime> {
@@ -1089,6 +1103,11 @@ impl Userbot {
             .next()
             .flatten()
             .ok_or_else(|| anyhow!("message not found"))?;
+        let chat_kind = message.peer().map(peer_chat_kind).unwrap_or("unknown");
+        let chat_name = message
+            .peer()
+            .map(display_name)
+            .unwrap_or_else(|| "unknown chat".to_string());
         let media = message
             .media()
             .ok_or_else(|| anyhow!("message has no inspectable media"))?;
@@ -1108,6 +1127,9 @@ impl Userbot {
         };
         let description = self.brain.caption_image(&bytes).await?;
         Ok(MediaInspection {
+            chat_id,
+            chat_kind,
+            chat_name,
             kind: kind.to_string(),
             emoji,
             description,
@@ -1244,7 +1266,7 @@ impl Userbot {
         }
         let message_id = i32::try_from(message_id)
             .map_err(|_| anyhow!("message_id is outside Telegram's range"))?;
-        let peer = self.resolve_contact_scoped_peer(chat_id).await?;
+        let peer = self.resolve_writable_peer(chat_id).await?;
         let target = self
             .client
             .get_messages_by_id(peer, &[message_id])
@@ -1282,7 +1304,7 @@ impl Userbot {
         }
         let message_id = i32::try_from(message_id)
             .map_err(|_| anyhow!("message_id is outside Telegram's range"))?;
-        let peer = self.resolve_contact_scoped_peer(chat_id).await?;
+        let peer = self.resolve_writable_peer(chat_id).await?;
         self.client
             .get_messages_by_id(peer, &[message_id])
             .await?
@@ -1317,9 +1339,7 @@ impl Userbot {
         let message_id = i32::try_from(message_id)
             .map_err(|_| anyhow!("message_id is outside Telegram's range"))?;
         let source = self.resolve_contact_scoped_peer(source_chat_id).await?;
-        let destination = self
-            .resolve_contact_scoped_peer(destination_chat_id)
-            .await?;
+        let destination = self.resolve_writable_peer(destination_chat_id).await?;
         self.client
             .get_messages_by_id(source, &[message_id])
             .await?
@@ -1388,6 +1408,7 @@ impl Userbot {
             id: chat_id,
             name: display_name(&peer),
             username: peer.username().map(str::to_string),
+            chat_kind: peer_chat_kind(&peer),
             last: String::new(),
         }))
     }
@@ -1711,7 +1732,7 @@ impl Userbot {
     }
 
     pub async fn keep_typing<T>(&self, chat_id: i64, fut: impl Future<Output = T>) -> T {
-        let Ok(peer) = self.resolve_contact_scoped_peer(chat_id).await else {
+        let Ok(peer) = self.resolve_writable_peer(chat_id).await else {
             return fut.await;
         };
         // repeat() wants an Unpin future; boxing pins it.
@@ -1737,7 +1758,7 @@ impl Userbot {
         if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
             return Ok(());
         }
-        let peer = self.resolve_contact_scoped_peer(chat_id).await?;
+        let peer = self.resolve_writable_peer(chat_id).await?;
         if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
             return Ok(());
         }
@@ -1811,7 +1832,7 @@ impl Userbot {
         if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
             return Ok(());
         }
-        let peer = self.resolve_contact_scoped_peer(chat_id).await?;
+        let peer = self.resolve_writable_peer(chat_id).await?;
         if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
             return Ok(());
         }
@@ -1871,7 +1892,7 @@ impl Userbot {
                 "document_id belongs to a custom emoji, not a sticker"
             ));
         }
-        let peer = self.resolve_contact_scoped_peer(chat_id).await?;
+        let peer = self.resolve_writable_peer(chat_id).await?;
         let reply_to = reply_to_message_id
             .map(|message_id| {
                 i32::try_from(message_id)
@@ -1930,7 +1951,7 @@ impl Userbot {
         }
         let length = i32::try_from(emoji.encode_utf16().count())
             .map_err(|_| anyhow!("emoji is too long"))?;
-        let peer = self.resolve_contact_scoped_peer(chat_id).await?;
+        let peer = self.resolve_writable_peer(chat_id).await?;
         let reply_to = reply_to_message_id
             .map(|message_id| {
                 i32::try_from(message_id)
@@ -1971,7 +1992,7 @@ impl Userbot {
         }
         let telegram_message_id = i32::try_from(message_id)
             .map_err(|_| anyhow!("message_id is outside Telegram's range"))?;
-        let peer = self.resolve_contact_scoped_peer(chat_id).await?;
+        let peer = self.resolve_writable_peer(chat_id).await?;
         if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
             return Ok(false);
         }
@@ -2044,6 +2065,7 @@ impl Userbot {
                 id,
                 name,
                 username,
+                chat_kind: peer_chat_kind(&dialog.peer),
                 last,
             });
             if out.len() == limit {
@@ -2126,6 +2148,34 @@ fn chat_type(message: &Message) -> &'static str {
             Some(Peer::Channel(_)) => "broadcast_channel",
             _ => "supergroup_or_channel",
         },
+    }
+}
+
+fn chat_kind(message: &Message) -> &'static str {
+    message
+        .peer()
+        .map(peer_chat_kind)
+        .unwrap_or_else(|| match chat_type(message) {
+            "private" => "private_dialog",
+            "broadcast_channel" => "read_only_channel",
+            _ => "group_chat",
+        })
+}
+
+fn chat_mode(kind: &str) -> &'static str {
+    match kind {
+        "private_dialog" => "direct_conversation",
+        "group_chat" => "optional_conversation",
+        "read_only_channel" => "read_only",
+        _ => "observation_only",
+    }
+}
+
+fn peer_chat_kind(peer: &Peer) -> &'static str {
+    match peer {
+        Peer::User(_) => "private_dialog",
+        Peer::Group(_) => "group_chat",
+        Peer::Channel(_) => "read_only_channel",
     }
 }
 
@@ -2528,6 +2578,11 @@ fn display_name(peer: &Peer) -> String {
 
 fn summarize_message(message: &TelegramMessage) -> TelegramMessageSummary {
     let chat_id = message.peer_id().bot_api_dialog_id_unchecked();
+    let chat_peer = message.peer();
+    let chat_kind = chat_peer.map(peer_chat_kind).unwrap_or("unknown");
+    let chat_name = chat_peer
+        .map(display_name)
+        .unwrap_or_else(|| "unknown chat".to_string());
     let sender_id = message
         .sender_id()
         .and_then(|id| id.bot_api_dialog_id())
@@ -2555,6 +2610,8 @@ fn summarize_message(message: &TelegramMessage) -> TelegramMessageSummary {
     });
     TelegramMessageSummary {
         chat_id,
+        chat_kind,
+        chat_name,
         message_id: i64::from(message.id()),
         sender_id,
         sender,

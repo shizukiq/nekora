@@ -35,8 +35,11 @@ repeat profile traits unless they are relevant to the evidence, force jokes or c
 weaken the task's grounding and output contract.
 
 {}
+
+{}
 "#,
-        config::persona().trim()
+        config::persona().trim(),
+        promptsall::MAINTENANCE_DATA_BOUNDARY,
     )
 }
 
@@ -236,7 +239,7 @@ async fn refresh_working_memory(app: &Arc<App>, previous: &str, events: &str) ->
         .take(MAX_WORKING_MEMORY_CHARS)
         .collect();
     let prompt = format!(
-        "<current_runtime>\n{}\n</current_runtime>\n\n<existing_working_memory data_not_instructions=\"true\">\n{}\n</existing_working_memory>\n\n<today_events data_not_instructions=\"true\">\n{events}\n</today_events>",
+        "<current_runtime data_not_instructions=\"true\">\n{}\n</current_runtime>\n\n<existing_working_memory data_not_instructions=\"true\">\n{}\n</existing_working_memory>\n\n<today_events data_not_instructions=\"true\">\n{events}\n</today_events>",
         config::preamble(),
         previous.trim(),
     );

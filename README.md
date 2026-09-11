@@ -61,12 +61,12 @@ proxy for the Mistral API.
 
 | Path                 | Default                                    | Notes                                                                                                        |
 |----------------------|--------------------------------------------|--------------------------------------------------------------------------------------------------------------|
-| Visible conversation | `deepseek-v4-flash`                        | OpenAI-compatible main endpoint; also appraises incoming social events                                       |
+| Visible conversation | `deepseek-flash` (V4.1 Flash)              | OpenAI-compatible main endpoint; also appraises incoming social events                                       |
 | Private maintenance  | `mistral-small-2603` via direct Mistral API  | configurable with `NEKORA_REASONING_MODEL`; an empty value disables it, and request failures fall back to the main model |
 | Embeddings           | `bge-m3` on Ollama                         | fixed local vector space for diary recall                                                                    |
 | Vision               | `qwen/qwen3-vl-32b-instruct` on OpenRouter | OpenRouter first, then `mistral-small-2603` via Mistral, then `qwen2.5vl:3b` locally                       |
 | Web search           | Ollama Cloud, then OpenRouter              | provider order is configurable; results are normalized before entering the turn                              |
-| Image generation     | disabled                                   | requires separate OpenRouter prompt and image models; explicit quality rejections trigger a retry            |
+| Image generation     | `krea/krea-2-medium-turbo`                 | requires an OpenRouter key and prompt model; Krea receives one character reference and quality rejections retry |
 
 If `MISTRAL_API_KEY` is empty, private maintenance uses the main model and vision goes from OpenRouter directly to the
 local fallback. `MISTRAL_API_BASE` defaults to `https://api.mistral.ai/v1`.
@@ -284,7 +284,7 @@ variables win over it.
 | `TELEGRAM_PHONE`               | prompt                              | account phone in international format                                                                     |
 | `DEEPSEEK_API_KEY`             | empty                               | key for the main OpenAI-compatible endpoint                                                               |
 | `NEKORA_MAIN_API_BASE`         | `https://api.deepseek.com/v1`       | main chat endpoint                                                                                        |
-| `NEKORA_MAIN_MODEL`            | `deepseek-v4-flash`                 | main chat model                                                                                           |
+| `NEKORA_MAIN_MODEL`            | `deepseek-flash`                    | main chat model; DeepSeek's direct API alias for V4.1 Flash                                                |
 | `MISTRAL_API_KEY`              | empty                               | direct Mistral key for private maintenance and second vision attempt                                     |
 | `MISTRAL_API_BASE`             | `https://api.mistral.ai/v1`         | direct Mistral OpenAI-compatible endpoint                                                                |
 | `NEKORA_WEB_SEARCH_CHAIN`      | `ollama,openrouter`                 | ordered cloud search providers                                                                            |
@@ -298,9 +298,9 @@ variables win over it.
 | `NEKORA_LOCAL_VISION_MODEL`    | `qwen2.5vl:3b`                      | local Ollama vision fallback                                                                              |
 | `NEKORA_REASONING_MODEL`       | `mistral-small-2603`               | Mistral model for private maintenance and public-result appraisal; set empty to use the main model       |
 | `NEKORA_MISTRAL_VISION_MODEL`  | `mistral-small-2603`               | second cloud model for analyzing incoming images                                                          |
-| `NEKORA_IMAGE_MODEL`           | empty                               | OpenRouter model slug for the dedicated `/images` API                                                     |
-| `NEKORA_IMAGE_PROMPT_MODEL`    | empty                               | OpenRouter chat model that engineers generation prompts                                                   |
-| `NEKORA_IMAGE_REFERENCES`      | image files in `references/` (up to 4) | comma-separated local reference image paths; unset uses supported images in `references/`                |
+| `NEKORA_IMAGE_MODEL`           | `krea/krea-2-medium-turbo`           | OpenRouter model slug for the dedicated `/images` API; set empty to disable image generation              |
+| `NEKORA_IMAGE_PROMPT_MODEL`    | empty                               | required OpenRouter chat model that engineers Krea scene prompts                                          |
+| `NEKORA_IMAGE_REFERENCES`      | `references/1221.png`               | comma-separated local references; Krea accepts one, and unset prefers `references/1221.png`              |
 | `NEKORA_IMAGE_PROMPT`          | built-in Nekora template            | optional full canonical image prompt override; `{SCENE_REQUEST}` is replaced per image                   |
 | `NEKORA_IMAGE_TIMEOUT`         | `300`                               | seconds allowed for one OpenRouter image generation request                                               |
 | `NEKORA_VISION_API_TIMEOUT`    | `30`                                | seconds allowed for each cloud vision attempt before the next provider is tried                           |
@@ -323,11 +323,15 @@ To change her personality, create `prompts/system.md`. When that file is not pre
 used. This file supplies the character profile; the core Telegram, context, and tool workflow remains built in so a
 personality edit cannot remove it accidentally. The prompt is read relative to the current working directory.
 
-Image generation uses the local reference images as OpenRouter `input_references`. The prompt engineer receives the
-canonical image template and returns only the scene-specific `{SCENE_REQUEST}` text; the fixed identity, rendering, and
-anti-drift sections are assembled by Rust. Set `NEKORA_IMAGE_MODEL` and `NEKORA_IMAGE_PROMPT_MODEL` explicitly before
-using `generate_image`, because image requests may incur provider charges. Image generation has its own
-`NEKORA_IMAGE_TIMEOUT` because it can take longer than an ordinary model request.
+Image generation uses local reference images as OpenRouter `input_references`. The default model is Krea 2 Medium Turbo,
+which accepts one reference image per request, so an unset `NEKORA_IMAGE_REFERENCES` prefers the character sheet at
+`references/1221.png`; an explicit list with more than one image is rejected for Krea. The prompt engineer receives the
+canonical image template and returns only a short natural-language scene brief; the fixed identity, rendering, and
+anti-drift sections are assembled by Rust. Set `NEKORA_IMAGE_PROMPT_MODEL` before using `generate_image`, because image
+requests may incur provider charges. Set `NEKORA_IMAGE_MODEL` to another OpenRouter image model when needed; the generic
+path keeps support for up to four discovered references. Image generation has its own `NEKORA_IMAGE_TIMEOUT` because it
+can take longer than an ordinary model request. `references/1221.png` is intentionally a character sheet; if Krea starts
+copying its panels or labels, replace it with a clean single-frame portrait through `NEKORA_IMAGE_REFERENCES`.
 
 Incoming image recognition tries OpenRouter first, then Mistral, and uses local Ollama only when both cloud providers
 fail. The same generator and references are used by `change_avatar`; the tool uploads the result as Nekora's Telegram
