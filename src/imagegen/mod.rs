@@ -21,7 +21,6 @@ use crate::promptsall;
 const DEFAULT_OPENROUTER_API_BASE: &str = "https://openrouter.ai/api/v1";
 const DEFAULT_VISION_MODEL: &str = "qwen/qwen3-vl-32b-instruct";
 const DEFAULT_IMAGE_MODEL: &str = "krea/krea-2-medium-turbo";
-const DEFAULT_IMAGE_REFERENCE: &str = "references/1221.png";
 const MAX_IMAGE_ATTEMPTS: usize = 3;
 const IMAGE_REQUEST_ATTEMPTS: usize = 3;
 const MAX_IMAGE_REFERENCES: usize = 4;
@@ -431,11 +430,6 @@ fn discover_reference_images() -> Result<Vec<PathBuf>> {
         }
     }
     paths.sort();
-    let preferred = Path::new(DEFAULT_IMAGE_REFERENCE);
-    if let Some(index) = paths.iter().position(|path| path.as_path() == preferred) {
-        let preferred = paths.remove(index);
-        paths.insert(0, preferred);
-    }
     Ok(paths)
 }
 

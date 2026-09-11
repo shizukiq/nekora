@@ -300,7 +300,7 @@ variables win over it.
 | `NEKORA_MISTRAL_VISION_MODEL`  | `mistral-small-2603`               | second cloud model for analyzing incoming images                                                          |
 | `NEKORA_IMAGE_MODEL`           | `krea/krea-2-medium-turbo`           | OpenRouter model slug for the dedicated `/images` API; set empty to disable image generation              |
 | `NEKORA_IMAGE_PROMPT_MODEL`    | empty                               | required OpenRouter chat model that engineers Krea scene prompts                                          |
-| `NEKORA_IMAGE_REFERENCES`      | `references/1221.png`               | comma-separated local references; Krea accepts one, and unset prefers `references/1221.png`              |
+| `NEKORA_IMAGE_REFERENCES`      | image files in `references/`       | comma-separated local references; Krea accepts one, and unset scans `references/`                       |
 | `NEKORA_IMAGE_PROMPT`          | built-in Nekora template            | optional full canonical image prompt override; `{SCENE_REQUEST}` is replaced per image                   |
 | `NEKORA_IMAGE_TIMEOUT`         | `300`                               | seconds allowed for one OpenRouter image generation request                                               |
 | `NEKORA_VISION_API_TIMEOUT`    | `30`                                | seconds allowed for each cloud vision attempt before the next provider is tried                           |
@@ -324,14 +324,14 @@ used. This file supplies the character profile; the core Telegram, context, and 
 personality edit cannot remove it accidentally. The prompt is read relative to the current working directory.
 
 Image generation uses local reference images as OpenRouter `input_references`. The default model is Krea 2 Medium Turbo,
-which accepts one reference image per request, so an unset `NEKORA_IMAGE_REFERENCES` prefers the character sheet at
-`references/1221.png`; an explicit list with more than one image is rejected for Krea. The prompt engineer receives the
+which accepts one reference image per request, so an unset `NEKORA_IMAGE_REFERENCES` scans the local `references/` directory
+and uses the first supported image; an explicit list with more than one image is rejected for Krea. The prompt engineer receives the
 canonical image template and returns only a short natural-language scene brief; the fixed identity, rendering, and
 anti-drift sections are assembled by Rust. Set `NEKORA_IMAGE_PROMPT_MODEL` before using `generate_image`, because image
 requests may incur provider charges. Set `NEKORA_IMAGE_MODEL` to another OpenRouter image model when needed; the generic
 path keeps support for up to four discovered references. Image generation has its own `NEKORA_IMAGE_TIMEOUT` because it
-can take longer than an ordinary model request. `references/1221.png` is intentionally a character sheet; if Krea starts
-copying its panels or labels, replace it with a clean single-frame portrait through `NEKORA_IMAGE_REFERENCES`.
+can take longer than an ordinary model request. If the selected reference is a character sheet and Krea starts copying its
+panels or labels, replace it with a clean single-frame portrait through `NEKORA_IMAGE_REFERENCES`.
 
 Incoming image recognition tries OpenRouter first, then Mistral, and uses local Ollama only when both cloud providers
 fail. The same generator and references are used by `change_avatar`; the tool uploads the result as Nekora's Telegram
