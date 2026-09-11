@@ -66,7 +66,7 @@ proxy for the Mistral API.
 | Embeddings           | `bge-m3` on Ollama                         | fixed local vector space for diary recall                                                                    |
 | Vision               | `qwen/qwen3-vl-32b-instruct` on OpenRouter | OpenRouter first, then `mistral-small-2603` via Mistral, then `qwen2.5vl:3b` locally                       |
 | Web search           | Ollama Cloud, then OpenRouter              | provider order is configurable; results are normalized before entering the turn                              |
-| Image generation     | `krea/krea-2-medium-turbo`                 | requires an OpenRouter key and prompt model; Krea receives one character reference and quality rejections retry |
+| Image generation     | `krea/krea-2-medium-turbo`                 | requires an OpenRouter key and prompt model; retries only transient provider requests                    |
 
 If `MISTRAL_API_KEY` is empty, private maintenance uses the main model and vision goes from OpenRouter directly to the
 local fallback. `MISTRAL_API_BASE` defaults to `https://api.mistral.ai/v1`.
@@ -123,7 +123,7 @@ The brain can use only this bounded tool set:
 | `search_messages`       | search one chat or the scoped global message history                                   |
 | `view_messages_around`  | read a bounded slice of history around a known message                                |
 | `get_current_time`      | ask Telegram for its server time in UTC+04:00                                          |
-| `generate_image`        | generate, quality-check, and send one image when explicitly configured                 |
+| `generate_image`        | generate and send one image when explicitly configured                                 |
 | `change_avatar`         | generate and set a new profile photo, including during an autonomous heartbeat tick       |
 | `send_message`          | send a visible Telegram reply or a proactive message; optionally reply to a message ID |
 | `edit_message`          | edit one of Nekora's own messages                                                      |
@@ -333,6 +333,9 @@ path keeps support for up to four discovered references. Image generation has it
 can take longer than an ordinary model request. If the selected reference is a character sheet and Krea starts copying its
 panels or labels, replace it with a clean single-frame portrait through `NEKORA_IMAGE_REFERENCES`.
 
+There is no post-generation vision quality gate: a successful image response is sent as-is. The image request still retries
+temporary transport or provider failures, without generating extra images after a successful response.
+
 Incoming image recognition tries OpenRouter first, then Mistral, and uses local Ollama only when both cloud providers
 fail. The same generator and references are used by `change_avatar`; the tool uploads the result as Nekora's Telegram
 profile photo.
@@ -373,7 +376,7 @@ excludes `.env`, session files, the vault, and build output.
 | `src/websearch/mod.rs`        | provider chain, fallback policy, and normalized results           |
 | `src/websearch/ollama.rs`     | Ollama Cloud Search adapter                                       |
 | `src/websearch/openrouter.rs` | OpenRouter web-search adapter                                     |
-| `src/imagegen/mod.rs`         | OpenRouter image generation, references, and quality gate         |
+| `src/imagegen/mod.rs`         | OpenRouter image generation, prompt assembly, and references     |
 | `src/diary.rs`                | Markdown notes, compact metadata, recall, and confidence          |
 | `src/sleep.rs`                | working-memory refresh and diary consolidation                    |
 | `src/social.rs`               | persistent mood, relationships, social incidents, and intentions |
