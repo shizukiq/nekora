@@ -1,30 +1,29 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 
-use crate::brain::{escape_prompt_data, system, user, ChatPurpose};
-use crate::diary::is_valid_generated_memory;
+use crate::brain::{escape_prompt_data, system, user, Brain, ChatPurpose};
+use crate::diary::{is_valid_generated_memory, Diary};
 use crate::{config, persistence, promptsall, App};
 
-const CONTEXT_DUMP_TRIGGER: usize = 20_000;
+const CONTEXT_DUMP_TRIGGER: usize = 40_000;
 const CHARS_PER_TOKEN: usize = 2;
 const MAX_SLEEP_INPUT_CHARS: usize = 24_000;
 const MAINTENANCE_TRUNCATION_MARKER: &str = "\n[event truncated for maintenance]";
-const MAX_DISTIL_PIECES_PER_PASS: usize = 3;
 const MAX_SLEEP_DIARY_CHARS: usize = 20_000;
-const REFLECTION_CONFIDENCE: f32 = 0.6;
-const MEMORY_CONFIDENCE: f32 = 0.7;
+const REFLECTION_CONFIDENCE: f32 = 0.0;
+const MEMORY_CONFIDENCE: f32 = 0.0;
 const SLEEP_MAX_TIME: Duration = Duration::from_secs(6 * 60 * 60);
 const RELATED_MEMORIES: usize = 10;
-const RECALL_RELATEDNESS: f64 = 0.86;
+const RECALL_RELATEDNESS: f64 = 0.80;
 const WORKING_MEMORY_FILE: &str = "working_memory.md";
 const MAX_WORKING_MEMORY_CHARS: usize = 3_000;
 const MAX_RECALL_QUERY_CHARS: usize = 12_000;
 const MAX_MEMORY_CONTEXT_CHARS: usize = 8_000;
 const MAX_ANCHOR_CONTEXT_CHARS: usize = 2_000;
-const RAG_TIMEOUT: Duration = Duration::from_secs(8);
+pub(crate) const RAG_TIMEOUT: Duration = Duration::from_secs(8);
 
 fn nekora_maintenance_system(instructions: &str) -> String {
     format!(
@@ -66,6 +65,26 @@ pub fn working_memory_context() -> String {
         .collect()
 }
 
+pub async fn refresh_diary_embeddings(
+    brain: &Brain,
+    diary: &Mutex<Diary>,
+    dimensions: usize,
+) -> Result<()> {
+    let missing = {
+        let mut diary = diary.lock().unwrap();
+        diary.reload_if_needed();
+        diary.missing_embeddings(dimensions)
+    };
+    for memory in missing {
+        let vector = brain.embed(&memory.body).await?;
+        diary
+            .lock()
+            .unwrap()
+            .update_embedding(&memory.id, &memory.body, &vector)?;
+    }
+    Ok(())
+}
+
 pub async fn relevant_memories_context(app: &Arc<App>, query: &str) -> String {
     if query.trim().is_empty() {
         return String::new();
@@ -104,14 +123,23 @@ pub async fn relevant_memories_context(app: &Arc<App>, query: &str) -> String {
             .iter()
             .map(|memory| memory.id.clone())
             .collect::<Vec<_>>();
-        match tokio::time::timeout(RAG_TIMEOUT, app.brain.embed(&query)).await {
-            Ok(Ok(vector)) => app.diary.lock().unwrap().recall(
-                &vector,
-                4,
-                RECALL_RELATEDNESS,
-                (remaining / 5).max(1),
-                &anchor_ids,
-            ),
+        let deadline = tokio::time::Instant::now() + RAG_TIMEOUT;
+        match tokio::time::timeout_at(deadline, app.brain.embed(&query)).await {
+            Ok(Ok(vector)) => {
+                // Repair may time out, but the query can still use ready embeddings.
+                let _ = tokio::time::timeout_at(
+                    deadline,
+                    refresh_diary_embeddings(&app.brain, &app.diary, vector.len()),
+                )
+                .await;
+                app.diary.lock().unwrap().recall(
+                    &vector,
+                    10,
+                    RECALL_RELATEDNESS,
+                    remaining,
+                    &anchor_ids,
+                )
+            }
             Ok(Err(_)) | Err(_) => Vec::new(),
         }
     };
@@ -184,10 +212,6 @@ pub async fn consolidate(
     }
 
     // Commit only after every model call succeeds, otherwise the same events can be retried.
-    if let Err(error) = consolidate_diary(app).await {
-        eprintln!("diary consolidation skipped; keeping today's journal: {error:#}");
-        return Ok(short_term);
-    }
     persistence::write_file_atomic(&working_memory_path, &working_memory)?;
     for (memory, vector, confidence) in distilled {
         app.diary
@@ -285,7 +309,6 @@ fn distilled_memory_pieces(output: &str) -> Result<Vec<(String, f32)>> {
     }
     let pieces = split_diary_pieces(output)
         .into_iter()
-        .take(MAX_DISTIL_PIECES_PER_PASS)
         .map(|chunk| memory_piece(&chunk, MEMORY_CONFIDENCE))
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| anyhow!("invalid diary pieces"))?;
@@ -293,12 +316,12 @@ fn distilled_memory_pieces(output: &str) -> Result<Vec<(String, f32)>> {
         .iter()
         .all(|(memory, _)| is_valid_generated_memory(memory))
     {
-        return Err(anyhow!("diary pieces omitted retrieval cues"));
+        return Err(anyhow!("diary pieces were empty or too short"));
     }
     Ok(pieces)
 }
 
-async fn consolidate_diary(app: &Arc<App>) -> Result<()> {
+pub async fn consolidate_diary(app: &Arc<App>) -> Result<()> {
     let deadline = Instant::now() + SLEEP_MAX_TIME;
     let mut excluded = Vec::new();
     while Instant::now() < deadline {
@@ -312,6 +335,7 @@ async fn consolidate_diary(app: &Arc<App>) -> Result<()> {
             continue;
         }
         let vector = app.brain.embed(&target.body).await?;
+        refresh_diary_embeddings(&app.brain, &app.diary, vector.len()).await?;
         let related = app.diary.lock().unwrap().sleep_related(
             &target.id,
             &vector,
@@ -378,9 +402,14 @@ async fn consolidate_diary(app: &Arc<App>) -> Result<()> {
             continue;
         }
 
-        let replacements = split_diary_pieces(&output)
+        let pieces = split_diary_pieces(&output);
+        if pieces.is_empty() {
+            excluded.push(target.id);
+            continue;
+        }
+        let replacements = pieces
             .into_iter()
-            .map(|chunk| memory_piece(&chunk, target.confidence.max(0.0)))
+            .map(|chunk| memory_piece(&chunk, target.confidence))
             .collect::<Option<Vec<_>>>();
         let Some(replacements) = replacements else {
             excluded.push(target.id);
@@ -389,7 +418,7 @@ async fn consolidate_diary(app: &Arc<App>) -> Result<()> {
 
         let replacements = replacements
             .into_iter()
-            .filter(|(_, confidence)| *confidence >= 0.0)
+            .filter(|(_, confidence)| *confidence > -0.99999)
             .collect::<Vec<_>>();
         if replacements
             .iter()
@@ -404,19 +433,22 @@ async fn consolidate_diary(app: &Arc<App>) -> Result<()> {
             continue;
         }
 
-        let mut replacement_ids = Vec::new();
+        // Finish cancellable model work before writing any replacement.
+        let mut embedded = Vec::with_capacity(replacements.len());
         for (memory, confidence) in replacements {
             let vector = app.brain.embed(&memory).await?;
-            if let Some(id) = app.diary.lock().unwrap().remember_replacement(
-                &memory,
-                &vector,
-                confidence,
-                &source_ids,
-            )? {
+            embedded.push((memory, confidence, vector));
+        }
+        let mut replacement_ids = Vec::new();
+        let mut diary = app.diary.lock().unwrap();
+        for (memory, confidence, vector) in embedded {
+            if let Some(id) =
+                diary.remember_replacement(&memory, &vector, confidence, &source_ids)?
+            {
                 replacement_ids.push(id);
             }
         }
-        app.diary.lock().unwrap().retire(&source_ids)?;
+        diary.retire(&source_ids)?;
         excluded.extend(replacement_ids);
         excluded.push(target.id);
     }
@@ -505,7 +537,7 @@ fn split_diary_pieces(output: &str) -> Vec<String> {
     let mut pieces = Vec::new();
     let mut current = String::new();
     for line in output.lines() {
-        if line.trim() == "---" {
+        if matches!(line.trim(), "---" | "- --" | "-- -") {
             if !current.trim().is_empty() {
                 pieces.push(current.trim().to_string());
             }
@@ -534,7 +566,7 @@ fn memory_piece(chunk: &str, fallback_confidence: f32) -> Option<(String, f32)> 
         return None;
     }
     let (confidence, body) = if chunk.starts_with('{') {
-        let end = chunk.find('\n')?;
+        let end = chunk.find('}')? + 1;
         let metadata: Value = serde_json::from_str(&chunk[..end]).ok()?;
         let metadata = metadata.as_object()?;
         if metadata.keys().any(|key| key != "confidence") {

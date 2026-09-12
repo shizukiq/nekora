@@ -355,6 +355,7 @@ async fn complete(
     };
     let mut tool_calls_used = 0usize;
     let mut tool_result_chars = 0usize;
+    let mut receipts = Vec::new();
 
     for _ in 0..MAX_PROXY_TOOL_ITERS {
         let reply = brain
@@ -378,8 +379,14 @@ async fn complete(
                     "Telegram tools are unavailable in standalone proxy mode"
                 ));
             };
-            let mut result =
-                tools::run(app, &call.function.name, &call.function.arguments, None).await;
+            let mut result = tools::run(
+                app,
+                &call.function.name,
+                &call.function.arguments,
+                None,
+                &mut receipts,
+            )
+            .await;
             let remaining = MAX_PROXY_TOOL_RESULT_CHARS.saturating_sub(tool_result_chars);
             if result.chars().count() > remaining {
                 let keep = remaining.saturating_sub(TOOL_RESULT_TRUNCATED.chars().count());
@@ -415,7 +422,12 @@ async fn proxy_context(
     };
     let query: String = query.chars().take(MAX_PROMPT_CHARS).collect();
     if let Ok(vector) = brain.embed(&query).await {
-        let hits = diary.lock().unwrap().recall(&vector, 6, 0.9, 12_000, &[]);
+        let _ = tokio::time::timeout(
+            crate::sleep::RAG_TIMEOUT,
+            crate::sleep::refresh_diary_embeddings(brain, diary, vector.len()),
+        )
+        .await;
+        let hits = diary.lock().unwrap().recall(&vector, 10, 0.80, 12_000, &[]);
         if !hits.is_empty() {
             if let Ok(serialized) = serde_json::to_string(&hits) {
                 context.push_str("\nrelevant diary memories:\n");

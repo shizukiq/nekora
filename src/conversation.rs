@@ -20,11 +20,18 @@ pub struct ConversationMessage {
     pub needs_social_appraisal: bool,
 }
 
+pub struct ToolReceipt {
+    pub name: String,
+    pub arguments: String,
+    pub result: String,
+}
+
 pub struct ConversationBatch {
     pub chat_id: i64,
     pub messages: Vec<ConversationMessage>,
     pub first_message_at: i64,
     pub silent_reviews: u32,
+    pub receipts: Vec<ToolReceipt>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,6 +48,7 @@ impl ReplyGeneration {
 
 struct Pending {
     messages: Vec<ConversationMessage>,
+    receipts: Vec<ToolReceipt>,
     first_message_at: i64,
     last_message_at: i64,
     typing_until: i64,
@@ -165,6 +173,7 @@ impl Conversation {
             *sequence += 1;
             Pending {
                 messages: Vec::new(),
+                receipts: Vec::new(),
                 first_message_at: now_ms,
                 last_message_at: now_ms,
                 typing_until: 0,
@@ -213,6 +222,7 @@ impl Conversation {
             messages: pending.messages,
             first_message_at: pending.first_message_at,
             silent_reviews: pending.silent_reviews,
+            receipts: pending.receipts,
         })
     }
 
@@ -225,6 +235,7 @@ impl Conversation {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 let pending = entry.insert(Pending {
                     messages: batch.messages,
+                    receipts: batch.receipts,
                     first_message_at: batch.first_message_at,
                     last_message_at: now_ms,
                     typing_until: 0,
@@ -237,9 +248,22 @@ impl Conversation {
             std::collections::btree_map::Entry::Occupied(mut entry) => {
                 let pending = entry.get_mut();
                 pending.messages.splice(0..0, batch.messages);
+                pending.receipts.splice(0..0, batch.receipts);
                 pending.first_message_at = pending.first_message_at.min(batch.first_message_at);
                 pending.silent_reviews = pending.silent_reviews.max(batch.silent_reviews);
                 pending.keep_recent_messages();
+            }
+        }
+    }
+
+    /// Retry backend failures without counting them as deliberate silence.
+    pub fn retry_after_error(&mut self, batch: ConversationBatch, now_ms: i64) {
+        let chat_id = batch.chat_id;
+        let has_new_messages = self.pending.contains_key(&chat_id);
+        self.restore(batch, now_ms);
+        if !has_new_messages {
+            if let Some(pending) = self.pending.get_mut(&chat_id) {
+                pending.retry_after = now_ms + PRIVATE_RETRY_MS;
             }
         }
     }
@@ -262,6 +286,7 @@ impl Conversation {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 let pending = entry.insert(Pending {
                     messages: batch.messages,
+                    receipts: batch.receipts,
                     first_message_at: batch.first_message_at,
                     last_message_at: now_ms,
                     typing_until: 0,
@@ -274,6 +299,7 @@ impl Conversation {
             std::collections::btree_map::Entry::Occupied(mut entry) => {
                 let pending = entry.get_mut();
                 pending.messages.splice(0..0, batch.messages);
+                pending.receipts.splice(0..0, batch.receipts);
                 pending.first_message_at = pending.first_message_at.min(batch.first_message_at);
                 pending.silent_reviews = pending.silent_reviews.max(batch.silent_reviews);
                 pending.keep_recent_messages();
@@ -292,6 +318,14 @@ impl Conversation {
 
     pub fn has_pending_private(&self) -> bool {
         self.pending.keys().any(|chat_id| *chat_id > 0)
+    }
+
+    pub fn next_private_deadline(&self, now_ms: i64) -> Option<i64> {
+        self.pending
+            .iter()
+            .filter(|(chat_id, _)| **chat_id > 0)
+            .map(|(_, pending)| pending.deadline(now_ms))
+            .min()
     }
 
     /// When the loop must next wake to check for a ready batch, or -1 when empty.

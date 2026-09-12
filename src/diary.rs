@@ -9,30 +9,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::persistence;
 
-const DEDUP_RELATEDNESS: f64 = 0.95;
+const DEDUP_RELATEDNESS: f64 = 0.97;
 const MAX_LISTED_MEMORIES: usize = 100;
 const MAX_LISTED_MEMORY_CHARS: usize = 12_000;
 const WORKING_MEMORY_FILE: &str = "working_memory";
-const MIN_GENERATED_MEMORY_CHARS: usize = 8;
-const FORBIDDEN_DIARY_LABELS: &[&str] = &[
-    "source",
-    "outcome",
-    "entities",
-    "topics",
-    "emotion / relationship",
-    "emotion",
-    "importance",
-    "uncertainty",
-    "источник",
-    "итог",
-    "сущности",
-    "темы",
-    "эмоция / отношения",
-    "эмоции",
-    "важность",
-    "неопределённость",
-    "неопределенность",
-];
+const MIN_GENERATED_MEMORY_CHARS: usize = 20;
 
 struct DiaryEntry {
     id: String,
@@ -40,19 +21,22 @@ struct DiaryEntry {
     embedding: Vec<f32>,
     confidence: f32,
     usage: u32,
-    last_used: i64,
+    last_used: String,
+    score: f32,
     retired: bool,
 }
 
 #[derive(Deserialize, Serialize)]
 struct StoredMetadata {
     #[serde(default)]
+    score: f32,
+    #[serde(default)]
     confidence: f32,
-    #[serde(default)]
+    #[serde(default, rename = "usageCount", alias = "usage")]
     usage: u32,
+    #[serde(default, rename = "lastUsed", alias = "last_used")]
+    last_used: serde_json::Value,
     #[serde(default)]
-    last_used: i64,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     embedding: Vec<f32>,
     #[serde(default, skip_serializing_if = "is_false")]
     retired: bool,
@@ -94,56 +78,7 @@ pub struct Diary {
 }
 
 pub fn is_valid_generated_memory(memory: &str) -> bool {
-    let mut cue_line = None;
-    for (index, line) in memory.lines().enumerate() {
-        if line.trim_start().starts_with("Retrieval cues:") {
-            cue_line = Some((index, line));
-            break;
-        }
-    }
-    let Some((index, line)) = cue_line else {
-        return false;
-    };
-    let body_chars = memory
-        .lines()
-        .take(index)
-        .flat_map(str::chars)
-        .filter(|character| !character.is_whitespace())
-        .count();
-    if body_chars < MIN_GENERATED_MEMORY_CHARS {
-        return false;
-    }
-    if memory.lines().take(index).any(has_forbidden_diary_label) {
-        return false;
-    }
-    if memory
-        .lines()
-        .skip(index + 1)
-        .any(|line| !line.trim().is_empty())
-    {
-        return false;
-    }
-    let Some((_, cues)) = line.split_once(':') else {
-        return false;
-    };
-    let count = cues
-        .split([',', ';', '|'])
-        .map(str::trim)
-        .filter(|cue| !cue.is_empty())
-        .count();
-    (3..=7).contains(&count)
-}
-
-fn has_forbidden_diary_label(line: &str) -> bool {
-    let line = line
-        .trim_start()
-        .trim_start_matches(['#', '*', '_'])
-        .trim()
-        .to_lowercase();
-    FORBIDDEN_DIARY_LABELS.iter().any(|label| {
-        line.strip_prefix(label)
-            .is_some_and(|rest| rest.trim_start().starts_with(':'))
-    })
+    memory.trim().chars().count() >= MIN_GENERATED_MEMORY_CHARS
 }
 
 fn relatedness(a: &[f32], b: &[f32]) -> f64 {
@@ -184,56 +119,29 @@ impl Diary {
         let Ok(mut files) = persistence::markdown_files(&self.directory) else {
             return false;
         };
+        files.sort();
         self.entries.clear();
         self.counter = 0;
-        files.sort();
-        let old_names: HashSet<String> = files
-            .iter()
-            .filter_map(|path| path.file_stem())
-            .map(|stem| stem.to_string_lossy().into_owned())
-            .collect();
-        let mut used_ids = HashSet::new();
-        let mut pending = Vec::new();
         for path in files {
-            let old_name = path
+            let id = path
                 .file_stem()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned();
-            if old_name == WORKING_MEMORY_FILE {
+            if id == WORKING_MEMORY_FILE {
                 continue;
             }
             let Some(raw) = persistence::read_file(&path) else {
                 continue;
             };
-            let Some(mut entry) = parse_note(&old_name, &raw) else {
+            let Some(mut entry) = parse_note(&id, &raw) else {
                 continue;
             };
             if entry.retired {
-                let _ = fs::remove_file(path);
                 continue;
             }
-            if !is_canonical_id(&entry.id)
-                || used_ids.contains(&entry.id)
-                || (old_names.contains(&entry.id) && entry.id != old_name)
-            {
-                entry.id = self.next_id_avoiding(&used_ids, &old_names);
-            }
-            used_ids.insert(entry.id.clone());
-            let canonical = old_name == entry.id
-                && raw.starts_with("---\n{")
-                && !raw.contains("\n\nRelated notes:\n");
-            pending.push((path, old_name, entry, canonical));
-        }
-        for (path, old_name, entry, canonical) in pending {
-            if !canonical {
-                if write_note_to(&self.directory, &entry).is_err() {
-                    return false;
-                }
-                if old_name != entry.id && fs::remove_file(path).is_err() {
-                    return false;
-                }
-            }
+            // The filename remains the identity, including for legacy notes.
+            entry.id = id;
             self.entries.push(entry);
         }
         true
@@ -332,13 +240,43 @@ impl Diary {
             embedding: embedding.to_vec(),
             confidence,
             usage: 0,
-            last_used: 0,
+            last_used: "never".to_string(),
+            score: 0.0,
             retired: false,
         };
         self.write_note(&entry)?;
         let id = entry.id.clone();
         self.entries.push(entry);
         Ok(Some(id))
+    }
+
+    pub fn missing_embeddings(&self, dimensions: usize) -> Vec<Memory> {
+        self.entries
+            .iter()
+            .filter(|entry| !entry.body.trim().is_empty() && entry.embedding.len() != dimensions)
+            .map(|entry| Memory {
+                id: entry.id.clone(),
+                body: entry.body.clone(),
+                confidence: entry.confidence,
+                usage: entry.usage,
+            })
+            .collect()
+    }
+
+    pub fn update_embedding(&mut self, id: &str, body: &str, embedding: &[f32]) -> io::Result<()> {
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == id && entry.body == body)
+        else {
+            return Ok(());
+        };
+        let previous = std::mem::replace(&mut entry.embedding, embedding.to_vec());
+        if let Err(error) = write_note_to(&self.directory, entry) {
+            entry.embedding = previous;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn recall(
@@ -354,7 +292,12 @@ impl Diary {
             .iter()
             .enumerate()
             .filter(|(_, entry)| !excluded.iter().any(|id| id == &entry.id))
-            .map(|(index, entry)| (index, relatedness(embedding, &entry.embedding)))
+            .map(|(index, entry)| {
+                (
+                    index,
+                    relatedness(embedding, &entry.embedding) + f64::from(entry.confidence) * 0.01,
+                )
+            })
             .filter(|(_, score)| *score >= minimum_relatedness)
             .collect();
         scored.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -393,7 +336,7 @@ impl Diary {
             .enumerate()
             .map(|(index, _)| index)
             .collect();
-        order.sort_by(|&a, &b| self.entries[b].id.cmp(&self.entries[a].id));
+        order.sort_by_key(|&index| std::cmp::Reverse(diary_entry_time(&self.entries[index].id)));
         let requested = if limit == 0 {
             MAX_LISTED_MEMORIES
         } else {
@@ -465,7 +408,9 @@ impl Diary {
         let entry = if rng.random_bool(0.2) {
             active.get(rng.random_range(0..active.len()))?
         } else {
-            active.iter().max_by(|left, right| left.id.cmp(&right.id))?
+            active
+                .iter()
+                .max_by_key(|entry| diary_entry_time(&entry.id))?
         };
         Some(Memory {
             id: entry.id.clone(),
@@ -533,7 +478,7 @@ impl Diary {
     fn touch(&mut self, index: usize, now: i64) {
         let entry = &mut self.entries[index];
         entry.usage = entry.usage.saturating_add(1);
-        entry.last_used = now;
+        entry.last_used = diary_access_time(now);
         let _ = write_note_to(&self.directory, entry);
     }
 
@@ -543,25 +488,12 @@ impl Diary {
 
     fn next_id(&mut self) -> String {
         loop {
-            let id = unix_millis()
-                .saturating_add(u128::from(self.counter))
+            let id = (unix_seconds() as u64)
+                .saturating_add(self.counter)
                 .to_string();
             self.counter += 1;
-            if !self.entries.iter().any(|entry| entry.id == id) {
-                return id;
-            }
-        }
-    }
-
-    fn next_id_avoiding(&mut self, used: &HashSet<String>, old_names: &HashSet<String>) -> String {
-        loop {
-            let id = unix_millis()
-                .saturating_add(u128::from(self.counter))
-                .to_string();
-            self.counter += 1;
-            if !used.contains(&id)
-                && !old_names.contains(&id)
-                && !self.entries.iter().any(|entry| entry.id == id)
+            if !self.entries.iter().any(|entry| entry.id == id)
+                && !note_path(&self.directory, &id).exists()
             {
                 return id;
             }
@@ -573,11 +505,21 @@ fn note_path(directory: &Path, id: &str) -> PathBuf {
     directory.join(format!("{id}.md"))
 }
 
+fn diary_access_time(seconds: i64) -> String {
+    if seconds == 0 {
+        return "never".to_string();
+    }
+    chrono::DateTime::from_timestamp(seconds, 0)
+        .map(|time| time.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| "never".to_string())
+}
+
 fn write_note_to(directory: &Path, entry: &DiaryEntry) -> std::io::Result<()> {
     let metadata = StoredMetadata {
+        score: entry.score,
         confidence: entry.confidence,
         usage: entry.usage,
-        last_used: entry.last_used,
+        last_used: serde_json::Value::String(entry.last_used.clone()),
         embedding: entry.embedding.clone(),
         retired: entry.retired,
     };
@@ -590,37 +532,48 @@ fn write_note_to(directory: &Path, entry: &DiaryEntry) -> std::io::Result<()> {
 }
 
 fn parse_note(id: &str, raw: &str) -> Option<DiaryEntry> {
-    let Some(rest) = raw.strip_prefix("---\n") else {
+    let plain = || {
         let body = raw.trim_matches(|c| c == '\n' || c == '\r').trim();
         if body.is_empty() {
             return None;
         }
-        return Some(DiaryEntry {
+        Some(DiaryEntry {
             id: id.to_string(),
             body: body.to_string(),
             embedding: Vec::new(),
-            confidence: 1.0,
+            confidence: 0.0,
             usage: 0,
-            last_used: 0,
+            last_used: "never".to_string(),
+            score: 0.0,
             retired: false,
-        });
+        })
     };
-    let separator = rest.find("\n---\n")?;
+    let Some(rest) = raw.strip_prefix("---\n") else {
+        return plain();
+    };
+    let Some(separator) = rest.find("\n---\n") else {
+        return plain();
+    };
     let header = &rest[..separator];
-    let raw_body = rest[separator + "\n---\n".len()..]
+    let body = rest[separator + "\n---\n".len()..]
         .trim_matches(|c| c == '\n' || c == '\r')
         .to_string();
-    let body = strip_related_notes(&raw_body);
 
     if header.trim_start().starts_with('{') {
-        let metadata: StoredMetadata = serde_json::from_str(header.trim()).ok()?;
+        let Ok(metadata) = serde_json::from_str::<StoredMetadata>(header.trim()) else {
+            return plain();
+        };
         return Some(DiaryEntry {
             id: id.to_string(),
             body,
             embedding: metadata.embedding,
             confidence: metadata.confidence,
             usage: metadata.usage,
-            last_used: metadata.last_used,
+            last_used: match metadata.last_used {
+                serde_json::Value::String(value) => value,
+                value => diary_access_time(value.as_i64().unwrap_or_default()),
+            },
+            score: metadata.score,
             retired: metadata.retired,
         });
     }
@@ -631,7 +584,8 @@ fn parse_note(id: &str, raw: &str) -> Option<DiaryEntry> {
         embedding: Vec::new(),
         confidence: 0.0,
         usage: 0,
-        last_used: 0,
+        last_used: "never".to_string(),
+        score: 0.0,
         retired: false,
     };
     let mut has_diary_metadata = false;
@@ -652,7 +606,7 @@ fn parse_note(id: &str, raw: &str) -> Option<DiaryEntry> {
             }
             "last_used" => {
                 has_diary_metadata = true;
-                entry.last_used = value.parse().ok()?;
+                entry.last_used = diary_access_time(value.parse().ok()?);
             }
             "retired" => {
                 has_diary_metadata = true;
@@ -668,32 +622,9 @@ fn parse_note(id: &str, raw: &str) -> Option<DiaryEntry> {
         }
     }
     if !has_diary_metadata {
-        entry.confidence = 1.0;
+        return plain();
     }
     Some(entry)
-}
-
-fn strip_related_notes(body: &str) -> String {
-    let Some((body, links)) = body.rsplit_once("\n\nRelated notes:\n") else {
-        return body.to_string();
-    };
-    let lines = links
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
-    if !lines.is_empty()
-        && lines
-            .iter()
-            .all(|line| line.starts_with("- [[") && line.ends_with("]]"))
-    {
-        return body.trim_end().to_string();
-    }
-    body.to_string()
-}
-
-fn is_canonical_id(id: &str) -> bool {
-    !id.is_empty() && id.chars().all(|character| character.is_ascii_digit())
 }
 
 fn is_false(value: &bool) -> bool {
@@ -709,8 +640,14 @@ fn unix_seconds() -> i64 {
     duration_since_epoch().as_secs() as i64
 }
 
-fn unix_millis() -> u128 {
-    duration_since_epoch().as_millis()
+fn diary_entry_time(id: &str) -> u128 {
+    let timestamp = id.parse::<u128>().unwrap_or_default();
+    // Older Nekora notes used milliseconds; keep them in chronological order.
+    if timestamp >= 1_000_000_000_000 {
+        timestamp / 1000
+    } else {
+        timestamp
+    }
 }
 
 fn unix_nanos() -> u128 {

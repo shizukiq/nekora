@@ -253,10 +253,32 @@ impl App {
     pub(crate) async fn wait_for_generation_change(&self, generation: ReplyGeneration) {
         loop {
             let changed = self.generation_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
             if !self.generation_is_current(generation) {
                 return;
             }
             changed.await;
+        }
+    }
+
+    pub(crate) async fn wait_for_private_message(&self) {
+        loop {
+            let incoming = self.wake.notified();
+            tokio::pin!(incoming);
+            incoming.as_mut().enable();
+            let now = self.monotonic_ms();
+            let deadline = self.conversation.lock().unwrap().next_private_deadline(now);
+            match deadline {
+                Some(deadline) if deadline <= now => return,
+                Some(deadline) => {
+                    tokio::select! {
+                        _ = incoming => {},
+                        _ = tokio::time::sleep(Duration::from_millis((deadline - now) as u64)) => {},
+                    }
+                }
+                None => incoming.await,
+            }
         }
     }
 
@@ -583,7 +605,12 @@ fn truncate_chars(value: &str, limit: usize) -> String {
 /// An "act" tick with nobody talking: reflect on an old page, then let her act.
 async fn proactive(app: &Arc<App>) -> Result<()> {
     let recent = app.recent_context(None, &[]);
-    let thought = match sleep::reflect(app, &recent).await {
+    let reflection = tokio::select! {
+        biased;
+        _ = app.wait_for_private_message() => return Ok(()),
+        result = sleep::reflect(app, &recent) => result,
+    };
+    let thought = match reflection {
         Ok(thought) => thought,
         Err(error) => {
             eprintln!("autonomous reflection skipped: {error:#}");
@@ -609,7 +636,13 @@ async fn proactive(app: &Arc<App>) -> Result<()> {
     app.userbot
         .stay_online(
             presence,
-            brain::act(app, &working_memory, vec![brain::user(content)], None),
+            brain::act(
+                app,
+                &working_memory,
+                vec![brain::user(content)],
+                None,
+                &mut Vec::new(),
+            ),
         )
         .await?;
     Ok(())
@@ -622,6 +655,7 @@ async fn respond(
     generation: ReplyGeneration,
     silent_reviews: u32,
     unanswered_for: Duration,
+    receipts: &mut Vec<conversation::ToolReceipt>,
 ) -> Result<brain::TurnOutcome> {
     let chat_id = events[0].chat_id;
 
@@ -677,6 +711,7 @@ async fn respond(
                     &working_memory,
                     vec![brain::user(content)],
                     Some(generation),
+                    receipts,
                 ),
             ),
         )
@@ -733,14 +768,23 @@ async fn heartbeat_loop(app: &Arc<App>) {
 }
 
 async fn run_turn(app: &Arc<App>, batch: Option<ConversationBatch>) -> Result<()> {
+    let conversational = batch.is_some();
+    let mut diary_dumped = false;
     let now = unix_seconds();
     let day = today_str();
-    if app.today.lock().unwrap().day != day {
+    if !conversational && app.today.lock().unwrap().day != day {
         let snapshot = app.today_snapshot();
-        match sleep::consolidate(app, snapshot.lines.clone(), true).await {
+        let result = tokio::select! {
+            biased;
+            _ = app.wait_for_private_message() => return Ok(()),
+            result = sleep::consolidate(app, snapshot.lines.clone(), true) => result,
+        };
+        match result {
             Ok(fresh) if fresh.is_empty() => {
                 if let Err(error) = app.finish_today(&snapshot, Some(day.clone())) {
                     eprintln!("rollover checkpoint failed, continuing with old journal: {error:#}");
+                } else {
+                    diary_dumped = !snapshot.lines.is_empty();
                 }
             }
             Ok(_) => {}
@@ -762,6 +806,7 @@ async fn run_turn(app: &Arc<App>, batch: Option<ConversationBatch>) -> Result<()
                 mut messages,
                 first_message_at,
                 silent_reviews,
+                mut receipts,
             } = batch;
             let mut events = to_events(chat_id, messages.clone());
             app.userbot.mark_read(chat_id).await;
@@ -776,6 +821,7 @@ async fn run_turn(app: &Arc<App>, batch: Option<ConversationBatch>) -> Result<()
                                 messages,
                                 first_message_at,
                                 silent_reviews,
+                                receipts,
                             },
                             app.monotonic_ms(),
                         );
@@ -794,22 +840,31 @@ async fn run_turn(app: &Arc<App>, batch: Option<ConversationBatch>) -> Result<()
                 let unanswered_for = Duration::from_millis(
                     app.monotonic_ms().saturating_sub(first_message_at) as u64,
                 );
-                let outcome =
-                    match respond(app, &events, generation, silent_reviews, unanswered_for).await {
-                        Ok(outcome) => outcome,
-                        Err(error) => {
-                            app.conversation.lock().unwrap().restore(
-                                ConversationBatch {
-                                    chat_id,
-                                    messages,
-                                    first_message_at,
-                                    silent_reviews,
-                                },
-                                app.monotonic_ms(),
-                            );
-                            return Err(error);
-                        }
-                    };
+                let outcome = match respond(
+                    app,
+                    &events,
+                    generation,
+                    silent_reviews,
+                    unanswered_for,
+                    &mut receipts,
+                )
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        app.conversation.lock().unwrap().retry_after_error(
+                            ConversationBatch {
+                                chat_id,
+                                messages,
+                                first_message_at,
+                                silent_reviews,
+                                receipts,
+                            },
+                            app.monotonic_ms(),
+                        );
+                        return Err(error);
+                    }
+                };
                 if !matches!(outcome, brain::TurnOutcome::Superseded) {
                     let unappraised = messages
                         .iter()
@@ -827,6 +882,7 @@ async fn run_turn(app: &Arc<App>, batch: Option<ConversationBatch>) -> Result<()
                     messages,
                     first_message_at,
                     silent_reviews,
+                    receipts,
                 };
                 match outcome {
                     brain::TurnOutcome::VisibleAction => app
@@ -853,13 +909,29 @@ async fn run_turn(app: &Arc<App>, batch: Option<ConversationBatch>) -> Result<()
         }
     }
 
+    if conversational {
+        return Ok(());
+    }
     let snapshot = app.today_snapshot();
-    match sleep::consolidate(app, snapshot.lines.clone(), false).await {
+    let result = tokio::select! {
+        biased;
+        _ = app.wait_for_private_message() => return Ok(()),
+        result = sleep::consolidate(app, snapshot.lines.clone(), false) => result,
+    };
+    match result {
         Ok(fresh) if fresh.is_empty() => {
             app.finish_today(&snapshot, None)?;
+            diary_dumped |= !snapshot.lines.is_empty();
         }
         Ok(_) => {}
         Err(error) => return Err(error),
+    }
+    if diary_dumped {
+        tokio::select! {
+            biased;
+            _ = app.wait_for_private_message() => return Ok(()),
+            result = sleep::consolidate_diary(app) => result?,
+        }
     }
     Ok(())
 }

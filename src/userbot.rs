@@ -39,9 +39,18 @@ const MAX_MEDIA_BYTES: usize = 32 * 1024 * 1024;
 const MAX_CONTEXT_ITEMS: usize = 16;
 const MAX_CONTEXT_TEXT_CHARS: usize = 1_500;
 const REPLY_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+const PRESENCE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 const MAX_BUBBLE_BYTES: usize = 4096;
 const MAX_OUTGOING_CHARS: usize = 12_000;
+
+pub enum MessageDelivery {
+    Complete,
+    Interrupted {
+        delivered: String,
+        remaining: String,
+    },
+}
 const MAX_IMAGE_CAPTION_CHARS: usize = 1_024;
 
 // Escaped before insertion so media text cannot forge its surrounding marker.
@@ -1648,25 +1657,31 @@ impl Userbot {
     }
 
     async fn go_online(&self) {
-        let _ = self
-            .client
-            .invoke(&tl::functions::account::UpdateStatus { offline: false })
-            .await;
+        let _ = tokio::time::timeout(
+            PRESENCE_REQUEST_TIMEOUT,
+            self.client
+                .invoke(&tl::functions::account::UpdateStatus { offline: false }),
+        )
+        .await;
     }
 
     async fn go_offline(&self) {
-        let _ = self
-            .client
-            .invoke(&tl::functions::account::UpdateStatus { offline: true })
-            .await;
+        let _ = tokio::time::timeout(
+            PRESENCE_REQUEST_TIMEOUT,
+            self.client
+                .invoke(&tl::functions::account::UpdateStatus { offline: true }),
+        )
+        .await;
     }
 
     async fn online_refresh_period(&self) -> Option<Duration> {
-        let tl::enums::Config::Config(config) = self
-            .client
-            .invoke(&tl::functions::help::GetConfig {})
-            .await
-            .ok()?;
+        let tl::enums::Config::Config(config) = tokio::time::timeout(
+            PRESENCE_REQUEST_TIMEOUT,
+            self.client.invoke(&tl::functions::help::GetConfig {}),
+        )
+        .await
+        .ok()?
+        .ok()?;
         u64::try_from(config.online_update_period_ms)
             .ok()
             .filter(|period| *period > 0)
@@ -1681,8 +1696,8 @@ impl Userbot {
     pub async fn stay_online<T>(
         self: &Arc<Self>,
         plan: PresencePlan,
-        future: impl Future<Output = T>,
-    ) -> T {
+        future: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
         {
             let mut presence = self.presence.lock().unwrap();
             presence.active_turns += 1;
@@ -1713,7 +1728,7 @@ impl Userbot {
         };
         if let Some(revision) = idle_revision {
             self.go_offline().await;
-            if let Some(delay) = plan.idle_return_after {
+            if let Some(delay) = plan.idle_return_after.filter(|_| output.is_ok()) {
                 let userbot = Arc::clone(self);
                 tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
@@ -1751,16 +1766,25 @@ impl Userbot {
         text: &str,
         reply_to_message_id: Option<i64>,
         generation: Option<ReplyGeneration>,
-    ) -> Result<bool> {
+    ) -> Result<MessageDelivery> {
         if text.contains("DSML") && text.contains("invoke name=\"") {
             return Err(anyhow!("refusing to send internal tool-call markup"));
         }
+        let text: String = text.chars().take(MAX_OUTGOING_CHARS).collect();
+        let mut parts = split_message(&text, MAX_BUBBLE_BYTES);
+        if parts.is_empty() {
+            parts.push(text);
+        }
+        let interrupted = |sent: usize| MessageDelivery::Interrupted {
+            delivered: parts[..sent].join("\n\n"),
+            remaining: parts[sent..].join("\n\n"),
+        };
         if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
-            return Ok(false);
+            return Ok(interrupted(0));
         }
         let peer = self.resolve_writable_peer(chat_id).await?;
         if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
-            return Ok(false);
+            return Ok(interrupted(0));
         }
         let telegram_reply_to_message_id = reply_to_message_id
             .map(|message_id| {
@@ -1768,14 +1792,9 @@ impl Userbot {
                     .map_err(|_| anyhow!("reply_to_message_id is outside Telegram's range"))
             })
             .transpose()?;
-        let text: String = text.chars().take(MAX_OUTGOING_CHARS).collect();
-        let mut parts = split_message(&text, MAX_BUBBLE_BYTES);
-        if parts.is_empty() {
-            parts.push(text);
-        }
         for (index, part) in parts.iter().enumerate() {
             if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
-                return Ok(index > 0);
+                return Ok(interrupted(index));
             }
 
             let _ = self
@@ -1794,12 +1813,12 @@ impl Userbot {
             if !delay_finished
                 || generation.is_some_and(|generation| !app.generation_is_current(generation))
             {
-                return Ok(index > 0);
+                return Ok(interrupted(index));
             }
 
             // Recheck after typing and delay, immediately before the send.
             if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
-                return Ok(index > 0);
+                return Ok(interrupted(index));
             }
             let message = InputMessage::new().text(part.as_str()).reply_to(
                 (index == 0)
@@ -1817,7 +1836,7 @@ impl Userbot {
                 },
             );
         }
-        Ok(true)
+        Ok(MessageDelivery::Complete)
     }
 
     pub async fn send_image(
@@ -1876,9 +1895,9 @@ impl Userbot {
         document_id: i64,
         reply_to_message_id: Option<i64>,
         generation: Option<ReplyGeneration>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
-            return Ok(());
+            return Ok(false);
         }
         let asset = self
             .telegram_assets
@@ -1900,7 +1919,7 @@ impl Userbot {
             })
             .transpose()?;
         if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
-            return Ok(());
+            return Ok(false);
         }
         let message = InputMessage::new()
             .media(tl::types::InputMediaDocument {
@@ -1918,7 +1937,7 @@ impl Userbot {
             &format!("[sticker] {}", asset.emoji),
             reply_to_message_id,
         );
-        Ok(())
+        Ok(true)
     }
 
     pub async fn send_custom_emoji(
@@ -1929,9 +1948,9 @@ impl Userbot {
         emoji: &str,
         reply_to_message_id: Option<i64>,
         generation: Option<ReplyGeneration>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
-            return Ok(());
+            return Ok(false);
         }
         let asset = self
             .telegram_assets
@@ -1959,7 +1978,7 @@ impl Userbot {
             })
             .transpose()?;
         if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
-            return Ok(());
+            return Ok(false);
         }
         let message = InputMessage::new()
             .text(emoji)
@@ -1976,7 +1995,7 @@ impl Userbot {
             &format!("[custom emoji] {emoji}"),
             reply_to_message_id,
         );
-        Ok(())
+        Ok(true)
     }
 
     pub async fn react(

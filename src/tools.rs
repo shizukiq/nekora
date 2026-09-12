@@ -4,15 +4,15 @@ use anyhow::{anyhow, Context, Result};
 use async_openai::types::chat::{ChatCompletionTool, ChatCompletionTools, FunctionObject};
 use serde_json::{json, Value};
 
-use crate::conversation::ReplyGeneration;
+use crate::conversation::{ReplyGeneration, ToolReceipt};
 use crate::diary::{is_valid_generated_memory, MemoryRevision};
 use crate::promptsall;
 use crate::App;
 
-const RECALL_K: usize = 6;
-const RECALL_MIN_RELATEDNESS: f64 = 0.9;
+const RECALL_K: usize = 10;
+const RECALL_MIN_RELATEDNESS: f64 = 0.80;
 const MAX_RECALL_BODY_CHARS: usize = 12_000;
-const DEFAULT_CONFIDENCE: f32 = 0.7;
+const DEFAULT_CONFIDENCE: f32 = 0.0;
 
 pub fn schema() -> Vec<ChatCompletionTools> {
     [
@@ -41,7 +41,7 @@ pub fn schema() -> Vec<ChatCompletionTools> {
             "remember",
             promptsall::TOOL_REMEMBER,
             json!({"type": "object", "properties": {
-                "text": {"type": "string", "description": "a flowing first-person Russian diary page with concrete details and a final Retrieval cues line"}},
+                "text": {"type": "string", "description": "a self-contained Russian Markdown diary memory with source context and retrieval cues"}},
                 "required": ["text"]}),
         ),
         (
@@ -259,7 +259,13 @@ pub fn schema() -> Vec<ChatCompletionTools> {
         ),
     ]
     .into_iter()
-    .map(|(name, description, parameters)| {
+    .map(|(name, description, mut parameters)| {
+        if matches!(name, "send_message" | "send_sticker" | "send_custom_emoji" | "generate_image" | "change_avatar" | "react_to_message") {
+            parameters["properties"]["repeat_request_message_id"] = json!({
+                "type": "integer", "minimum": 1,
+                "description": "Only when a person explicitly requests this action again: the message_id of that new request in the current conversation. Reuse that same id on retries. Omit for ordinary actions and automatic retries; never invent an id."
+            });
+        }
         ChatCompletionTools::Function(ChatCompletionTool {
             function: FunctionObject {
                 name: name.to_string(),
@@ -278,9 +284,57 @@ pub async fn run(
     name: &str,
     args_json: &str,
     generation: Option<ReplyGeneration>,
+    receipts: &mut Vec<ToolReceipt>,
 ) -> String {
+    let arguments = parse_tool_arguments(args_json).ok().map(|mut args| {
+        if args
+            .get("repeat_request_message_id")
+            .is_some_and(Value::is_null)
+        {
+            args.as_object_mut()
+                .unwrap()
+                .remove("repeat_request_message_id");
+        }
+        if let Some(generation) = generation {
+            if matches!(
+                name,
+                "send_message" | "send_sticker" | "send_custom_emoji" | "generate_image"
+            ) {
+                args.as_object_mut()
+                    .unwrap()
+                    .entry("chat_id")
+                    .or_insert(json!(generation.chat_id()));
+            }
+        }
+        args.to_string()
+    });
+    if let Some(receipt) = receipts.iter().find(|receipt| {
+        receipt.name == name && arguments.as_deref() == Some(receipt.arguments.as_str())
+    }) {
+        return format!("Previously executed; not repeated. Previous result: {}. Continue unfinished work. Only if a person explicitly requested this action again, supply repeat_request_message_id from that new request and reuse it on retries.", receipt.result);
+    }
     match dispatch(app, name, args_json, generation).await {
-        Ok(result) => result,
+        Ok(result) => {
+            if matches!(
+                result.as_str(),
+                "sent"
+                    | "sent sticker"
+                    | "sent custom emoji"
+                    | "sent image"
+                    | "changed profile photo"
+                    | "reacted"
+            ) || result.starts_with("partially sent: ")
+            {
+                if let Some(arguments) = arguments {
+                    receipts.push(ToolReceipt {
+                        name: name.to_string(),
+                        arguments,
+                        result: result.clone(),
+                    });
+                }
+            }
+            result
+        }
         Err(error) => {
             // Keep backend details out of the persona, but let a failed image
             // action produce an honest visible explanation instead of silence.
@@ -343,10 +397,20 @@ async fn dispatch(
     generation: Option<ReplyGeneration>,
 ) -> Result<String> {
     let args = parse_tool_arguments(args_json)?;
+    if optional_message_id(&args, "repeat_request_message_id")?.is_some_and(|id| id <= 0) {
+        return Err(anyhow!(
+            "repeat_request_message_id must be a positive message_id"
+        ));
+    }
 
     match name {
         "recall_memory" => {
             let vector = app.brain.embed(str_arg(&args, "query")?).await?;
+            let _ = tokio::time::timeout(
+                crate::sleep::RAG_TIMEOUT,
+                crate::sleep::refresh_diary_embeddings(&app.brain, &app.diary, vector.len()),
+            )
+            .await;
             let hits: Vec<_> = app.diary.lock().unwrap().recall(
                 &vector,
                 RECALL_K,
@@ -380,7 +444,7 @@ async fn dispatch(
             let text = str_arg(&args, "text")?;
             if !is_valid_generated_memory(text) {
                 return Err(anyhow!(
-                    "memory must be diary prose with a complete final Retrieval cues paragraph"
+                    "memory must contain a self-contained Markdown entry, not an empty fragment"
                 ));
             }
             let vector = app.brain.embed(text).await?;
@@ -402,7 +466,7 @@ async fn dispatch(
             let text = str_arg(&args, "text")?;
             if !is_valid_generated_memory(text) {
                 return Err(anyhow!(
-                    "replacement memory must be diary prose with a complete final Retrieval cues paragraph"
+                    "replacement memory must contain a self-contained Markdown entry, not an empty fragment"
                 ));
             }
             let vector = app.brain.embed(text).await?;
@@ -761,12 +825,22 @@ async fn dispatch(
                 .ok_or_else(|| anyhow!("missing chat_id"))?;
             let text = str_arg(&args, "text")?;
             let reply_to_message_id = optional_message_id(&args, "reply_to_message_id")?;
-            let sent = app
+            let delivery = app
                 .userbot
                 .send(app, chat_id, text, reply_to_message_id, generation)
                 .await?;
-            if !sent {
-                return Ok("turn became outdated before the message was sent".to_string());
+            if let crate::userbot::MessageDelivery::Interrupted {
+                delivered,
+                remaining,
+            } = delivery
+            {
+                if delivered.is_empty() {
+                    return Ok("turn became outdated before the message was sent".to_string());
+                }
+                return Ok(format!(
+                    "partially sent: {}",
+                    json!({"delivered": delivered, "remaining": remaining})
+                ));
             }
             if generation.is_none_or(|generation| generation.chat_id() != chat_id) {
                 app.social.lock().unwrap().complete_intention_for(chat_id)?;
@@ -789,10 +863,16 @@ async fn dispatch(
                 .and_then(Value::as_i64)
                 .ok_or_else(|| anyhow!("missing document_id"))?;
             let reply_to_message_id = optional_message_id(&args, "reply_to_message_id")?;
-            app.userbot
+            let sent = app
+                .userbot
                 .send_sticker(app, chat_id, document_id, reply_to_message_id, generation)
                 .await?;
-            Ok("sent sticker".to_string())
+            Ok(if sent {
+                "sent sticker"
+            } else {
+                "turn became outdated before the sticker was sent"
+            }
+            .to_string())
         }
         "send_custom_emoji" => {
             let chat_id = args
@@ -811,7 +891,8 @@ async fn dispatch(
                 .ok_or_else(|| anyhow!("missing document_id"))?;
             let emoji = str_arg(&args, "emoji")?;
             let reply_to_message_id = optional_message_id(&args, "reply_to_message_id")?;
-            app.userbot
+            let sent = app
+                .userbot
                 .send_custom_emoji(
                     app,
                     chat_id,
@@ -821,7 +902,12 @@ async fn dispatch(
                     generation,
                 )
                 .await?;
-            Ok("sent custom emoji".to_string())
+            Ok(if sent {
+                "sent custom emoji"
+            } else {
+                "turn became outdated before the custom emoji was sent"
+            }
+            .to_string())
         }
         "react_to_message" => {
             let chat_id = args
@@ -860,7 +946,7 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
         .ok_or_else(|| anyhow!("missing {key}"))
 }
 
-fn parse_tool_arguments(args_json: &str) -> Result<Value> {
+pub(crate) fn parse_tool_arguments(args_json: &str) -> Result<Value> {
     let trimmed = args_json.trim();
     if trimmed.is_empty() {
         return Ok(json!({}));

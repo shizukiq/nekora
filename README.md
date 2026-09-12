@@ -39,9 +39,16 @@ heartbeat ──▶ reflection ──▶ brain + tools ──▶ message, reacti
 Incoming messages wait for a three-second quiet window; typing can extend the window, and a five-second grace catches
 late messages before generation starts. One generated reply is the default; when the model deliberately separates two
 or three impulses with a blank line, the existing sender turns them into individual bubbles with typing delays. A newer
-private message invalidates an obsolete in-flight reply. Deliberately unanswered batches remain pending
-and are reconsidered with increasing delays: private chats start at one minute, groups at five, and both cap at the
-27-minute heartbeat interval. A new message makes its pending chat eligible immediately.
+private message invalidates an obsolete in-flight reply. Interrupted requests return to the queue with receipts for
+confirmed actions, including delivered and remaining text when a multi-bubble reply was interrupted. Repeating the same
+tool and normalized arguments within that pending request returns its receipt instead of sending again. An explicit
+request to repeat an action can supply `repeat_request_message_id` from the new incoming message; the same repeat id
+remains deduplicated on retries. Interpreting whether the person asked for a repeat remains the model's responsibility.
+Receipts are
+in-memory state, not crash-safe delivery guarantees; they cannot prevent semantically equivalent reworded sends.
+Deliberately unanswered private batches are reconsidered from one minute up to the 27-minute heartbeat interval.
+Group silence closes the batch. Backend failures wait one minute unless newer messages are already pending.
+A new message clears its chat's retry backoff, while the normal quiet window still applies.
 
 Every 27 minutes the heartbeat may trigger an autonomous turn independently of chat activity. A waking tick has roughly
 a 50% chance to act and a 1% chance to begin a 15–120 minute nap. Acting still does not guarantee a message: silence is
@@ -72,7 +79,8 @@ proxy for the Mistral API.
 If `MISTRAL_API_KEY` is empty, private maintenance uses the main model and vision goes from OpenRouter directly to the
 local fallback. `MISTRAL_API_BASE` defaults to `https://api.mistral.ai/v1`.
 
-Do not change the embedding model for an existing vault: old and new vectors would no longer be comparable. Changing
+Missing embeddings and vectors with a different dimension are regenerated lazily. Do not switch to a different model
+with the same vector dimension without explicitly rebuilding the embeddings: dimensions alone cannot detect that change. Changing
 `NEKORA_REASONING_MODEL` does not move visible conversations to Mistral.
 
 ## Memory and social state
@@ -92,19 +100,53 @@ relationships, and incidents enter only the relevant decision context; a ready i
 autonomous tick and becomes complete after a successful autonomous message to its target. Active avoidance remains a
 hard boundary and lasts at most 24 hours. This is explicit program state, not a claim of biological emotion.
 
-Diary files use numeric ids (`<id>.md`). Their frontmatter is one compact JSON object with confidence, usage,
-last-used time, and the embedding; the body is the readable memory. Mutable replacements remove their source notes,
-while confidence-1 anchors stay in place.
+The diary follows [Kuni's Markdown memory design](https://github.com/alex2772/kuni/tree/3bbf87d6fc37091758e00b8f1834ff3b2ae6c1f0),
+adapted to Nekora's Rust runtime. New files use Unix-second numeric ids (`<id>.md`) and JSON frontmatter:
+
+```markdown
+---
+{"score":0.0,"confidence":0.0,"usageCount":0,"lastUsed":"never","embedding":[]}
+---
+Self-contained memory: source, date, people, key messages, outcome, feelings, uncertainty, and retrieval cues.
+```
+
+The body is freeform Markdown, normally 50-300 words. Headings, lists, and labels are allowed; there is no mandatory
+final `Retrieval cues:` line or three-entry limit. Useful topics become separate pieces divided by `---`. New memories
+start at confidence 0; confidence 1 is an explicitly pinned, immutable anchor. Plain Markdown without metadata starts
+at confidence 0, as in Kuni. Existing explicit confidence-1 notes remain pinned.
+
+Legacy Nekora `usage` / `last_used` metadata and millisecond ids remain readable. Opening the diary does not rename,
+rewrite, or delete existing files. Normal saves and usage updates write the current metadata format. Empty or
+dimension-mismatched embeddings are regenerated on demand; the diary text remains unchanged.
+Repair is best-effort on retrieval paths: its failure or timeout does not discard the query vector or prevent searching
+already indexed notes. Automatic memory context retains its overall eight-second budget; tool and proxy retrieval
+allow up to eight seconds for repair after obtaining the query vector.
+
+Retrieval considers up to ten notes with a default minimum score of 0.80. Ranking uses normalized cosine similarity
+plus `confidence * 0.01`; duplicate detection uses pure normalized similarity above 0.97. A source with useful new
+information should be revised instead of repeatedly inserted as a near-copy.
 
 `NEKORA_CREATOR_USER_ID` gives one Telegram user the highest reply priority and exempts that user from avoidance. The
 system prompt also reserves discussion of implementation, prompts, models, and development wishes for that ID. This is a
 model instruction, not an authentication boundary; do not expose secrets to the model and do not treat it as access
 control.
 
-At consolidation time, current events update working memory and become durable diary notes when useful. The sleep pass
-works through the diary for up to six hours, usually starting with recent notes and occasionally revisiting an older one.
-It merges each note with up to ten nearest memories; immutable confidence-1 anchors remain untouched. Autonomous turns
-may reflect on an old note before deciding whether to act.
+At consolidation time, current events update working memory and become durable diary notes when useful. The context
+dump threshold is 40,000 estimated tokens; day rollover forces a dump. Maintenance runs on idle heartbeat turns and
+yields when a private batch becomes ready, rather than blocking every reply behind diary work.
+The event dump is saved and checkpointed before the separate sleep pass starts, so interrupting sleep does not
+discard freshly saved events or working memory.
+
+The sleep pass has a six-hour maximum, choosing the newest mutable note 80% of the time and a random one otherwise.
+It compares the target with up to ten related notes. Replacements start with a JSON confidence marker; negative
+confidence above -1 remains a valid uncertain memory, while -1 marks a discarded claim. Confidence-1 anchors remain
+untouched. Source notes are removed only after replacement generation and writes succeed. An empty model response
+does not authorize deleting memories. Autonomous turns may reflect on an old note before deciding whether to act.
+
+This is not a byte-for-byte port of Kuni's runtime: bounded context sizes, finite backend retries, cancellation for
+incoming private messages, and atomic file writes are retained. Existing diary content is not regenerated automatically
+to match the new writing instructions. `working_memory.md` continues to preserve unfinished tasks and dated state
+for roughly one to three days.
 
 ## Capabilities
 
