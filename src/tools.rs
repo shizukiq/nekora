@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use async_openai::types::chat::{ChatCompletionTool, ChatCompletionTools, FunctionObject};
 use serde_json::{json, Value};
 
@@ -285,14 +285,19 @@ pub async fn run(
             // Keep backend details out of the persona, but let a failed image
             // action produce an honest visible explanation instead of silence.
             eprintln!("tool {name} failed: {error:#}");
-            if matches!(name, "generate_image" | "change_avatar") {
-                image_generation_failure_for_model(name, &error)
-            } else if is_invalid_tool_arguments(&error) {
+            if is_invalid_tool_arguments(&error) {
                 "(tool arguments were invalid JSON; retry the same action with a shorter valid JSON object)".to_string()
+            } else if error
+                .chain()
+                .any(|cause| cause.to_string() == "image generation failed")
+            {
+                image_generation_failure_for_model(name, &error)
+            } else if matches!(name, "generate_image" | "change_avatar") {
+                "(image action failed outside image generation; delivery or profile update was not confirmed. Do not claim success or blame the image provider.)".to_string()
             } else if name == "react_to_message" && is_reaction_invalid(&error) {
                 "(Telegram rejected that reaction; it is unavailable for this chat or message. Do not retry the same reaction.)".to_string()
             } else {
-                "(couldn't do that just now)".to_string()
+                "(action failed; success was not confirmed. Do not invent a cause such as Telegram permissions or claim the action succeeded.)".to_string()
             }
         }
     }
@@ -688,11 +693,6 @@ async fn dispatch(
                 .and_then(Value::as_i64)
                 .or_else(|| generation.map(|generation| generation.chat_id()))
                 .ok_or_else(|| anyhow!("missing chat_id"))?;
-            if generation.is_some_and(|generation| generation.chat_id() != chat_id) {
-                return Err(anyhow!(
-                    "a conversational turn can only answer its current chat"
-                ));
-            }
             let description = str_arg(&args, "description")?;
             let caption = match args.get("caption") {
                 Some(value) => value
@@ -702,13 +702,18 @@ async fn dispatch(
             }
             .to_string();
             let reply_to_message_id = optional_message_id(&args, "reply_to_message_id")?;
-            let image = app.image_generator.generate(description).await?;
+            app.userbot.resolve_writable_peer(chat_id).await?;
+            let image = app
+                .image_generator
+                .generate(description)
+                .await
+                .context("image generation failed")?;
             // Generation may be cancelled when a newer message arrives. Once
             // Telegram sending begins it must finish its own generation checks
             // and record a successful send even if the calling turn is dropped.
             let app = Arc::clone(app);
             let userbot = Arc::clone(&app.userbot);
-            tokio::spawn(async move {
+            let sent = tokio::spawn(async move {
                 userbot
                     .send_image(
                         &app,
@@ -722,11 +727,19 @@ async fn dispatch(
             })
             .await
             .map_err(|error| anyhow!("image sender task failed: {error}"))??;
-            Ok("sent image".to_string())
+            Ok(if sent {
+                "sent image".to_string()
+            } else {
+                "turn became outdated before the image was sent".to_string()
+            })
         }
         "change_avatar" => {
             let description = str_arg(&args, "description")?;
-            let image = app.image_generator.generate(description).await?;
+            let image = app
+                .image_generator
+                .generate(description)
+                .await
+                .context("image generation failed")?;
             if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
                 return Ok("turn became outdated before the avatar was changed".to_string());
             }
@@ -746,17 +759,16 @@ async fn dispatch(
                 .and_then(Value::as_i64)
                 .or_else(|| generation.map(|generation| generation.chat_id()))
                 .ok_or_else(|| anyhow!("missing chat_id"))?;
-            if generation.is_some_and(|generation| generation.chat_id() != chat_id) {
-                return Err(anyhow!(
-                    "a conversational turn can only answer its current chat"
-                ));
-            }
             let text = str_arg(&args, "text")?;
             let reply_to_message_id = optional_message_id(&args, "reply_to_message_id")?;
-            app.userbot
+            let sent = app
+                .userbot
                 .send(app, chat_id, text, reply_to_message_id, generation)
                 .await?;
-            if generation.is_none() {
+            if !sent {
+                return Ok("turn became outdated before the message was sent".to_string());
+            }
+            if generation.is_none_or(|generation| generation.chat_id() != chat_id) {
                 app.social.lock().unwrap().complete_intention_for(chat_id)?;
             }
             Ok("sent".to_string())

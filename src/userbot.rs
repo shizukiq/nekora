@@ -600,7 +600,7 @@ impl Userbot {
         )
     }
 
-    async fn resolve_writable_peer(&self, chat_id: i64) -> Result<PeerRef> {
+    pub(crate) async fn resolve_writable_peer(&self, chat_id: i64) -> Result<PeerRef> {
         let peer_ref = self.resolve_contact_scoped_peer(chat_id).await?;
         if matches!(self.client.resolve_peer(peer_ref).await?, Peer::Channel(_)) {
             return Err(anyhow!(
@@ -1751,16 +1751,16 @@ impl Userbot {
         text: &str,
         reply_to_message_id: Option<i64>,
         generation: Option<ReplyGeneration>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if text.contains("DSML") && text.contains("invoke name=\"") {
             return Err(anyhow!("refusing to send internal tool-call markup"));
         }
         if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
-            return Ok(());
+            return Ok(false);
         }
         let peer = self.resolve_writable_peer(chat_id).await?;
         if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
-            return Ok(());
+            return Ok(false);
         }
         let telegram_reply_to_message_id = reply_to_message_id
             .map(|message_id| {
@@ -1775,7 +1775,7 @@ impl Userbot {
         }
         for (index, part) in parts.iter().enumerate() {
             if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
-                return Ok(());
+                return Ok(index > 0);
             }
 
             let _ = self
@@ -1794,12 +1794,12 @@ impl Userbot {
             if !delay_finished
                 || generation.is_some_and(|generation| !app.generation_is_current(generation))
             {
-                return Ok(());
+                return Ok(index > 0);
             }
 
             // Recheck after typing and delay, immediately before the send.
             if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
-                return Ok(());
+                return Ok(index > 0);
             }
             let message = InputMessage::new().text(part.as_str()).reply_to(
                 (index == 0)
@@ -1817,7 +1817,7 @@ impl Userbot {
                 },
             );
         }
-        Ok(())
+        Ok(true)
     }
 
     pub async fn send_image(
@@ -1828,13 +1828,13 @@ impl Userbot {
         caption: &str,
         reply_to_message_id: Option<i64>,
         generation: Option<ReplyGeneration>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
-            return Ok(());
+            return Ok(false);
         }
         let peer = self.resolve_writable_peer(chat_id).await?;
         if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
-            return Ok(());
+            return Ok(false);
         }
         let telegram_reply_to_message_id = reply_to_message_id
             .map(|message_id| {
@@ -1849,7 +1849,7 @@ impl Userbot {
             .upload_stream(&mut stream, image_len, image.filename)
             .await?;
         if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
-            return Ok(());
+            return Ok(false);
         }
         let caption: String = caption.chars().take(MAX_IMAGE_CAPTION_CHARS).collect();
         let message = InputMessage::new()
@@ -1866,7 +1866,7 @@ impl Userbot {
             },
             reply_to_message_id,
         );
-        Ok(())
+        Ok(true)
     }
 
     pub async fn send_sticker(

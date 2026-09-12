@@ -484,19 +484,22 @@ fn normalize_dsml_tool_calls(reply: &mut ChatCompletionResponseMessage) -> Resul
     let Some(content) = reply.content.as_deref() else {
         return Ok(());
     };
-    if !(content.contains("DSML") && content.contains("invoke name=\"")) {
+
+    if !(content.contains("DSML") && content.contains("invoke name=")) {
         return Ok(());
     }
 
-    let normalized = content.replace('｜', "|");
-    let mut rest = normalized.as_str();
+    let mut rest = content;
     let mut calls = Vec::new();
-    while let Some(invoke) = rest.find("invoke name=\"") {
-        rest = &rest[invoke + "invoke name=\"".len()..];
+    while let Some((invoke, invoke_prefix_len)) = find_dsml_invoke(rest) {
+        rest = &rest[invoke + invoke_prefix_len..];
         let name_end = rest
             .find('"')
             .ok_or_else(|| anyhow!("brain returned malformed DSML tool name"))?;
         let name = &rest[..name_end];
+        if name.is_empty() {
+            return Err(anyhow!("brain returned an empty DSML tool name"));
+        }
         let body_start = rest[name_end..]
             .find('>')
             .ok_or_else(|| anyhow!("brain returned malformed DSML invoke"))?
@@ -508,8 +511,11 @@ fn normalize_dsml_tool_calls(reply: &mut ChatCompletionResponseMessage) -> Resul
         let mut body = &rest[body_start..body_end];
         let mut arguments = serde_json::Map::new();
 
-        while let Some(parameter) = body.find("parameter name=\"") {
-            body = &body[parameter + "parameter name=\"".len()..];
+        while let Some((parameter, parameter_prefix_len)) = find_dsml_parameter(body) {
+            if !body[..parameter].trim().is_empty() {
+                return Err(anyhow!("brain returned unexpected DSML invoke content"));
+            }
+            body = &body[parameter + parameter_prefix_len..];
             let key_end = body
                 .find('"')
                 .ok_or_else(|| anyhow!("brain returned malformed DSML parameter name"))?;
@@ -522,9 +528,9 @@ fn normalize_dsml_tool_calls(reply: &mut ChatCompletionResponseMessage) -> Resul
                 find_dsml_close(&body[tag_end + 1..], "parameter")
                     .map(|(end, len)| (end + tag_end + 1, len))
                     .ok_or_else(|| anyhow!("brain returned unclosed DSML parameter"))?;
-            let tag = &body[key_end..=tag_end];
+            let attributes = &body[key_end..=tag_end];
             let raw = body[tag_end + 1..value_end].trim();
-            let value = if tag.contains("string=\"false\"") {
+            let value = if attributes.contains("string=\"false\"") {
                 serde_json::from_str(raw)
                     .map_err(|_| anyhow!("brain returned invalid DSML JSON"))?
             } else {
@@ -543,6 +549,8 @@ fn normalize_dsml_tool_calls(reply: &mut ChatCompletionResponseMessage) -> Resul
                     .cloned()
                     .ok_or_else(|| anyhow!("DSML arguments must be a JSON object"))?;
             }
+        } else if !body.trim().is_empty() {
+            return Err(anyhow!("brain returned unexpected DSML invoke content"));
         }
 
         calls.push(ChatCompletionMessageToolCalls::Function(
@@ -565,16 +573,66 @@ fn normalize_dsml_tool_calls(reply: &mut ChatCompletionResponseMessage) -> Resul
     Ok(())
 }
 
-fn find_dsml_close(text: &str, tag: &str) -> Option<(usize, usize)> {
+fn find_dsml_invoke(text: &str) -> Option<(usize, usize)> {
     [
-        format!("<|/DSML|{tag}>"),
-        format!("</|DSML|{tag}>"),
-        format!("<|DSML|/{tag}>"),
-        format!("/{tag}>"),
+        "<｜｜DSML｜｜ invoke name=\"",
+        "<｜｜DSML｜｜invoke name=\"",
+        "<||DSML|| invoke name=\"",
+        "<||DSML||invoke name=\"",
+        "<｜DSML｜invoke name=\"",
+        "<|DSML|invoke name=\"",
     ]
     .into_iter()
-    .filter_map(|closing| text.find(&closing).map(|start| (start, closing.len())))
+    .filter_map(|prefix| text.find(prefix).map(|start| (start, prefix.len())))
     .min_by_key(|(start, _)| *start)
+}
+
+fn find_dsml_parameter(text: &str) -> Option<(usize, usize)> {
+    [
+        "<｜｜DSML｜｜ parameter name=\"",
+        "<｜｜DSML｜｜parameter name=\"",
+        "<||DSML|| parameter name=\"",
+        "<||DSML||parameter name=\"",
+        "<｜DSML｜parameter name=\"",
+        "<|DSML|parameter name=\"",
+    ]
+    .into_iter()
+    .filter_map(|prefix| text.find(prefix).map(|start| (start, prefix.len())))
+    .min_by_key(|(start, _)| *start)
+}
+
+fn find_dsml_close(text: &str, tag: &str) -> Option<(usize, usize)> {
+    let closings: &[&str] = match tag {
+        "invoke" => &[
+            "</｜｜DSML｜｜invoke>",
+            "</｜｜DSML｜｜ invoke>",
+            "</｜DSML｜invoke>",
+            "</|DSML|invoke>",
+            "<｜/DSML｜invoke>",
+            "<|/DSML|invoke>",
+            "<｜DSML｜/invoke>",
+            "<|DSML|/invoke>",
+            "</||DSML||invoke>",
+            "</||DSML|| invoke>",
+        ],
+        "parameter" => &[
+            "</｜｜DSML｜｜parameter>",
+            "</｜｜DSML｜｜ parameter>",
+            "</｜DSML｜parameter>",
+            "</|DSML|parameter>",
+            "<｜/DSML｜parameter>",
+            "<|/DSML|parameter>",
+            "<｜DSML｜/parameter>",
+            "<|DSML|/parameter>",
+            "</||DSML||parameter>",
+            "</||DSML|| parameter>",
+        ],
+        _ => return None,
+    };
+    closings
+        .iter()
+        .filter_map(|closing| text.find(*closing).map(|start| (start, closing.len())))
+        .min_by_key(|(start, _)| *start)
 }
 
 pub fn system(content: impl Into<String>) -> ChatCompletionRequestMessage {
@@ -722,7 +780,13 @@ pub async fn act(
                 || (call.function.name == "generate_image" && result == "sent image")
                 || (call.function.name == "change_avatar" && result == "changed profile photo")
             {
-                sent_message = true;
+                let destination =
+                    serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                        .ok()
+                        .and_then(|args| args.get("chat_id").and_then(serde_json::Value::as_i64));
+                sent_message |= generation.is_none_or(|generation| {
+                    destination.is_none_or(|chat_id| chat_id == generation.chat_id())
+                });
                 visible_action = true;
             }
             if call.function.name == "react_to_message" && result == "reacted" {
