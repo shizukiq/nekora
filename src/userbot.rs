@@ -793,10 +793,11 @@ impl Userbot {
         })
     }
 
-    pub async fn change_profile_photo(
+    pub async fn change_avatar(
         &self,
         app: &App,
         image: GeneratedImage,
+        chat_id: Option<i64>,
         generation: Option<ReplyGeneration>,
     ) -> Result<bool> {
         if image.bytes.is_empty() {
@@ -805,6 +806,18 @@ impl Userbot {
         if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
             return Ok(false);
         }
+        let group = match chat_id {
+            Some(chat_id) => {
+                let peer = self.resolve_writable_peer(chat_id).await?;
+                if peer.id.kind() == PeerKind::User {
+                    return Err(anyhow!(
+                        "avatar destination must be a group, not a private dialog"
+                    ));
+                }
+                Some(peer)
+            }
+            None => None,
+        };
 
         let image_len = image.bytes.len();
         let mut stream = Cursor::new(image.bytes);
@@ -816,14 +829,62 @@ impl Userbot {
             return Ok(false);
         }
 
-        self.client
-            .invoke(&tl::functions::photos::UploadProfilePhoto {
-                fallback: false,
-                bot: None,
+        if let Some(group) = group {
+            let photo = tl::types::InputChatUploadedPhoto {
                 file: Some(uploaded.raw),
                 video: None,
                 video_start_ts: None,
                 video_emoji_markup: None,
+            }
+            .into();
+            match group.id.kind() {
+                PeerKind::Chat => {
+                    self.client
+                        .invoke(&tl::functions::messages::EditChatPhoto {
+                            chat_id: group.into(),
+                            photo,
+                        })
+                        .await?;
+                }
+                PeerKind::Channel => {
+                    self.client
+                        .invoke(&tl::functions::channels::EditPhoto {
+                            channel: group.into(),
+                            photo,
+                        })
+                        .await?;
+                }
+                PeerKind::User => return Err(anyhow!("avatar destination must be a group")),
+            }
+        } else {
+            self.client
+                .invoke(&tl::functions::photos::UploadProfilePhoto {
+                    fallback: false,
+                    bot: None,
+                    file: Some(uploaded.raw),
+                    video: None,
+                    video_start_ts: None,
+                    video_emoji_markup: None,
+                })
+                .await?;
+        }
+        Ok(true)
+    }
+
+    pub async fn change_bio(
+        &self,
+        app: &App,
+        about: &str,
+        generation: Option<ReplyGeneration>,
+    ) -> Result<bool> {
+        if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
+            return Ok(false);
+        }
+        self.client
+            .invoke(&tl::functions::account::UpdateProfile {
+                first_name: None,
+                last_name: None,
+                about: Some(about.to_string()),
             })
             .await?;
         Ok(true)

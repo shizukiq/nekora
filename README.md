@@ -114,6 +114,8 @@ The body is freeform Markdown, normally 50-300 words. Headings, lists, and label
 final `Retrieval cues:` line or three-entry limit. Useful topics become separate pieces divided by `---`. New memories
 start at confidence 0; confidence 1 is an explicitly pinned, immutable anchor. Plain Markdown without metadata starts
 at confidence 0, as in Kuni. Existing explicit confidence-1 notes remain pinned.
+Connected messages about the same event should stay together; repeated compliments or reflections alone are not
+new events. Exact text duplicates are rejected even when embeddings are missing.
 
 Legacy Nekora `usage` / `last_used` metadata and millisecond ids remain readable. Opening the diary does not rename,
 rewrite, or delete existing files. Normal saves and usage updates write the current metadata format. Empty or
@@ -138,7 +140,10 @@ The event dump is saved and checkpointed before the separate sleep pass starts, 
 discard freshly saved events or working memory.
 
 The sleep pass has a six-hour maximum, choosing the newest mutable note 80% of the time and a random one otherwise.
-It compares the target with up to ten related notes. Replacements start with a JSON confidence marker; negative
+It compares the target with up to ten notes with normalized cosine similarity of at least 0.80.
+A proposed replacement set with more pieces than its mutable sources is rejected before writing, keeping consolidation
+from fragmenting the collection. This is not a fixed limit on the number of distinct memories.
+Replacements start with a JSON confidence marker; negative
 confidence above -1 remains a valid uncertain memory, while -1 marks a discarded claim. Confidence-1 anchors remain
 untouched. Source notes are removed only after replacement generation and writes succeed. An empty model response
 does not authorize deleting memories. Autonomous turns may reflect on an old note before deciding whether to act.
@@ -167,7 +172,8 @@ The brain can use only this bounded tool set:
 | `view_messages_around`  | read a bounded slice of history around a known message                                |
 | `get_current_time`      | ask Telegram for its server time in UTC+04:00                                          |
 | `generate_image`        | generate and send one image when explicitly configured                                 |
-| `change_avatar`         | generate and set a new profile photo, including during an autonomous heartbeat tick       |
+| `change_avatar`         | generate and install an avatar: own profile by default, group photo with explicit `chat_id` |
+| `change_bio`            | update Nekora's own About text; an empty string clears it, names remain unchanged        |
 | `send_message`          | send a visible Telegram reply or a proactive message; optionally reply to a message ID |
 | `edit_message`          | edit one of Nekora's own messages                                                      |
 | `remove_message`        | delete one exact message after checking its chat and message IDs                      |
@@ -366,6 +372,17 @@ To change her personality, create `prompts/system.md`. When that file is not pre
 used. This file supplies the character profile; the core Telegram, context, and tool workflow remains built in so a
 personality edit cannot remove it accidentally. The prompt is read relative to the current working directory.
 
+The built-in prompts adapt the workflow in [Kuni's prompts](https://github.com/alex2772/kuni/blob/3bbf87d6fc37091758e00b8f1834ff3b2ae6c1f0/src/prompts.cpp):
+runtime instructions, character identity, memory maintenance, and image scene description have separate roles.
+This is an adaptation, not a verbatim copy. Nekora uses her own tool names and receives chat context directly;
+there is no open-chat prerequisite. Relevant personal news can trigger memory recall, while a greeting needs none.
+Replies stay selective and concise without treating every direct follow-up as bait. The default persona is mildly
+scatterbrained: complicated questions invite simple words and brief uncertainty, not an expert lecture after a cute
+opening. Practical actions still require accurate tool use and honest results; the diary keeps factual detail.
+Visible actions use tools; final plain text can also be forwarded by the conversation fallback and is not private reasoning.
+Unlike Kuni's Stable Diffusion pipeline, image engineering produces a natural-language scene, not positive/negative
+JSON or weighted tags. Nekora's appearance remains in the canonical template; only explicit scene requests change it temporarily.
+
 Image generation uses local reference images as OpenRouter `input_references`. The default model is Krea 2 Medium Turbo,
 which accepts one reference image per request, so an unset `NEKORA_IMAGE_REFERENCES` scans the local `references/` directory
 and uses the first supported image; an explicit list with more than one image is rejected for Krea. The prompt engineer receives the
@@ -379,11 +396,23 @@ panels or labels, replace it with a clean single-frame portrait through `NEKORA_
 There is no post-generation vision quality gate: a successful image response is sent as-is. The image request still retries
 temporary transport or provider failures, without generating extra images after a successful response.
 Photo, selfie, and snapshot requests are rendered as one camera-like frame; other requests keep the anime illustration
-style. A multi-panel reference can still leak its layout into an image, so use one clean portrait without text or panels.
+style. The default illustration uses dimensional skin shading and densely layered, individually rendered hair. Black is
+the dominant hair color; broad dark-crimson locks overlap through the lengths rather than forming a percentage-based
+split or an isolated red half. An avatar request changes framing, not the rendering into a flat mascot icon. Scene-specific
+style and background requests still override these defaults.
+A multi-panel reference can still leak its layout into an image, so use one clean portrait without text or panels.
+The template and reference bytes are loaded at startup: restart Nekora to pick up edits. `NEKORA_IMAGE_PROMPT`, when set,
+replaces the built-in template entirely and must be updated separately.
 
 Incoming image recognition tries OpenRouter first, then Mistral, and uses local Ollama only when both cloud providers
 fail. The same generator and references are used by `change_avatar`; the tool uploads the result as Nekora's Telegram
 profile photo.
+With an explicit group `chat_id`, `change_avatar` instead installs the generated image through Telegram's
+[group-photo](https://core.telegram.org/method/messages.editChatPhoto) or
+[supergroup-photo](https://core.telegram.org/method/channels.editPhoto) API. Existing contact scope and read-only
+channel restrictions remain; Telegram enforces edit permissions. A generated message alone is not an avatar update.
+`change_bio` uses [account.updateProfile](https://core.telegram.org/method/account.updateProfile) without changing names;
+Telegram enforces the account's bio length limit. Confirmed avatar and bio changes participate in retry receipts.
 
 Conversational requests keep only the core workflow and character profile in the stable system prefix. Working memory is
 runtime-derived data and follows in its own untrusted user-role block, before per-turn time, recalled diary notes,

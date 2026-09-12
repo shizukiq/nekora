@@ -207,8 +207,16 @@ pub fn schema() -> Vec<ChatCompletionTools> {
             "change_avatar",
             promptsall::TOOL_CHANGE_AVATAR,
             json!({"type": "object", "properties": {
+                "chat_id": {"type": "integer", "description": "Group to update; omit to change Nekora's own profile photo. Never use a private dialog id."},
                 "description": {"type": "string", "description": "the new avatar's subject, mood, colors, and composition"}},
                 "required": ["description"]}),
+        ),
+        (
+            "change_bio",
+            "Change Nekora's own Telegram bio (About), not her name or another person's profile. Inspect the current profile first. Supply the exact public text; an empty string clears it. Never publish private chat details or secrets.",
+            json!({"type": "object", "properties": {
+                "about": {"type": "string", "description": "Exact new bio; Telegram enforces the account's length limit."}},
+                "required": ["about"]}),
         ),
         (
             "send_message",
@@ -260,7 +268,7 @@ pub fn schema() -> Vec<ChatCompletionTools> {
     ]
     .into_iter()
     .map(|(name, description, mut parameters)| {
-        if matches!(name, "send_message" | "send_sticker" | "send_custom_emoji" | "generate_image" | "change_avatar" | "react_to_message") {
+        if matches!(name, "send_message" | "send_sticker" | "send_custom_emoji" | "generate_image" | "change_avatar" | "change_bio" | "react_to_message") {
             parameters["properties"]["repeat_request_message_id"] = json!({
                 "type": "integer", "minimum": 1,
                 "description": "Only when a person explicitly requests this action again: the message_id of that new request in the current conversation. Reuse that same id on retries. Omit for ordinary actions and automatic retries; never invent an id."
@@ -322,6 +330,8 @@ pub async fn run(
                     | "sent custom emoji"
                     | "sent image"
                     | "changed profile photo"
+                    | "changed group photo"
+                    | "changed bio"
                     | "reacted"
             ) || result.starts_with("partially sent: ")
             {
@@ -346,6 +356,12 @@ pub async fn run(
                 .any(|cause| cause.to_string() == "image generation failed")
             {
                 image_generation_failure_for_model(name, &error)
+            } else if name == "change_avatar"
+                && format!("{error:#}").contains("CHAT_ADMIN_REQUIRED")
+            {
+                "(Telegram rejected the avatar change: CHAT_ADMIN_REQUIRED. The account lacks the required group-admin permission; the photo was not changed.)".to_string()
+            } else if name == "change_bio" && format!("{error:#}").contains("ABOUT_TOO_LONG") {
+                "(Telegram rejected the bio because it is too long; shorten it and retry. The bio was not changed.)".to_string()
             } else if matches!(name, "generate_image" | "change_avatar") {
                 "(image action failed outside image generation; delivery or profile update was not confirmed. Do not claim success or blame the image provider.)".to_string()
             } else if name == "react_to_message" && is_reaction_invalid(&error) {
@@ -799,22 +815,51 @@ async fn dispatch(
         }
         "change_avatar" => {
             let description = str_arg(&args, "description")?;
-            let image = app
-                .image_generator
-                .generate(description)
-                .await
-                .context("image generation failed")?;
+            let chat_id = match args.get("chat_id") {
+                None => None,
+                Some(value) => Some(value.as_i64().filter(|id| *id < 0).ok_or_else(|| {
+                    anyhow!("chat_id must be a negative group id; omit it for the own profile")
+                })?),
+            };
+            if let Some(chat_id) = chat_id {
+                app.userbot.resolve_writable_peer(chat_id).await?;
+            }
+            // Generation may be cancelled; the later Telegram mutation must return its receipt.
+            let image = match generation {
+                Some(generation) => tokio::select! {
+                    biased;
+                    _ = app.wait_for_generation_change(generation) => {
+                        return Ok("turn became outdated before the avatar was changed".to_string());
+                    }
+                    image = app.image_generator.generate(description) => image,
+                },
+                None => app.image_generator.generate(description).await,
+            }
+            .context("image generation failed")?;
             if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
                 return Ok("turn became outdated before the avatar was changed".to_string());
             }
             if app
                 .userbot
-                .change_profile_photo(app, image, generation)
+                .change_avatar(app, image, chat_id, generation)
                 .await?
             {
-                Ok("changed profile photo".to_string())
+                if let Some(chat_id) = chat_id {
+                    app.record_outgoing(chat_id, "[changed group photo]", None);
+                    Ok("changed group photo".to_string())
+                } else {
+                    Ok("changed profile photo".to_string())
+                }
             } else {
                 Ok("turn became outdated before the avatar was changed".to_string())
+            }
+        }
+        "change_bio" => {
+            let about = str_arg(&args, "about")?;
+            if app.userbot.change_bio(app, about, generation).await? {
+                Ok("changed bio".to_string())
+            } else {
+                Ok("turn became outdated before the bio was changed".to_string())
             }
         }
         "send_message" => {

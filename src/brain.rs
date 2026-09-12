@@ -769,6 +769,8 @@ pub async fn act(
                             | "send_sticker"
                             | "send_custom_emoji"
                             | "react_to_message"
+                            | "change_avatar"
+                            | "change_bio"
                             | "remember"
                     ) =>
                 {
@@ -800,7 +802,12 @@ pub async fn act(
                 || (call.function.name == "send_sticker" && result == "sent sticker")
                 || (call.function.name == "send_custom_emoji" && result == "sent custom emoji")
                 || (call.function.name == "generate_image" && result == "sent image")
-                || (call.function.name == "change_avatar" && result == "changed profile photo")
+                || (call.function.name == "change_avatar"
+                    && matches!(
+                        result.as_str(),
+                        "changed profile photo" | "changed group photo"
+                    ))
+                || (call.function.name == "change_bio" && result == "changed bio")
             {
                 let destination = tools::parse_tool_arguments(&call.function.arguments)?
                     .get("chat_id")

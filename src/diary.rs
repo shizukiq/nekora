@@ -228,7 +228,8 @@ impl Diary {
     ) -> std::io::Result<Option<String>> {
         let too_close = self.entries.iter().any(|entry| {
             !excluded_ids.iter().any(|id| id == &entry.id)
-                && relatedness(embedding, &entry.embedding) > DEDUP_RELATEDNESS
+                && (entry.body.trim() == body.trim()
+                    || relatedness(embedding, &entry.embedding) > DEDUP_RELATEDNESS)
         });
         if too_close {
             return Ok(None);

@@ -340,7 +340,7 @@ pub async fn consolidate_diary(app: &Arc<App>) -> Result<()> {
             &target.id,
             &vector,
             RELATED_MEMORIES,
-            0.0,
+            RECALL_RELATEDNESS,
             &excluded,
         );
         let mut remaining = MAX_SLEEP_DIARY_CHARS - target_chars;
@@ -420,6 +420,11 @@ pub async fn consolidate_diary(app: &Arc<App>) -> Result<()> {
             .into_iter()
             .filter(|(_, confidence)| *confidence > -0.99999)
             .collect::<Vec<_>>();
+        // Consolidation must not grow the collection by fragmenting existing notes.
+        if replacements.len() > source_ids.len() {
+            excluded.extend(source_ids);
+            continue;
+        }
         if replacements
             .iter()
             .any(|(memory, _)| !is_valid_generated_memory(memory))
