@@ -400,6 +400,9 @@ panels or labels, replace it with a clean single-frame portrait through `NEKORA_
 
 There is no post-generation vision quality gate: a successful image response is sent as-is. The image request still retries
 temporary transport or provider failures, without generating extra images after a successful response.
+The base prompt uses a short comma-separated set of descriptive illustration tags, following the form of examples in
+[Krea's prompting guide](https://github.com/krea-ai/krea-2/blob/main/docs/prompting.md). These are ordinary language,
+not weighted Stable Diffusion syntax; an explicit scene style overrides them. Their effect has not been benchmarked here.
 The default medium is detailed semi-realistic anime; an explicitly requested medium is part of the scene instead of
 appending separate photographic and illustrated instruction blocks to every request. The template requests soft
 dimensional shading and detailed tangled hair. Black is

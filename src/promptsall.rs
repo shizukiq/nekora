@@ -493,12 +493,13 @@ locks interwoven asymmetrically through the bangs and lengths. No permanent deco
 
 Use the reference for her recognizable face, proportions and hairstyle, not its layout or poses.
 Preserve its visual identity instead of redesigning her from this short description.
-The scene below controls clothing, action, expression, setting and framing; an explicit temporary
+The scene below controls clothing, action, barefoot, expression, setting and framing; an explicit temporary
 appearance change applies only to this image.
 
-Default style: detailed semi-realistic anime illustration, dimensional soft shading, finely
-rendered tangled hair and natural light. Use a different medium only when the scene explicitly
-requests it. Keep one continuous scene, without panels, duplicate characters, labels or swatches.
+Default illustration style tags: semi-realistic anime, delicate linework, dimensional soft shading,
+fine hair strands, layered hair depth, natural lighting.
+These are defaults, not additional styles to mix: an explicit medium or style in the scene replaces
+them. Keep one continuous scene, without panels, duplicate characters, labels or swatches.
 
 Scene:
 {SCENE_REQUEST}
