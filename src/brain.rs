@@ -956,7 +956,7 @@ pub async fn act(
 
 async fn finish_without_tools(
     app: &Arc<App>,
-    messages: Vec<ChatCompletionRequestMessage>,
+    mut messages: Vec<ChatCompletionRequestMessage>,
     generation: Option<ReplyGeneration>,
     visible_action: bool,
     receipts: &mut Vec<ToolReceipt>,
@@ -968,6 +968,9 @@ async fn finish_without_tools(
             TurnOutcome::StayedQuiet
         });
     };
+    messages.push(user(
+        "The tool phase is complete. Return one brief plain-text response for the current chat now. Do not call tools and do not return an empty message.",
+    ));
     let reply = tokio::select! {
         biased;
         _ = app.wait_for_generation_change(generation) => return Ok(TurnOutcome::Superseded),
@@ -984,7 +987,20 @@ async fn finish_without_tools(
         .map(str::trim)
         .filter(|text| !text.is_empty())
     else {
-        return if visible_action {
+        if visible_action {
+            return Ok(TurnOutcome::VisibleAction);
+        }
+        let args = serde_json::json!({
+            "chat_id": generation.chat_id(),
+            "text": "я что-то затупила и не договорила. напиши ещё раз, пожалуйста",
+        })
+        .to_string();
+        let sent =
+            tools::run(app, "send_message", &args, Some(generation), receipts).await == "sent";
+        if !sent && !app.generation_is_current(generation) {
+            return Ok(TurnOutcome::Superseded);
+        }
+        return if sent {
             Ok(TurnOutcome::VisibleAction)
         } else {
             Err(anyhow!("brain returned an empty final conversation reply"))
