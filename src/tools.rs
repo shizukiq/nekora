@@ -496,10 +496,10 @@ async fn dispatch(
                     .revise(memory_id, text, &vector, DEFAULT_CONFIDENCE)?;
             Ok(match revision {
                 MemoryRevision::Replaced(id) => {
-                    format!("revised as {id}; previous memory removed")
+                    format!("revised as {id}; previous memory removed; explicitly tell the current interlocutor in the visible reply that their note was corrected and briefly say what changed")
                 }
                 MemoryRevision::AlreadyKnown => {
-                    "correction already existed; previous memory removed".to_string()
+                    "correction already existed; previous memory removed; explicitly tell the current interlocutor in the visible reply that their note was corrected and briefly say what changed".to_string()
                 }
                 MemoryRevision::Unchanged => "memory already says that".to_string(),
                 MemoryRevision::NotEditable => {
