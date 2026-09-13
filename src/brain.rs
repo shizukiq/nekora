@@ -770,6 +770,11 @@ pub async fn act(
             {
                 return Ok(TurnOutcome::Superseded);
             }
+            if !visible_action && generation.is_some() {
+                return Err(anyhow!(
+                    "conversation ended without a delivered reply or explicit stay_quiet"
+                ));
+            }
             return Ok(if visible_action {
                 TurnOutcome::VisibleAction
             } else {
@@ -925,11 +930,11 @@ async fn finish_without_tools(
         .map(str::trim)
         .filter(|text| !text.is_empty())
     else {
-        return Ok(if visible_action {
-            TurnOutcome::VisibleAction
+        return if visible_action {
+            Ok(TurnOutcome::VisibleAction)
         } else {
-            TurnOutcome::StayedQuiet
-        });
+            Err(anyhow!("brain returned an empty final conversation reply"))
+        };
     };
     let args = serde_json::json!({
         "chat_id": generation.chat_id(),
@@ -940,11 +945,10 @@ async fn finish_without_tools(
     if !sent && !app.generation_is_current(generation) {
         return Ok(TurnOutcome::Superseded);
     }
-    Ok(if visible_action || sent {
-        TurnOutcome::VisibleAction
-    } else {
-        TurnOutcome::StayedQuiet
-    })
+    if !visible_action && !sent {
+        return Err(anyhow!("final conversation reply was not delivered"));
+    }
+    Ok(TurnOutcome::VisibleAction)
 }
 
 // Re-file the model's own reply back into the running transcript, carrying its
