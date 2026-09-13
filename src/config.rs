@@ -63,8 +63,29 @@ pub fn creator_user_id() -> Result<Option<i64>> {
     Ok(Some(user_id))
 }
 
+/// The Telegram dialog id whose durable memory is isolated from Nekora's
+/// general diary. Telegram group and supergroup ids are negative.
+pub fn group_chat_id() -> Result<Option<i64>> {
+    let value = env_or("NEKORA_GROUP_ID", "");
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let chat_id = value
+        .parse::<i64>()
+        .map_err(|_| anyhow::anyhow!("NEKORA_GROUP_ID must be a negative Telegram group ID"))?;
+    if chat_id >= 0 {
+        bail!("NEKORA_GROUP_ID must be a negative Telegram group ID");
+    }
+    Ok(Some(chat_id))
+}
+
 pub fn vault_dir() -> PathBuf {
     PathBuf::from(env_or("NEKORA_VAULT", "vault"))
+}
+
+pub fn group_vault_dir(group_chat_id: i64) -> PathBuf {
+    vault_dir().join("groups").join(group_chat_id.to_string())
 }
 
 /// Runtime files are kept beside the diary notes, but outside the note directory

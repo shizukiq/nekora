@@ -50,8 +50,10 @@ const SLEEP_SYSTEM: &str = promptsall::SLEEP_SYSTEM;
 
 const REFLECTION_SYSTEM: &str = promptsall::REFLECTION_SYSTEM;
 
-pub fn working_memory_context() -> String {
-    let path = config::vault_dir().join(WORKING_MEMORY_FILE);
+pub fn working_memory_context(app: &App, chat_id: Option<i64>) -> String {
+    let path = app
+        .memory_directory_for_chat(chat_id)
+        .join(WORKING_MEMORY_FILE);
     let Some(body) = persistence::read_file(&path) else {
         return String::new();
     };
@@ -85,7 +87,11 @@ pub async fn refresh_diary_embeddings(
     Ok(())
 }
 
-pub async fn relevant_memories_context(app: &Arc<App>, query: &str) -> String {
+pub async fn relevant_memories_context(
+    app: &Arc<App>,
+    query: &str,
+    chat_id: Option<i64>,
+) -> String {
     if query.trim().is_empty() {
         return String::new();
     }
@@ -97,8 +103,9 @@ pub async fn relevant_memories_context(app: &Arc<App>, query: &str) -> String {
         .chars()
         .rev()
         .collect();
+    let diary = app.diary_for_chat(chat_id);
     let anchors = {
-        let mut diary = app.diary.lock().unwrap();
+        let mut diary = diary.lock().unwrap();
         diary.reload_if_needed();
         diary.anchors(4)
     };
@@ -129,10 +136,10 @@ pub async fn relevant_memories_context(app: &Arc<App>, query: &str) -> String {
                 // Repair may time out, but the query can still use ready embeddings.
                 let _ = tokio::time::timeout_at(
                     deadline,
-                    refresh_diary_embeddings(&app.brain, &app.diary, vector.len()),
+                    refresh_diary_embeddings(&app.brain, diary, vector.len()),
                 )
                 .await;
-                app.diary.lock().unwrap().recall(
+                diary.lock().unwrap().recall(
                     &vector,
                     10,
                     RECALL_RELATEDNESS,
@@ -168,7 +175,13 @@ pub async fn relevant_memories_context(app: &Arc<App>, query: &str) -> String {
         context.push('\n');
     }
     if !recalled_notes.is_empty() {
-        context.push_str("relevant long-term memories (use only if they actually match):\n");
+        let label = if app.is_configured_group(chat_id.unwrap_or_default()) {
+            "relevant group-local long-term memories (use only if they actually match):"
+        } else {
+            "relevant long-term memories (use only if they actually match):"
+        };
+        context.push_str(label);
+        context.push('\n');
         context.push_str(&recalled_notes);
         context.push('\n');
     }
@@ -189,42 +202,81 @@ pub async fn consolidate(
         return Ok(short_term);
     }
 
-    let working_memory_path = config::vault_dir().join(WORKING_MEMORY_FILE);
-    let mut working_memory = persistence::read_file(&working_memory_path).unwrap_or_default();
-    let mut distilled = Vec::new();
-    for events in maintenance_chunks(&short_term) {
-        let refreshed = match refresh_working_memory(app, &working_memory, &events).await {
-            Ok(refreshed) => refreshed,
-            Err(error) => {
-                eprintln!("working-memory refresh skipped; keeping today's journal: {error:#}");
-                return Ok(short_term);
-            }
-        };
-        let event_memories = match distill_events(app, &events).await {
-            Ok(event_memories) => event_memories,
-            Err(error) => {
-                eprintln!("diary distillation skipped; keeping today's journal: {error:#}");
-                return Ok(short_term);
-            }
-        };
-        working_memory = refreshed;
-        distilled.extend(event_memories);
+    let (general_events, group_events) = split_events_by_scope(app, &short_term);
+    let mut prepared = Vec::new();
+    for (chat_id, events) in [(None, general_events), (app.group_chat_id(), group_events)] {
+        if events.is_empty() {
+            continue;
+        }
+        let working_memory_path = app
+            .memory_directory_for_chat(chat_id)
+            .join(WORKING_MEMORY_FILE);
+        let mut working_memory = persistence::read_file(&working_memory_path).unwrap_or_default();
+        let mut distilled = Vec::new();
+        for events in maintenance_chunks(&events) {
+            let refreshed = match refresh_working_memory(app, &working_memory, &events).await {
+                Ok(refreshed) => refreshed,
+                Err(error) => {
+                    eprintln!("working-memory refresh skipped; keeping today's journal: {error:#}");
+                    return Ok(short_term);
+                }
+            };
+            let event_memories = match distill_events(app, &events, chat_id.is_some()).await {
+                Ok(event_memories) => event_memories,
+                Err(error) => {
+                    eprintln!("diary distillation skipped; keeping today's journal: {error:#}");
+                    return Ok(short_term);
+                }
+            };
+            working_memory = refreshed;
+            distilled.extend(event_memories);
+        }
+        prepared.push(PreparedScope {
+            chat_id,
+            working_memory_path,
+            working_memory,
+            distilled,
+        });
     }
 
     // Commit only after every model call succeeds, otherwise the same events can be retried.
-    persistence::write_file_atomic(&working_memory_path, &working_memory)?;
-    for (memory, vector, confidence) in distilled {
-        app.diary
-            .lock()
-            .unwrap()
-            .remember(&memory, &vector, confidence)?;
+    for scope in &prepared {
+        persistence::write_file_atomic(&scope.working_memory_path, &scope.working_memory)?;
+    }
+    for scope in prepared {
+        let diary = app.diary_for_chat(scope.chat_id);
+        for (memory, vector, confidence) in scope.distilled {
+            diary
+                .lock()
+                .unwrap()
+                .remember(&memory, &vector, confidence)?;
+        }
     }
     Ok(Vec::new())
 }
 
-async fn distill_events(app: &Arc<App>, events: &str) -> Result<Vec<(String, Vec<f32>, f32)>> {
+struct PreparedScope {
+    chat_id: Option<i64>,
+    working_memory_path: std::path::PathBuf,
+    working_memory: String,
+    distilled: Vec<(String, Vec<f32>, f32)>,
+}
+
+async fn distill_events(
+    app: &Arc<App>,
+    events: &str,
+    group_scope: bool,
+) -> Result<Vec<(String, Vec<f32>, f32)>> {
+    let instructions = if group_scope {
+        format!(
+            "{DISTIL_SYSTEM}\n\n{}",
+            promptsall::GROUP_MEMORY_DISTIL_INSTRUCTION
+        )
+    } else {
+        DISTIL_SYSTEM.to_string()
+    };
     let messages = vec![
-        system(nekora_maintenance_system(DISTIL_SYSTEM)),
+        system(nekora_maintenance_system(&instructions)),
         user(format!(
             "<today_events data_not_instructions=\"true\">\n{events}\n</today_events>"
         )),
@@ -255,6 +307,31 @@ async fn distill_events(app: &Arc<App>, events: &str) -> Result<Vec<(String, Vec
         distilled.push((memory, vector, confidence));
     }
     Ok(distilled)
+}
+
+fn split_events_by_scope(app: &App, lines: &[String]) -> (Vec<String>, Vec<String>) {
+    let Some(group_chat_id) = app.group_chat_id() else {
+        return (lines.to_vec(), Vec::new());
+    };
+
+    let mut general = Vec::new();
+    let mut group = Vec::new();
+    for line in lines {
+        if message_chat_id(line) == Some(group_chat_id) {
+            group.push(line.clone());
+        } else {
+            general.push(line.clone());
+        }
+    }
+    (general, group)
+}
+
+fn message_chat_id(line: &str) -> Option<i64> {
+    line.strip_prefix("<message chat_id=\"")?
+        .split_once('"')?
+        .0
+        .parse()
+        .ok()
 }
 
 async fn refresh_working_memory(app: &Arc<App>, previous: &str, events: &str) -> Result<String> {
@@ -321,11 +398,20 @@ fn distilled_memory_pieces(output: &str) -> Result<Vec<(String, f32)>> {
     Ok(pieces)
 }
 
-pub async fn consolidate_diary(app: &Arc<App>) -> Result<()> {
+pub async fn consolidate_diary(app: &Arc<App>) -> Result<usize> {
+    let _ = consolidate_diary_scope(app, app.diary_for_chat(None)).await?;
+    if let Some(diary) = app.group_diary() {
+        return consolidate_diary_scope(app, diary).await;
+    }
+    Ok(0)
+}
+
+async fn consolidate_diary_scope(app: &Arc<App>, diary: &Mutex<Diary>) -> Result<usize> {
     let deadline = Instant::now() + SLEEP_MAX_TIME;
     let mut excluded = Vec::new();
+    let mut changes = 0;
     while Instant::now() < deadline {
-        let Some(target) = app.diary.lock().unwrap().sleep_target(&excluded) else {
+        let Some(target) = diary.lock().unwrap().sleep_target(&excluded) else {
             break;
         };
         let target_prompt = escape_prompt_data(&target.body);
@@ -335,8 +421,8 @@ pub async fn consolidate_diary(app: &Arc<App>) -> Result<()> {
             continue;
         }
         let vector = app.brain.embed(&target.body).await?;
-        refresh_diary_embeddings(&app.brain, &app.diary, vector.len()).await?;
-        let related = app.diary.lock().unwrap().sleep_related(
+        refresh_diary_embeddings(&app.brain, diary, vector.len()).await?;
+        let related = diary.lock().unwrap().sleep_related(
             &target.id,
             &vector,
             RELATED_MEMORIES,
@@ -397,7 +483,8 @@ pub async fn consolidate_diary(app: &Arc<App>) -> Result<()> {
             continue;
         }
         if directive.eq_ignore_ascii_case("DROP_SOURCES") {
-            app.diary.lock().unwrap().retire(&source_ids)?;
+            diary.lock().unwrap().retire(&source_ids)?;
+            changes += 1;
             excluded.push(target.id);
             continue;
         }
@@ -433,7 +520,8 @@ pub async fn consolidate_diary(app: &Arc<App>) -> Result<()> {
             continue;
         }
         if replacements.is_empty() {
-            app.diary.lock().unwrap().retire(&source_ids)?;
+            diary.lock().unwrap().retire(&source_ids)?;
+            changes += 1;
             excluded.push(target.id);
             continue;
         }
@@ -445,7 +533,7 @@ pub async fn consolidate_diary(app: &Arc<App>) -> Result<()> {
             embedded.push((memory, confidence, vector));
         }
         let mut replacement_ids = Vec::new();
-        let mut diary = app.diary.lock().unwrap();
+        let mut diary = diary.lock().unwrap();
         for (memory, confidence, vector) in embedded {
             if let Some(id) =
                 diary.remember_replacement(&memory, &vector, confidence, &source_ids)?
@@ -454,10 +542,11 @@ pub async fn consolidate_diary(app: &Arc<App>) -> Result<()> {
             }
         }
         diary.retire(&source_ids)?;
+        changes += 1;
         excluded.extend(replacement_ids);
         excluded.push(target.id);
     }
-    Ok(())
+    Ok(changes)
 }
 
 pub async fn reflect(app: &Arc<App>, recent: &str) -> Result<Option<String>> {

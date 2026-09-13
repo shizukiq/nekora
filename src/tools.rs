@@ -422,12 +422,13 @@ async fn dispatch(
     match name {
         "recall_memory" => {
             let vector = app.brain.embed(str_arg(&args, "query")?).await?;
+            let diary = app.diary_for_chat(generation.map(|generation| generation.chat_id()));
             let _ = tokio::time::timeout(
                 crate::sleep::RAG_TIMEOUT,
-                crate::sleep::refresh_diary_embeddings(&app.brain, &app.diary, vector.len()),
+                crate::sleep::refresh_diary_embeddings(&app.brain, diary, vector.len()),
             )
             .await;
-            let hits: Vec<_> = app.diary.lock().unwrap().recall(
+            let hits: Vec<_> = diary.lock().unwrap().recall(
                 &vector,
                 RECALL_K,
                 RECALL_MIN_RELATEDNESS,
@@ -453,7 +454,8 @@ async fn dispatch(
         }
         "list_memories" => {
             let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(0) as usize;
-            let listing = app.diary.lock().unwrap().list_memories(limit);
+            let diary = app.diary_for_chat(generation.map(|generation| generation.chat_id()));
+            let listing = diary.lock().unwrap().list_memories(limit);
             Ok(serde_json::to_string(&listing)?)
         }
         "remember" => {
@@ -467,8 +469,8 @@ async fn dispatch(
             if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
                 return Ok("turn became outdated before the memory was stored".to_string());
             }
-            let stored = app
-                .diary
+            let diary = app.diary_for_chat(generation.map(|generation| generation.chat_id()));
+            let stored = diary
                 .lock()
                 .unwrap()
                 .remember(text, &vector, DEFAULT_CONFIDENCE)?;
@@ -489,17 +491,18 @@ async fn dispatch(
             if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
                 return Ok("turn became outdated before the memory was revised".to_string());
             }
+            let diary = app.diary_for_chat(generation.map(|generation| generation.chat_id()));
             let revision =
-                app.diary
+                diary
                     .lock()
                     .unwrap()
                     .revise(memory_id, text, &vector, DEFAULT_CONFIDENCE)?;
             Ok(match revision {
                 MemoryRevision::Replaced(id) => {
-                    format!("revised as {id}; previous memory removed")
+                    format!("revised as {id}; previous memory removed; explicitly tell the affected person in the visible reply that this memory was corrected and briefly say what changed")
                 }
                 MemoryRevision::AlreadyKnown => {
-                    "correction already existed; previous memory removed".to_string()
+                    "correction already existed; previous memory removed; explicitly tell the affected person in the visible reply that this memory was corrected and briefly say what changed".to_string()
                 }
                 MemoryRevision::Unchanged => "memory already says that".to_string(),
                 MemoryRevision::NotEditable => {
@@ -512,8 +515,8 @@ async fn dispatch(
             if generation.is_some_and(|generation| !app.generation_is_current(generation)) {
                 return Ok("turn became outdated before the memory was removed".to_string());
             }
-            let retired = app
-                .diary
+            let diary = app.diary_for_chat(generation.map(|generation| generation.chat_id()));
+            let retired = diary
                 .lock()
                 .unwrap()
                 .retire(std::slice::from_ref(&memory_id))?;
