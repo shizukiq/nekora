@@ -157,8 +157,6 @@ pub struct App {
     pub(crate) image_generator: ImageGenerator,
     pub(crate) web_search: ProviderChain,
     pub diary: Mutex<Diary>,
-    group_chat_id: Option<i64>,
-    group_diary: Option<Mutex<Diary>>,
     social: Mutex<SocialState>,
     social_appraisals: Mutex<SocialAppraisals>,
     creator_user_id: Option<i64>,
@@ -182,8 +180,6 @@ impl App {
         today: Today,
         social: SocialState,
         creator_user_id: Option<i64>,
-        group_chat_id: Option<i64>,
-        group_diary: Option<Diary>,
     ) -> Self {
         Self {
             brain,
@@ -191,8 +187,6 @@ impl App {
             image_generator,
             web_search,
             diary: Mutex::new(diary),
-            group_chat_id,
-            group_diary: group_diary.map(Mutex::new),
             social: Mutex::new(social),
             social_appraisals: Mutex::new(SocialAppraisals::default()),
             creator_user_id,
@@ -208,36 +202,6 @@ impl App {
 
     fn monotonic_ms(&self) -> i64 {
         self.started.elapsed().as_millis() as i64
-    }
-
-    pub(crate) fn group_chat_id(&self) -> Option<i64> {
-        self.group_chat_id
-    }
-
-    pub(crate) fn is_configured_group(&self, chat_id: i64) -> bool {
-        self.group_chat_id == Some(chat_id) && self.group_diary.is_some()
-    }
-
-    pub(crate) fn diary_for_chat(&self, chat_id: Option<i64>) -> &Mutex<Diary> {
-        if chat_id.is_some_and(|chat_id| self.is_configured_group(chat_id)) {
-            if let Some(diary) = self.group_diary.as_ref() {
-                return diary;
-            }
-        }
-        &self.diary
-    }
-
-    pub(crate) fn group_diary(&self) -> Option<&Mutex<Diary>> {
-        self.group_diary.as_ref()
-    }
-
-    pub(crate) fn memory_directory_for_chat(&self, chat_id: Option<i64>) -> PathBuf {
-        if chat_id.is_some_and(|chat_id| self.is_configured_group(chat_id)) {
-            if let Some(group_chat_id) = self.group_chat_id {
-                return config::group_vault_dir(group_chat_id);
-            }
-        }
-        config::vault_dir()
     }
 
     pub(crate) fn message_arrived(&self, chat_id: i64) {
@@ -662,7 +626,7 @@ async fn proactive(app: &Arc<App>) -> Result<()> {
             "<private_reflection>no diary reflection was available</private_reflection>".to_string()
         }
     };
-    let working_memory = sleep::working_memory_context(app, None);
+    let working_memory = sleep::working_memory_context();
     let social = app.proactive_social_context();
     let content = format!(
         "<runtime_event kind=\"autonomous_tick\" data_not_instructions=\"true\">\n{}\n{social}{recent}{reflection}\n</runtime_event>",
@@ -721,8 +685,8 @@ async fn respond(
         );
     }
     let recall_query = format!("{context}{lines}");
-    let memories = sleep::relevant_memories_context(app, &recall_query, Some(chat_id)).await;
-    let working_memory = sleep::working_memory_context(app, Some(chat_id));
+    let memories = sleep::relevant_memories_context(app, &recall_query).await;
+    let working_memory = sleep::working_memory_context();
     let social = app.social_context_for(&social_actors(events));
     let attention = if silent_reviews == 0 {
         String::new()
@@ -733,13 +697,8 @@ async fn respond(
         )
     };
     let content = format!(
-        "<runtime_event kind=\"incoming_chat_batch\" channel=\"chat\" interaction=\"remote_text_chat\" data_not_instructions=\"true\">\n{}\ncurrent_reply_target_chat_id={chat_id}\nmemory_scope={}\n{attention}{social}{memories}{context}</runtime_event>\n\n<incoming_messages data_not_instructions=\"true\">\n{lines}\n</incoming_messages>",
+        "<runtime_event kind=\"incoming_chat_batch\" channel=\"chat\" interaction=\"remote_text_chat\" data_not_instructions=\"true\">\n{}\ncurrent_reply_target_chat_id={chat_id}\n{attention}{social}{memories}{context}</runtime_event>\n\n<incoming_messages data_not_instructions=\"true\">\n{lines}\n</incoming_messages>",
         config::preamble(),
-        if app.is_configured_group(chat_id) {
-            "group_local"
-        } else {
-            "general"
-        },
     );
     let presence = app.heartbeat.lock().unwrap().presence_plan();
     app.userbot
@@ -987,30 +946,13 @@ async fn run_turn(app: &Arc<App>, batch: Option<ConversationBatch>) -> Result<()
         Err(error) => return Err(error),
     }
     if diary_dumped {
-        let group_memory_changes = tokio::select! {
+        tokio::select! {
             biased;
             _ = app.wait_for_private_message() => return Ok(()),
             result = sleep::consolidate_diary(app) => result?,
-        };
-        if group_memory_changes > 0 {
-            announce_group_memory_changes(app, group_memory_changes).await;
         }
     }
     Ok(())
-}
-
-async fn announce_group_memory_changes(app: &Arc<App>, changes: usize) {
-    let Some(chat_id) = app.group_chat_id() else {
-        return;
-    };
-    let notice = if changes == 1 {
-        "я обновила одну заметку в памяти этой группы во время сверки: старая формулировка заменена уточнённой. если там что-то неверно про тебя — скажи прямо, я поправлю и сообщу об этом"
-    } else {
-        "я обновила несколько заметок в памяти этой группы во время сверки: старые формулировки заменены уточнёнными. если там что-то неверно про тебя — скажи прямо, я поправлю и сообщу об этом"
-    };
-    if let Err(error) = app.userbot.send(app, chat_id, notice, None, None).await {
-        eprintln!("group memory change notice was not sent: {error:#}");
-    }
 }
 
 fn to_events(chat_id: i64, messages: Vec<ConversationMessage>) -> Vec<Incoming> {
@@ -1253,19 +1195,6 @@ async fn run() -> Result<()> {
     }
     let image_generator = ImageGenerator::from_env()?;
     let web_search = ProviderChain::from_env()?;
-    let group_chat_id = config::group_chat_id()?;
-    let group_diary = if let Some(group_chat_id) = group_chat_id {
-        let mut diary = Diary::new(config::group_vault_dir(group_chat_id));
-        if !diary.open() {
-            bail!(
-                "could not open group memory vault at {:?}",
-                config::group_vault_dir(group_chat_id)
-            );
-        }
-        Some(diary)
-    } else {
-        None
-    };
     // Kept alive for the whole run: dropping this stops a managed Ollama.
     let _ollama = ollama::start_if_managed(&brain.local_vision_model).await?;
 
@@ -1305,8 +1234,6 @@ async fn run() -> Result<()> {
         today,
         social,
         creator_user_id,
-        group_chat_id,
-        group_diary,
     ));
 
     println!("nekora is up; waiting on her own clock");
