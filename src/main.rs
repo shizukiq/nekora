@@ -1029,6 +1029,12 @@ fn escape_message_attribute(value: &str) -> String {
 async fn ingest(app: &Arc<App>, updates: &mut grammers_client::client::UpdateStream) {
     loop {
         match updates.next().await {
+            // Media handlers may be waiting for these updates while holding worker slots.
+            Ok(Update::Raw(raw)) if matches!(&raw.raw, tl::enums::Update::TranscribedAudio(_)) => {
+                if let tl::enums::Update::TranscribedAudio(audio) = &raw.raw {
+                    app.userbot.receive_transcription(audio);
+                }
+            }
             Ok(update) if update_needs_handling(&update) => {
                 if let Update::NewMessage(message) = &update {
                     let chat_id = message.peer_id().bot_api_dialog_id_unchecked();

@@ -67,6 +67,7 @@ pub struct Brain {
     pub local_vision_model: String,
     request_timeout: Duration,
     vision_api_timeout: Duration,
+    audio_http: reqwest::Client,
 }
 
 #[derive(Clone, Copy)]
@@ -124,7 +125,59 @@ impl Brain {
             local_vision_model: env_or("NEKORA_LOCAL_VISION_MODEL", DEFAULT_LOCAL_VISION_MODEL),
             request_timeout: Duration::from_secs(timeout_secs),
             vision_api_timeout: Duration::from_secs(vision_api_timeout_secs),
+            audio_http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(60))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?,
         })
+    }
+
+    pub fn can_transcribe_audio(&self) -> bool {
+        !env_or("MISTRAL_API_KEY", "").trim().is_empty()
+            && !env_or("NEKORA_TRANSCRIPTION_MODEL", "voxtral-mini-latest")
+                .trim()
+                .is_empty()
+    }
+
+    pub async fn transcribe_audio(&self, audio: Vec<u8>, filename: &str) -> Result<String> {
+        if !self.can_transcribe_audio() {
+            return Err(anyhow!("audio transcription is not configured"));
+        }
+        let form = reqwest::multipart::Form::new()
+            .text(
+                "model",
+                env_or("NEKORA_TRANSCRIPTION_MODEL", "voxtral-mini-latest"),
+            )
+            .part(
+                "file",
+                reqwest::multipart::Part::bytes(audio).file_name(filename.to_string()),
+            );
+        let mut response = self
+            .audio_http
+            .post(format!(
+                "{}/audio/transcriptions",
+                api_base("MISTRAL_API_BASE", DEFAULT_MISTRAL_API_BASE)
+            ))
+            .bearer_auth(env_or("MISTRAL_API_KEY", ""))
+            .multipart(form)
+            .send()
+            .await?
+            .error_for_status()?;
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if body.len() + chunk.len() > 256 * 1024 {
+                return Err(anyhow!("audio transcription response is too large"));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let response: serde_json::Value = serde_json::from_slice(&body)?;
+        response
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(|text| text.chars().take(12_000).collect())
+            .ok_or_else(|| anyhow!("audio transcription returned no speech"))
     }
 
     /// Turn text into a bge-m3 vector. The diary stores and recalls; we only
@@ -241,7 +294,9 @@ impl Brain {
             || async {
                 let mut request = request.clone();
                 if repair_tool_format.load(Ordering::Relaxed) {
-                    request.messages.push(system(promptsall::TOOL_FORMAT_REPAIR));
+                    request
+                        .messages
+                        .push(system(promptsall::TOOL_FORMAT_REPAIR));
                 }
                 let response = client.chat().create(request).await?;
                 let choice = response
@@ -544,8 +599,7 @@ fn normalize_dsml_tool_calls(reply: &mut ChatCompletionResponseMessage) -> Resul
             let attributes = &body[key_end..=tag_end];
             let raw = body[tag_end + 1..value_end].trim();
             let value = if attributes.contains("string=\"false\"") {
-                serde_json::from_str(raw)
-                    .context("brain returned invalid DSML JSON")?
+                serde_json::from_str(raw).context("brain returned invalid DSML JSON")?
             } else {
                 serde_json::Value::String(raw.to_string())
             };

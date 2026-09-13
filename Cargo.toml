@@ -31,7 +31,7 @@ grammers-tl-types = "0.10"
 async-openai = { version = "0.41", default-features = false, features = ["rustls", "chat-completion", "embedding"] }
 
 # Cloud web search adapters use the same rustls-only HTTP transport.
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "multipart"] }
 
 # The local pool: bge-m3 embeddings and the fallback vision model on Ollama.
 # Same rustls choice, for the same reason -- its default feature is native-tls.

@@ -347,6 +347,7 @@ variables win over it.
 | `NEKORA_LOCAL_VISION_MODEL`    | `qwen2.5vl:3b`                      | local Ollama vision fallback                                                                              |
 | `NEKORA_REASONING_MODEL`       | `mistral-small-2603`               | Mistral model for private maintenance and public-result appraisal; set empty to use the main model       |
 | `NEKORA_MISTRAL_VISION_MODEL`  | `mistral-small-2603`               | second cloud model for analyzing incoming images                                                          |
+| `NEKORA_TRANSCRIPTION_MODEL`   | `voxtral-mini-latest`             | Mistral incoming speech recognition; empty disables cloud transcription                                   |
 | `NEKORA_IMAGE_MODEL`           | `krea/krea-2-medium-turbo`           | OpenRouter model slug for the dedicated `/images` API; set empty to disable image generation              |
 | `NEKORA_IMAGE_PROMPT_MODEL`    | ignored                             | obsolete: scenes are no longer rewritten by an intermediate model                                        |
 | `NEKORA_IMAGE_REFERENCES`      | image files in `references/`       | comma-separated local references; Krea accepts one, and unset scans `references/`                       |
@@ -412,6 +413,22 @@ style and background requests still override these defaults.
 A multi-panel reference can still leak its layout into an image, so use one clean portrait without text or panels.
 The template and reference bytes are loaded at startup: restart Nekora to pick up edits. `NEKORA_IMAGE_PROMPT`, when set,
 replaces the built-in template entirely and must be updated separately.
+
+Incoming voice messages wait up to 20 seconds for Telegram's completed transcription, including pending results
+delivered through updates. If Telegram fails or times out, Nekora uploads the audio to Mistral's
+[`audio/transcriptions`](https://docs.mistral.ai/studio/audio/speech_to_text/offline_transcription) endpoint using
+`MISTRAL_API_KEY`, `MISTRAL_API_BASE`, and `NEKORA_TRANSCRIPTION_MODEL`. Cloud transcription has a 60-second timeout
+and can incur provider charges. An empty model or missing key disables that fallback. This is speech recognition,
+not voice generation or analysis of musical sound; no outgoing speech model is configured.
+
+Video and video notes use FFmpeg (included in the Docker image; required on PATH for native runs) to sample three frames across at most the first
+120 seconds and extract speech from that interval when Telegram has no transcript. Each frame has a time offset;
+speech text has no sentence-level timestamps. Frame descriptions use the existing vision chain. The input download
+is limited to 32 MiB and 30 seconds; each decoding process is limited to 20 seconds and each frame caption to 45 seconds.
+Frames fit within 768×768 pixels. Audio extraction produces mono MP3 at 16 kHz. Temporary input files are private
+on Unix and removed when processing finishes or is cancelled; child decoders are killed on cancellation.
+If decoding or recognition fails, any available transcript or preview remains usable, with the missing information
+marked explicitly. `inspect_message_media` uses the same processing for video and voice messages.
 
 Incoming image recognition tries OpenRouter first, then Mistral, and uses local Ollama only when both cloud providers
 fail. The same generator and references are used by `change_avatar`; the tool uploads the result as Nekora's Telegram

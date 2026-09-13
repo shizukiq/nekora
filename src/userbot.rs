@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io::Cursor;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -16,7 +18,7 @@ use grammers_session::types::{PeerId, PeerKind, PeerRef};
 use grammers_session::Session;
 use rand::Rng;
 use serde::Serialize;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 use crate::brain::Brain;
 use crate::config::{self, env_or};
@@ -40,6 +42,15 @@ const MAX_CONTEXT_ITEMS: usize = 16;
 const MAX_CONTEXT_TEXT_CHARS: usize = 1_500;
 const REPLY_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 const PRESENCE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_VIDEO_SECONDS: f64 = 120.0;
+
+struct DownloadedVideo(PathBuf);
+
+impl Drop for DownloadedVideo {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
 
 const MAX_BUBBLE_BYTES: usize = 4096;
 const MAX_OUTGOING_CHARS: usize = 12_000;
@@ -216,6 +227,7 @@ pub struct Userbot {
     sticker_sets: Mutex<HashMap<i64, tl::enums::InputStickerSet>>,
     telegram_assets: Mutex<HashMap<i64, CachedTelegramAsset>>,
     presence: Mutex<Presence>,
+    transcriptions: tokio::sync::broadcast::Sender<tl::types::UpdateTranscribedAudio>,
 }
 
 impl Userbot {
@@ -235,6 +247,7 @@ impl Userbot {
             sticker_sets: Mutex::new(HashMap::new()),
             telegram_assets: Mutex::new(HashMap::new()),
             presence: Mutex::new(Presence::default()),
+            transcriptions: tokio::sync::broadcast::channel(32).0,
         }
     }
 
@@ -1181,21 +1194,41 @@ impl Userbot {
         let media = message
             .media()
             .ok_or_else(|| anyhow!("message has no inspectable media"))?;
-        let (kind, emoji, bytes) = match &media {
-            Media::Photo(photo) => ("photo", None, self.download_media(photo).await?),
+        let (kind, emoji, description) = match &media {
+            Media::Photo(photo) => (
+                "photo",
+                None,
+                self.brain
+                    .caption_image(&self.download_media(photo).await?)
+                    .await?,
+            ),
             Media::Sticker(sticker) => {
                 let bytes = self.download_sticker_image(sticker).await?;
-                ("sticker", Some(sticker.emoji().to_string()), bytes)
+                (
+                    "sticker",
+                    Some(sticker.emoji().to_string()),
+                    self.brain.caption_image(&bytes).await?,
+                )
+            }
+            Media::Document(document)
+                if matches!(visual_document_kind(document), Some("video" | "video note"))
+                    || document.mime_type() == Some("audio/ogg") =>
+            {
+                let kind = if document.mime_type() == Some("audio/ogg") {
+                    "voice message"
+                } else {
+                    visual_document_kind(document).unwrap_or("video")
+                };
+                (kind, None, self.describe_document(&message, document).await)
             }
             Media::Document(document) => {
                 let kind = visual_document_kind(document)
                     .ok_or_else(|| anyhow!("document has no inspectable visual content"))?;
                 let bytes = self.download_visual_document(document, kind).await?;
-                (kind, None, bytes)
+                (kind, None, self.brain.caption_image(&bytes).await?)
             }
             _ => return Err(anyhow!("message has no inspectable visual content")),
         };
-        let description = self.brain.caption_image(&bytes).await?;
         Ok(MediaInspection {
             chat_id,
             chat_kind,
@@ -1583,8 +1616,13 @@ impl Userbot {
         }
     }
 
-    async fn describe_document(&self, message: &Message, document: &Document) -> String {
+    async fn describe_document(&self, message: &TelegramMessage, document: &Document) -> String {
         if let Some(kind) = visual_document_kind(document) {
+            if matches!(kind, "video" | "video note") {
+                return self
+                    .describe_video(document, self.transcribe(message).await)
+                    .await;
+            }
             return self.describe_visual_document(document, kind).await;
         }
         let mime = document.mime_type().unwrap_or("");
@@ -1628,7 +1666,16 @@ impl Userbot {
             "[video]".to_string()
         } else if mime == "audio/ogg" {
             let mut label = "[voice message]".to_string();
-            match self.transcribe(message).await {
+            let mut transcription = self.transcribe(message).await;
+            if transcription.is_none() && self.brain.can_transcribe_audio() {
+                if let Ok(Ok(bytes)) =
+                    tokio::time::timeout(Duration::from_secs(30), self.download_media(document))
+                        .await
+                {
+                    transcription = self.brain.transcribe_audio(bytes, "voice.ogg").await.ok();
+                }
+            }
+            match transcription {
                 Some(text) => {
                     label.push_str("\n[voice transcription]: ");
                     label.push_str(&clean(&text));
@@ -1643,9 +1690,116 @@ impl Userbot {
         }
     }
 
+    async fn describe_video(&self, document: &Document, transcription: Option<String>) -> String {
+        let duration = document
+            .duration()
+            .filter(|seconds| seconds.is_finite() && *seconds > 0.0);
+        let seconds = duration.unwrap_or(MAX_VIDEO_SECONDS).min(MAX_VIDEO_SECONDS);
+        let kind = visual_document_kind(document).unwrap_or("video");
+        let mut parts = vec![format!(
+            "[{kind}]\n(frame sampling limited to the first {seconds:.1}s; only explicitly listed frames were inspected)"
+        )];
+        let mut speech = transcription;
+        let video = async {
+            let bytes = self.download_media(document).await?;
+            tokio::task::spawn_blocking(move || -> Result<DownloadedVideo> {
+                let path = std::env::temp_dir()
+                    .join(format!("nekora-video-{:032x}", rand::random::<u128>()));
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                let mut file = options.open(&path)?;
+                let video = DownloadedVideo(path);
+                std::io::Write::write_all(&mut file, &bytes)?;
+                Ok(video)
+            })
+            .await?
+        };
+        let mut has_frames = false;
+        if let Ok(Ok(video)) = tokio::time::timeout(Duration::from_secs(30), video).await {
+            for time in [0.0, seconds * 0.5, seconds * 0.9] {
+                let frame = decode_video_segment(
+                    &video.0,
+                    time,
+                    &[
+                        "-an",
+                        "-frames:v",
+                        "1",
+                        "-vf",
+                        "scale=768:768:force_original_aspect_ratio=decrease",
+                        "-c:v",
+                        "mjpeg",
+                        "-q:v",
+                        "3",
+                        "-f",
+                        "image2pipe",
+                    ],
+                    2 * 1024 * 1024,
+                )
+                .await;
+                if let Ok(bytes) = frame {
+                    if let Ok(Ok(caption)) = tokio::time::timeout(
+                        Duration::from_secs(45),
+                        self.brain.caption_image(&bytes),
+                    )
+                    .await
+                    {
+                        parts.push(format!("Frame at {time:.1}s: {}", clean(&caption)));
+                        has_frames = true;
+                    }
+                }
+            }
+            if speech.is_none() && self.brain.can_transcribe_audio() {
+                let audio_limit = MAX_VIDEO_SECONDS.to_string();
+                if let Ok(bytes) = decode_video_segment(
+                    &video.0,
+                    0.0,
+                    &[
+                        "-t",
+                        &audio_limit,
+                        "-vn",
+                        "-ac",
+                        "1",
+                        "-ar",
+                        "16000",
+                        "-c:a",
+                        "libmp3lame",
+                        "-b:a",
+                        "32k",
+                        "-f",
+                        "mp3",
+                    ],
+                    1024 * 1024,
+                )
+                .await
+                {
+                    speech = self.brain.transcribe_audio(bytes, "video.mp3").await.ok();
+                    if speech.is_some() {
+                        parts.push("Speech below covers at most the first 120s; no sentence-level timestamps are available.".to_string());
+                    }
+                }
+            }
+        }
+        if !has_frames {
+            parts.push(self.describe_visual_document(document, kind).await);
+        }
+        match speech {
+            Some(text) => parts.push(format!("[voice transcription]: {}", clean(&text))),
+            None => parts.push(
+                "(speech unavailable; this does not establish that the video is silent)"
+                    .to_string(),
+            ),
+        }
+        parts.join("\n")
+    }
+
     async fn describe_visual_document(&self, document: &Document, kind: &str) -> String {
         let label = visual_label(document, kind);
-        if matches!(kind, "gif" | "video") {
+        if matches!(kind, "gif" | "video" | "video note") {
             let Some(thumbnail) = largest_thumbnail(document) else {
                 return format!("{label}\n(no preview frame was attached)");
             };
@@ -1684,7 +1838,7 @@ impl Userbot {
     }
 
     async fn download_visual_document(&self, document: &Document, kind: &str) -> Result<Vec<u8>> {
-        if matches!(kind, "gif" | "video") {
+        if matches!(kind, "gif" | "video" | "video note") {
             let thumbnail = largest_thumbnail(document)
                 .ok_or_else(|| anyhow!("visual document has no preview thumbnail"))?;
             self.download_media(&thumbnail).await
@@ -1705,16 +1859,42 @@ impl Userbot {
         Ok(bytes)
     }
 
-    async fn transcribe(&self, message: &Message) -> Option<String> {
+    async fn transcribe(&self, message: &TelegramMessage) -> Option<String> {
+        let mut updates = self.transcriptions.subscribe();
         let peer_ref = message.peer_ref().await.ok()??;
         let request = tl::functions::messages::TranscribeAudio {
             peer: peer_ref.into(),
             msg_id: message.id(),
         };
-        let tl::enums::messages::TranscribedAudio::Audio(audio) =
-            self.client.invoke(&request).await.ok()?;
-        let text = audio.text.trim();
-        (!text.is_empty()).then(|| text.to_string())
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let tl::enums::messages::TranscribedAudio::Audio(audio) =
+                self.client.invoke(&request).await.ok()?;
+            if !audio.pending {
+                return (!audio.text.trim().is_empty()).then(|| audio.text.trim().to_string());
+            }
+            loop {
+                match updates.recv().await {
+                    Ok(update)
+                        if update.transcription_id == audio.transcription_id
+                            && update.msg_id == message.id()
+                            && PeerId::from(&update.peer) == message.peer_id()
+                            && !update.pending =>
+                    {
+                        return (!update.text.trim().is_empty())
+                            .then(|| update.text.trim().to_string());
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    pub fn receive_transcription(&self, update: &tl::types::UpdateTranscribedAudio) {
+        let _ = self.transcriptions.send(update.clone());
     }
 
     async fn go_online(&self) {
@@ -2709,7 +2889,62 @@ fn summarize_message(message: &TelegramMessage) -> TelegramMessageSummary {
     }
 }
 
+async fn decode_video_segment(
+    path: &Path,
+    start: f64,
+    output_args: &[&str],
+    max_bytes: u64,
+) -> Result<Vec<u8>> {
+    let mut child = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-v",
+            "error",
+            "-protocol_whitelist",
+            "file,pipe",
+            "-format_whitelist",
+            "mov,matroska,webm,avi",
+            "-threads",
+            "1",
+            "-ss",
+        ])
+        .arg(format!("{start:.3}"))
+        .arg("-i")
+        .arg(path)
+        .args(output_args)
+        .args(["-threads", "1", "pipe:1"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("video decoder has no output"))?;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let mut bytes = Vec::new();
+        stdout.take(max_bytes + 1).read_to_end(&mut bytes).await?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(anyhow!("decoded media is too large"));
+        }
+        if !child.wait().await?.success() || bytes.is_empty() {
+            return Err(anyhow!("could not decode this media segment"));
+        }
+        Ok(bytes)
+    })
+    .await
+    .map_err(|_| anyhow!("video decoding timed out"))?
+}
+
 fn visual_document_kind(document: &Document) -> Option<&'static str> {
+    if let Some(tl::enums::Document::Document(raw)) = &document.raw.document {
+        if raw.attributes.iter().any(|attribute| {
+            matches!(attribute, tl::enums::DocumentAttribute::Video(video) if video.round_message)
+        }) {
+            return Some("video note");
+        }
+    }
     let mime = document.mime_type().unwrap_or("");
     if mime.eq_ignore_ascii_case("image/gif") || document_has_extension(document, &["gif"]) {
         return Some("gif");
@@ -2753,7 +2988,7 @@ fn visual_label(document: &Document, kind: &str) -> String {
     } else {
         format!(" ({})", details.join(", "))
     };
-    let preview = matches!(kind, "gif" | "video")
+    let preview = matches!(kind, "gif" | "video" | "video note")
         .then_some("\n[preview frame]")
         .unwrap_or("");
     format!("[{kind}]{suffix}{preview}")
