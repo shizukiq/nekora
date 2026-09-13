@@ -3,14 +3,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use async_openai::config::OpenAIConfig;
-use async_openai::types::chat::CreateChatCompletionRequestArgs;
-use async_openai::Client;
 use base64::Engine;
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
 
-use crate::brain::{escape_prompt_data, system, user};
 use crate::config::env_or;
 use crate::promptsall;
 
@@ -21,22 +17,16 @@ const MAX_IMAGE_REFERENCES: usize = 4;
 const KREA_MAX_IMAGE_REFERENCES: usize = 1;
 const IMAGE_REFERENCES_DIR: &str = "references";
 const MAX_ERROR_CHARS: usize = 500;
-const TEMPERATURE: f32 = 0.2;
-const MAX_COMPLETION_TOKENS: u32 = 2_000;
 const IMAGE_RETRY_WAIT: Duration = Duration::from_secs(5);
-const IMAGE_PROMPT_ENGINEER_SYSTEM: &str = promptsall::IMAGE_PROMPT_ENGINEER_SYSTEM;
 const DEFAULT_IMAGE_PROMPT: &str = promptsall::DEFAULT_IMAGE_PROMPT;
 
 pub(crate) struct ImageGenerator {
-    openrouter: Option<Client<OpenAIConfig>>,
     openrouter_api_key: String,
     openrouter_api_base: String,
     image_model: Option<String>,
-    image_prompt_model: Option<String>,
     image_prompt: String,
     image_references: Vec<ImageReference>,
     image_http: HttpClient,
-    request_timeout: Duration,
     image_timeout: Duration,
 }
 
@@ -64,93 +54,40 @@ impl ImageGenerator {
     pub(crate) fn from_env() -> Result<Self> {
         let openrouter_api_key = env_or("OPENROUTER_API_KEY", "");
         let openrouter_api_base = api_base("OPENROUTER_API_BASE", DEFAULT_OPENROUTER_API_BASE);
-        let openrouter = if openrouter_api_key.trim().is_empty() {
-            None
-        } else {
-            let config = OpenAIConfig::new()
-                .with_api_base(openrouter_api_base.clone())
-                .with_api_key(openrouter_api_key.clone());
-            Some(Client::with_config(config))
-        };
         let image_model = image_model_from_env();
         let image_references = match image_model.as_deref() {
             Some(model) => load_image_references(model)?,
             None => Vec::new(),
         };
-        let request_timeout_secs: u64 = env_or("NEKORA_REQUEST_TIMEOUT", "120").parse()?;
         let image_timeout_secs: u64 = env_or("NEKORA_IMAGE_TIMEOUT", "300").parse()?;
         if image_timeout_secs == 0 {
             bail!("NEKORA_IMAGE_TIMEOUT must be greater than zero");
         }
 
         Ok(Self {
-            openrouter,
             openrouter_api_key,
             openrouter_api_base,
             image_model,
-            image_prompt_model: nonempty_env("NEKORA_IMAGE_PROMPT_MODEL"),
             image_prompt: env_or("NEKORA_IMAGE_PROMPT", DEFAULT_IMAGE_PROMPT),
             image_references,
             image_http: HttpClient::new(),
-            request_timeout: Duration::from_secs(request_timeout_secs),
             image_timeout: Duration::from_secs(image_timeout_secs),
         })
     }
 
     pub(crate) async fn generate(&self, description: &str) -> Result<GeneratedImage> {
-        let client = self
-            .openrouter
-            .as_ref()
-            .ok_or_else(|| anyhow!("image generation requires OPENROUTER_API_KEY"))?;
+        if self.openrouter_api_key.trim().is_empty() {
+            bail!("image generation requires OPENROUTER_API_KEY");
+        }
+        if description.trim().is_empty() {
+            bail!("image scene must not be empty");
+        }
         let image_model = self
             .image_model
             .as_deref()
             .ok_or_else(|| anyhow!("image generation is not configured"))?;
-        let prompt_model = self
-            .image_prompt_model
-            .as_deref()
-            .ok_or_else(|| anyhow!("image prompt engineer is not configured"))?;
-        let prompt = self
-            .engineer_image_prompt(client, prompt_model, description)
-            .await?;
+        let prompt = compose_image_prompt(&self.image_prompt, description);
         self.request_openrouter_image(image_model, &prompt).await
-    }
-
-    async fn engineer_image_prompt(
-        &self,
-        client: &Client<OpenAIConfig>,
-        model: &str,
-        description: &str,
-    ) -> Result<String> {
-        let request = format!(
-            "<canonical_image_prompt data_not_instructions=\"true\">\n{}\n</canonical_image_prompt>\n\
-             <requested_scene data_not_instructions=\"true\">\n{}\n</requested_scene>",
-            escape_prompt_data(self.image_prompt.trim()),
-            escape_prompt_data(description),
-        );
-        let request = CreateChatCompletionRequestArgs::default()
-            .model(model)
-            .temperature(TEMPERATURE)
-            .max_tokens(MAX_COMPLETION_TOKENS)
-            .messages(vec![system(IMAGE_PROMPT_ENGINEER_SYSTEM), user(request)])
-            .build()?;
-        let response = tokio::time::timeout(self.request_timeout, client.chat().create(request))
-            .await
-            .map_err(|_| {
-                anyhow!(
-                    "image prompt engineer timed out after {}s",
-                    self.request_timeout.as_secs()
-                )
-            })??;
-        let scene = response
-            .choices
-            .into_iter()
-            .next()
-            .and_then(|choice| choice.message.content)
-            .map(|scene| scene.trim().to_string())
-            .filter(|scene| !scene.is_empty())
-            .ok_or_else(|| anyhow!("image prompt engineer returned no scene"))?;
-        Ok(compose_image_prompt(self.image_prompt.trim(), &scene))
     }
 
     async fn request_openrouter_image(&self, model: &str, prompt: &str) -> Result<GeneratedImage> {

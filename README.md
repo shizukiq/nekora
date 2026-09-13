@@ -74,7 +74,7 @@ proxy for the Mistral API.
 | Embeddings           | `bge-m3` on Ollama                         | fixed local vector space for diary recall                                                                    |
 | Vision               | `qwen/qwen3-vl-32b-instruct` on OpenRouter | OpenRouter first, then `mistral-small-2603` via Mistral, then `qwen2.5vl:3b` locally                       |
 | Web search           | Ollama Cloud, then OpenRouter              | provider order is configurable; results are normalized before entering the turn                              |
-| Image generation     | `krea/krea-2-medium-turbo`                 | requires an OpenRouter key and prompt model; retries only transient provider requests                    |
+| Image generation     | `krea/krea-2-medium-turbo`                 | requires an OpenRouter key; scene and base prompt are composed without another text model               |
 
 If `MISTRAL_API_KEY` is empty, private maintenance uses the main model and vision goes from OpenRouter directly to the
 local fallback. `MISTRAL_API_BASE` defaults to `https://api.mistral.ai/v1`.
@@ -348,7 +348,7 @@ variables win over it.
 | `NEKORA_REASONING_MODEL`       | `mistral-small-2603`               | Mistral model for private maintenance and public-result appraisal; set empty to use the main model       |
 | `NEKORA_MISTRAL_VISION_MODEL`  | `mistral-small-2603`               | second cloud model for analyzing incoming images                                                          |
 | `NEKORA_IMAGE_MODEL`           | `krea/krea-2-medium-turbo`           | OpenRouter model slug for the dedicated `/images` API; set empty to disable image generation              |
-| `NEKORA_IMAGE_PROMPT_MODEL`    | empty                               | required OpenRouter chat model that engineers Krea scene prompts                                          |
+| `NEKORA_IMAGE_PROMPT_MODEL`    | ignored                             | obsolete: scenes are no longer rewritten by an intermediate model                                        |
 | `NEKORA_IMAGE_REFERENCES`      | image files in `references/`       | comma-separated local references; Krea accepts one, and unset scans `references/`                       |
 | `NEKORA_IMAGE_PROMPT`          | built-in Nekora template            | optional full canonical image prompt override; `{SCENE_REQUEST}` is replaced per image                   |
 | `NEKORA_IMAGE_TIMEOUT`         | `300`                               | seconds allowed for one OpenRouter image generation request                                               |
@@ -380,23 +380,29 @@ Replies stay selective and concise without treating every direct follow-up as ba
 scatterbrained: complicated questions invite simple words and brief uncertainty, not an expert lecture after a cute
 opening. Practical actions still require accurate tool use and honest results; the diary keeps factual detail.
 Visible actions use tools; final plain text can also be forwarded by the conversation fallback and is not private reasoning.
-Unlike Kuni's Stable Diffusion pipeline, image engineering produces a natural-language scene, not positive/negative
-JSON or weighted tags. Nekora's appearance remains in the canonical template; only explicit scene requests change it temporarily.
+Conversational spelling, punctuation and sentence fragments may stay informal; accuracy requirements apply to facts
+and tool arguments, not to polishing her voice. Incoming media is interpreted at three separate levels: what was sent,
+what is depicted, and what the surrounding conversation suggests. A patting sticker is not automatically an action on
+Nekora. Vision, emotional appraisal and diary maintenance preserve that distinction without requiring disclaimers in chat.
+For sticker replies, the existing workflow is `list_sticker_sets(kind="sticker")` → `list_stickers` → `send_sticker`.
+Selection uses installed sets and returned document IDs; a sticker may be the entire reply, not a mandatory extra bubble.
 
 Image generation uses local reference images as OpenRouter `input_references`. The default model is Krea 2 Medium Turbo,
 which accepts one reference image per request, so an unset `NEKORA_IMAGE_REFERENCES` scans the local `references/` directory
-and uses the first supported image; an explicit list with more than one image is rejected for Krea. The prompt engineer receives the
-canonical image template and returns only a short natural-language scene brief; the fixed identity, rendering, and
-anti-drift sections are assembled by Rust. Set `NEKORA_IMAGE_PROMPT_MODEL` before using `generate_image`, because image
-requests may incur provider charges. Set `NEKORA_IMAGE_MODEL` to another OpenRouter image model when needed; the generic
+and uses the first supported image; an explicit list with more than one image is rejected for Krea. Rust inserts the
+tool's scene description directly into `{SCENE_REQUEST}` in the short base prompt. There is no intermediate prompt
+engineer; `NEKORA_IMAGE_PROMPT_MODEL` is ignored. The reference supplies facial and hair identity, while the template
+sets a few character anchors and the default style. Image requests may incur provider charges.
+Set `NEKORA_IMAGE_MODEL` to another OpenRouter image model when needed; the generic
 path keeps support for up to four discovered references. Image generation has its own `NEKORA_IMAGE_TIMEOUT` because it
 can take longer than an ordinary model request. If the selected reference is a character sheet and Krea starts copying its
 panels or labels, replace it with a clean single-frame portrait through `NEKORA_IMAGE_REFERENCES`.
 
 There is no post-generation vision quality gate: a successful image response is sent as-is. The image request still retries
 temporary transport or provider failures, without generating extra images after a successful response.
-Photo, selfie, and snapshot requests are rendered as one camera-like frame; other requests keep the anime illustration
-style. The default illustration uses dimensional skin shading and densely layered, individually rendered hair. Black is
+The default medium is detailed semi-realistic anime; an explicitly requested medium is part of the scene instead of
+appending separate photographic and illustrated instruction blocks to every request. The template requests soft
+dimensional shading and detailed tangled hair. Black is
 the dominant hair color; broad dark-crimson locks overlap through the lengths rather than forming a percentage-based
 split or an isolated red half. An avatar request changes framing, not the rendering into a flat mascot icon. Scene-specific
 style and background requests still override these defaults.
