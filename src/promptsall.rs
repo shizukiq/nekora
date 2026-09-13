@@ -484,6 +484,8 @@ and lists are allowed. Do not output tool calls, a preamble, or an enclosing cod
 Return NO_MEMORY when there is nothing to preserve.
 "#;
 
+pub(crate) const TOOL_FORMAT_REPAIR: &str = "The previous completion could not be parsed as a tool call and none of its calls were executed. Generate the response again using the API's structured tool_calls field and valid JSON object arguments matching the provided tool schemas. Do not write DSML, XML tool tags or fenced tool calls in message content. If no tools are available, return only the requested answer in plain content.";
+
 pub(crate) const DEFAULT_IMAGE_PROMPT: &str = r#"Create one coherent image containing one Nekora.
 
 Nekora is a clearly adult catgirl with pale skin, a soft feminine face, emerald-green eyes,
@@ -496,8 +498,14 @@ Preserve its visual identity instead of redesigning her from this short descript
 The scene below controls clothing, action, barefoot, expression, setting and framing; an explicit temporary
 appearance change applies only to this image.
 
-Default illustration style tags: semi-realistic anime, delicate linework, dimensional soft shading,
-fine hair strands, layered hair depth, natural lighting.
+Default illustration style: detailed painterly anime with a soft semi-realistic finish. Use delicate
+linework blended into the painting, smooth dimensional shading, subtle skin blush, luminous eyes
+with layered iris detail, and fine flyaway strands over richly layered hair with soft glossy highlights.
+Give clothing tactile folds and the setting softly painted depth, keeping the face as the visual focus.
+Use cinematic lighting motivated by the scene: soft directional light, gentle rim light, warm highlights
+balanced by cooler shadows, delicate bloom around bright light sources, and a softly receding background.
+Keep Nekora's established eye and hair colors under the lighting. Aim for an intimate, atmospheric
+illustration with natural anatomy and restrained highlights; avoid flat cel shading or a plastic 3D finish.
 These are defaults, not additional styles to mix: an explicit medium or style in the scene replaces
 them. Keep one continuous scene, without panels, duplicate characters, labels or swatches.
 

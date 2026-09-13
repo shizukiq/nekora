@@ -1,9 +1,9 @@
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use async_openai::config::OpenAIConfig;
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
@@ -236,16 +236,27 @@ impl Brain {
             builder.tools(tools.to_vec());
         }
         let request = builder.build()?;
+        let repair_tool_format = AtomicBool::new(false);
         self.retry(
             || async {
-                let response = client.chat().create(request.clone()).await?;
-                let mut reply = response
+                let mut request = request.clone();
+                if repair_tool_format.load(Ordering::Relaxed) {
+                    request.messages.push(system(promptsall::TOOL_FORMAT_REPAIR));
+                }
+                let response = client.chat().create(request).await?;
+                let choice = response
                     .choices
                     .into_iter()
                     .next()
-                    .map(|choice| choice.message)
                     .ok_or_else(|| anyhow!("brain returned no choices"))?;
-                normalize_dsml_tool_calls(&mut reply)?;
+                let mut reply = choice.message;
+                if let Err(error) = normalize_dsml_tool_calls(&mut reply) {
+                    repair_tool_format.store(true, Ordering::Relaxed);
+                    return Err(error.context(format!(
+                        "DSML tool call parsing failed (finish_reason: {:?})",
+                        choice.finish_reason
+                    )));
+                }
                 Ok(reply)
             },
             |_| true,
@@ -513,7 +524,9 @@ fn normalize_dsml_tool_calls(reply: &mut ChatCompletionResponseMessage) -> Resul
 
         while let Some((parameter, parameter_prefix_len)) = find_dsml_parameter(body) {
             if !body[..parameter].trim().is_empty() {
-                return Err(anyhow!("brain returned unexpected DSML invoke content"));
+                return Err(anyhow!(
+                    "brain returned unexpected DSML invoke content before parameter"
+                ));
             }
             body = &body[parameter + parameter_prefix_len..];
             let key_end = body
@@ -532,11 +545,13 @@ fn normalize_dsml_tool_calls(reply: &mut ChatCompletionResponseMessage) -> Resul
             let raw = body[tag_end + 1..value_end].trim();
             let value = if attributes.contains("string=\"false\"") {
                 serde_json::from_str(raw)
-                    .map_err(|_| anyhow!("brain returned invalid DSML JSON"))?
+                    .context("brain returned invalid DSML JSON")?
             } else {
                 serde_json::Value::String(raw.to_string())
             };
-            arguments.insert(key.to_string(), value);
+            if arguments.insert(key.to_string(), value).is_some() {
+                return Err(anyhow!("brain returned duplicate DSML parameter"));
+            }
             body = &body[value_end + parameter_close_len..];
         }
 
@@ -544,13 +559,15 @@ fn normalize_dsml_tool_calls(reply: &mut ChatCompletionResponseMessage) -> Resul
             let raw = body.trim();
             if !raw.is_empty() {
                 arguments = serde_json::from_str::<serde_json::Value>(raw)
-                    .map_err(|_| anyhow!("brain returned invalid DSML arguments"))?
+                    .context("brain returned invalid DSML arguments")?
                     .as_object()
                     .cloned()
                     .ok_or_else(|| anyhow!("DSML arguments must be a JSON object"))?;
             }
         } else if !body.trim().is_empty() {
-            return Err(anyhow!("brain returned unexpected DSML invoke content"));
+            return Err(anyhow!(
+                "brain returned unexpected DSML invoke content after parameters"
+            ));
         }
 
         calls.push(ChatCompletionMessageToolCalls::Function(
@@ -580,7 +597,9 @@ fn find_dsml_invoke(text: &str) -> Option<(usize, usize)> {
         "<||DSML|| invoke name=\"",
         "<||DSML||invoke name=\"",
         "<｜DSML｜invoke name=\"",
+        "<｜DSML｜ invoke name=\"",
         "<|DSML|invoke name=\"",
+        "<|DSML| invoke name=\"",
     ]
     .into_iter()
     .filter_map(|prefix| text.find(prefix).map(|start| (start, prefix.len())))
@@ -594,7 +613,9 @@ fn find_dsml_parameter(text: &str) -> Option<(usize, usize)> {
         "<||DSML|| parameter name=\"",
         "<||DSML||parameter name=\"",
         "<｜DSML｜parameter name=\"",
+        "<｜DSML｜ parameter name=\"",
         "<|DSML|parameter name=\"",
+        "<|DSML| parameter name=\"",
     ]
     .into_iter()
     .filter_map(|prefix| text.find(prefix).map(|start| (start, prefix.len())))
@@ -607,7 +628,9 @@ fn find_dsml_close(text: &str, tag: &str) -> Option<(usize, usize)> {
             "</｜｜DSML｜｜invoke>",
             "</｜｜DSML｜｜ invoke>",
             "</｜DSML｜invoke>",
+            "</｜DSML｜ invoke>",
             "</|DSML|invoke>",
+            "</|DSML| invoke>",
             "<｜/DSML｜invoke>",
             "<|/DSML|invoke>",
             "<｜DSML｜/invoke>",
@@ -619,7 +642,9 @@ fn find_dsml_close(text: &str, tag: &str) -> Option<(usize, usize)> {
             "</｜｜DSML｜｜parameter>",
             "</｜｜DSML｜｜ parameter>",
             "</｜DSML｜parameter>",
+            "</｜DSML｜ parameter>",
             "</|DSML|parameter>",
+            "</|DSML| parameter>",
             "<｜/DSML｜parameter>",
             "<|/DSML|parameter>",
             "<｜DSML｜/parameter>",
