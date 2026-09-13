@@ -852,6 +852,25 @@ async fn run_turn(app: &Arc<App>, batch: Option<ConversationBatch>) -> Result<()
                 {
                     Ok(outcome) => outcome,
                     Err(error) => {
+                        if chat_id > 0 && app.generation_is_current(generation) {
+                            let args = serde_json::json!({
+                                "chat_id": chat_id,
+                                "text": "У меня технический сбой, не получилось закончить ответ. Попробуй написать чуть позже.",
+                            })
+                            .to_string();
+                            let result = tools::run(
+                                app,
+                                "send_message",
+                                &args,
+                                Some(generation),
+                                &mut receipts,
+                            )
+                            .await;
+                            // Stop retrying only after the person receives the failure notice.
+                            if result == "sent" {
+                                return Err(error);
+                            }
+                        }
                         app.conversation.lock().unwrap().retry_after_error(
                             ConversationBatch {
                                 chat_id,
