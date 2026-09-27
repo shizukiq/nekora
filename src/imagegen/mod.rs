@@ -7,8 +7,7 @@ use base64::Engine;
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
 
-use crate::config::env_or;
-use crate::promptsall;
+use crate::config::{self, env_or};
 
 const DEFAULT_OPENROUTER_API_BASE: &str = "https://openrouter.ai/api/v1";
 const DEFAULT_IMAGE_MODEL: &str = "krea/krea-2-medium-turbo";
@@ -18,7 +17,6 @@ const KREA_MAX_IMAGE_REFERENCES: usize = 1;
 const IMAGE_REFERENCES_DIR: &str = "references";
 const MAX_ERROR_CHARS: usize = 500;
 const IMAGE_RETRY_WAIT: Duration = Duration::from_secs(5);
-const DEFAULT_IMAGE_PROMPT: &str = promptsall::DEFAULT_IMAGE_PROMPT;
 
 pub(crate) struct ImageGenerator {
     openrouter_api_key: String,
@@ -68,7 +66,7 @@ impl ImageGenerator {
             openrouter_api_key,
             openrouter_api_base,
             image_model,
-            image_prompt: env_or("NEKORA_IMAGE_PROMPT", DEFAULT_IMAGE_PROMPT),
+            image_prompt: env_or("NEKORA_IMAGE_PROMPT", config::image_prompt()),
             image_references,
             image_http: HttpClient::new(),
             image_timeout: Duration::from_secs(image_timeout_secs),

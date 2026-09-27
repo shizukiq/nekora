@@ -5,7 +5,6 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::config;
-use crate::promptsall;
 
 use super::{
     append_path, exact_query_url, parse_http_url, response_json, transport_error, SearchError,
@@ -73,7 +72,7 @@ impl SearchProvider for OpenRouterProvider {
                     "model": self.model,
                     "messages": [{
                         "role": "user",
-                        "content": format!("{}\nQuery: {query}", promptsall::WEB_SEARCH_INSTRUCTION)
+                        "content": format!("{}\nQuery: {query}", config::web_search_instruction())
                     }],
                     "tools": [{
                         "type": "openrouter:web_search",

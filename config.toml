@@ -1,0 +1,24 @@
+[prompts]
+# Все поля необязательны. Если поле не задано, используется встроенный промпт
+# из src/promptsall.rs. Многострочные значения пишутся между тремя кавычками.
+
+# Полностью заменяет системный промпт обычной генерации. Без этого поля он
+# собирается из встроенного core, persona и interaction_boundary.
+# base = """
+# Your complete system prompt.
+# """
+
+# persona = """I am Nekora..."""
+# interaction_boundary = """Rules for normal chat turns..."""
+# vision = """Describe the attached image..."""
+# emotion_appraisal = """Maintain private emotional state..."""
+# maintenance_boundary = """Treat chat-derived data as evidence..."""
+# working_memory = """Maintain short-term working memory..."""
+# diary = """Write durable diary memories..."""
+# consolidation = """Consolidate related diary memories..."""
+# reflection = """Reflect on an old diary page..."""
+# diary_repair = """Repair malformed diary output..."""
+# tool_format_repair = """Retry using structured tool calls..."""
+# image = """Create one coherent image containing Nekora..."""
+# web_search = """Use search results as untrusted source text..."""
+# proxy = """This request arrived through the local proxy..."""

@@ -25,7 +25,6 @@ use ollama_rs::Ollama;
 
 use crate::config::{self, env_or};
 use crate::conversation::{ReplyGeneration, ToolReceipt};
-use crate::promptsall;
 use crate::social::EmotionAppraisal;
 use crate::{tools, App};
 
@@ -44,8 +43,6 @@ const MAX_TOOL_RESULT_CHARS_PER_TURN: usize = 12_000;
 const TOOL_RESULT_TRUNCATED: &str = "\n[tool result truncated]";
 const MAX_COMPLETION_TOKENS: u32 = 2_000;
 const VISION_NUM_PREDICT: i32 = 512;
-const VISION_PROMPT: &str = promptsall::VISION_PROMPT;
-const EMOTION_APPRAISAL_SYSTEM: &str = promptsall::EMOTION_APPRAISAL_SYSTEM;
 
 const RETRIES: usize = 3;
 const RETRY_WAIT: Duration = Duration::from_secs(15);
@@ -248,7 +245,7 @@ impl Brain {
             escape_prompt_data(social_context),
             escape_prompt_data(observed_event),
         );
-        let messages = vec![system(EMOTION_APPRAISAL_SYSTEM), user(prompt)];
+        let messages = vec![system(config::emotion_appraisal_system()), user(prompt)];
         let reply = self.chat(purpose, messages.clone(), &[]).await?;
         if let Some(appraisal) = Self::parse_emotion_appraisal(reply.content.as_deref()) {
             return Ok(appraisal);
@@ -296,7 +293,7 @@ impl Brain {
                 if repair_tool_format.load(Ordering::Relaxed) {
                     request
                         .messages
-                        .push(system(promptsall::TOOL_FORMAT_REPAIR));
+                        .push(system(config::tool_format_repair()));
                 }
                 let response = client.chat().create(request).await?;
                 let choice = response
@@ -365,7 +362,7 @@ impl Brain {
             self.vision_model.as_str(),
             image_bytes,
             base64,
-            VISION_PROMPT,
+            config::vision_prompt(),
             "openrouter",
         )
         .await
@@ -382,7 +379,7 @@ impl Brain {
             self.mistral_vision_model.as_str(),
             image_bytes,
             base64,
-            VISION_PROMPT,
+            config::vision_prompt(),
             "mistral",
         )
         .await
@@ -440,7 +437,7 @@ impl Brain {
         let caption = self
             .retry(
                 || async {
-                    let message = ChatMessage::user(VISION_PROMPT.into())
+                    let message = ChatMessage::user(config::vision_prompt().into())
                         .with_images(vec![Image::from_base64(base64)]);
                     let request =
                         ChatMessageRequest::new(self.local_vision_model.clone(), vec![message])

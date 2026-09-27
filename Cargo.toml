@@ -3,7 +3,7 @@ name = "nekora"
 version = "0.1.0"
 edition = "2021"
 description = "An autonomous Telegram userbot that lives on its own clock"
-license = "GPL-3"
+license = "CC0-1.0"
 
 # One binary, one Nekora. The old Python "hand" and C++ "core" are now one Rust
 # process: the core modules (heartbeat, conversation, diary, persistence) stay
@@ -41,6 +41,7 @@ ollama-rs = { version = "0.3", default-features = false, features = ["rustls"] }
 # recall/list payloads. serde covers both.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.9"
 
 # Incoming photos are captioned by the local vision model, which takes base64.
 base64 = "0.23"

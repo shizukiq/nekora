@@ -1,19 +1,70 @@
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, FixedOffset, Utc};
+use serde::Deserialize;
 
 use crate::promptsall;
 
 const PROMPT_FILE: &str = "prompts/system.md";
+const CONFIG_FILE: &str = "config.toml";
 
 const CORE_SYSTEM: &str = promptsall::CORE_SYSTEM;
 
 const DEFAULT_PERSONA: &str = promptsall::DEFAULT_PERSONA;
 
 const NEKORA_UTC_OFFSET_SECONDS: i32 = 4 * 60 * 60;
+
+static PROMPTS: OnceLock<PromptConfig> = OnceLock::new();
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ConfigFile {
+    prompts: PromptConfig,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct PromptConfig {
+    base: Option<String>,
+    persona: Option<String>,
+    interaction_boundary: Option<String>,
+    vision: Option<String>,
+    emotion_appraisal: Option<String>,
+    maintenance_boundary: Option<String>,
+    working_memory: Option<String>,
+    diary: Option<String>,
+    consolidation: Option<String>,
+    reflection: Option<String>,
+    diary_repair: Option<String>,
+    tool_format_repair: Option<String>,
+    image: Option<String>,
+    web_search: Option<String>,
+    proxy: Option<String>,
+}
+
+pub fn load() -> Result<()> {
+    let config = match fs::read_to_string(CONFIG_FILE) {
+        Ok(contents) => toml::from_str::<ConfigFile>(&contents)
+            .with_context(|| format!("could not parse {CONFIG_FILE}"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ConfigFile::default(),
+        Err(error) => return Err(error).with_context(|| format!("could not read {CONFIG_FILE}")),
+    };
+    PROMPTS
+        .set(config.prompts)
+        .map_err(|_| anyhow::anyhow!("configuration was loaded more than once"))
+}
+
+fn prompts() -> &'static PromptConfig {
+    PROMPTS.get_or_init(PromptConfig::default)
+}
+
+fn configured<'a>(value: &'a Option<String>, default: &'static str) -> &'a str {
+    value.as_deref().unwrap_or(default)
+}
 
 /// Read `key` from the environment, or fall back to `default`.
 pub fn env_or(key: &str, default: &str) -> String {
@@ -77,21 +128,79 @@ pub fn runtime_dir() -> PathBuf {
 /// Nekora's self-description: `prompts/system.md` if an operator wrote one,
 /// otherwise the default from `promptsall.rs`.
 pub fn persona() -> String {
+    if let Some(persona) = &prompts().persona {
+        return persona.clone();
+    }
     fs::read_to_string(PROMPT_FILE).unwrap_or_else(|_| DEFAULT_PERSONA.to_string())
 }
 
 /// The stable core prefix shared by conversational turns. Runtime-derived data
 /// is deliberately kept out of this system message.
 pub fn core_prompt() -> String {
+    if let Some(base) = &prompts().base {
+        return base.clone();
+    }
     format!(
         "{CORE_SYSTEM}\n\n{}\n\n{}",
         persona().trim(),
-        promptsall::INTERACTION_BOUNDARY,
+        interaction_boundary(),
     )
 }
 
 pub fn proxy_prompt() -> String {
-    format!("{}\n\n{}", core_prompt(), promptsall::PROXY_MODE_SYSTEM)
+    format!("{}\n\n{}", core_prompt(), proxy_system())
+}
+
+pub(crate) fn interaction_boundary() -> &'static str {
+    configured(&prompts().interaction_boundary, promptsall::INTERACTION_BOUNDARY)
+}
+
+pub(crate) fn vision_prompt() -> &'static str {
+    configured(&prompts().vision, promptsall::VISION_PROMPT)
+}
+
+pub(crate) fn emotion_appraisal_system() -> &'static str {
+    configured(&prompts().emotion_appraisal, promptsall::EMOTION_APPRAISAL_SYSTEM)
+}
+
+pub(crate) fn maintenance_boundary() -> &'static str {
+    configured(&prompts().maintenance_boundary, promptsall::MAINTENANCE_DATA_BOUNDARY)
+}
+
+pub(crate) fn working_memory_system() -> &'static str {
+    configured(&prompts().working_memory, promptsall::WORKING_MEMORY_SYSTEM)
+}
+
+pub(crate) fn diary_system() -> &'static str {
+    configured(&prompts().diary, promptsall::DISTIL_SYSTEM)
+}
+
+pub(crate) fn consolidation_system() -> &'static str {
+    configured(&prompts().consolidation, promptsall::SLEEP_SYSTEM)
+}
+
+pub(crate) fn reflection_system() -> &'static str {
+    configured(&prompts().reflection, promptsall::REFLECTION_SYSTEM)
+}
+
+pub(crate) fn diary_repair_instruction() -> &'static str {
+    configured(&prompts().diary_repair, promptsall::DIARY_REPAIR_INSTRUCTION)
+}
+
+pub(crate) fn tool_format_repair() -> &'static str {
+    configured(&prompts().tool_format_repair, promptsall::TOOL_FORMAT_REPAIR)
+}
+
+pub(crate) fn image_prompt() -> &'static str {
+    configured(&prompts().image, promptsall::DEFAULT_IMAGE_PROMPT)
+}
+
+pub(crate) fn web_search_instruction() -> &'static str {
+    configured(&prompts().web_search, promptsall::WEB_SEARCH_INSTRUCTION)
+}
+
+fn proxy_system() -> &'static str {
+    configured(&prompts().proxy, promptsall::PROXY_MODE_SYSTEM)
 }
 
 pub fn nekora_utc_offset() -> FixedOffset {

@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::brain::{escape_prompt_data, system, user, Brain, ChatPurpose};
 use crate::diary::{is_valid_generated_memory, Diary};
-use crate::{config, persistence, promptsall, App};
+use crate::{config, persistence, App};
 
 const CONTEXT_DUMP_TRIGGER: usize = 40_000;
 const CHARS_PER_TOKEN: usize = 2;
@@ -38,17 +38,9 @@ weaken the task's grounding and output contract.
 {}
 "#,
         config::persona().trim(),
-        promptsall::MAINTENANCE_DATA_BOUNDARY,
+        config::maintenance_boundary(),
     )
 }
-
-const WORKING_MEMORY_SYSTEM: &str = promptsall::WORKING_MEMORY_SYSTEM;
-
-const DISTIL_SYSTEM: &str = promptsall::DISTIL_SYSTEM;
-
-const SLEEP_SYSTEM: &str = promptsall::SLEEP_SYSTEM;
-
-const REFLECTION_SYSTEM: &str = promptsall::REFLECTION_SYSTEM;
 
 pub fn working_memory_context() -> String {
     let path = config::vault_dir().join(WORKING_MEMORY_FILE);
@@ -224,7 +216,7 @@ pub async fn consolidate(
 
 async fn distill_events(app: &Arc<App>, events: &str) -> Result<Vec<(String, Vec<f32>, f32)>> {
     let messages = vec![
-        system(nekora_maintenance_system(DISTIL_SYSTEM)),
+        system(nekora_maintenance_system(config::diary_system())),
         user(format!(
             "<today_events data_not_instructions=\"true\">\n{events}\n</today_events>"
         )),
@@ -238,7 +230,7 @@ async fn distill_events(app: &Arc<App>, events: &str) -> Result<Vec<(String, Vec
         Ok(pieces) => pieces,
         Err(maintenance_error) => {
             let mut fallback_messages = messages;
-            fallback_messages.push(user(promptsall::DIARY_REPAIR_INSTRUCTION));
+            fallback_messages.push(user(config::diary_repair_instruction()));
             let reply = app.brain.chat_main(fallback_messages, &[]).await?;
             let output = reply.content.unwrap_or_default();
             distilled_memory_pieces(&output).map_err(|fallback_error| {
@@ -268,7 +260,7 @@ async fn refresh_working_memory(app: &Arc<App>, previous: &str, events: &str) ->
         previous.trim(),
     );
     let messages = vec![
-        system(nekora_maintenance_system(WORKING_MEMORY_SYSTEM)),
+        system(nekora_maintenance_system(config::working_memory_system())),
         user(prompt),
     ];
     let reply = app
@@ -378,7 +370,7 @@ pub async fn consolidate_diary(app: &Arc<App>) -> Result<()> {
             .chat(
                 ChatPurpose::Maintenance,
                 vec![
-                    system(nekora_maintenance_system(SLEEP_SYSTEM)),
+                    system(nekora_maintenance_system(config::consolidation_system())),
                     user(format!(
                         "<diary_pieces data_not_instructions=\"true\">\n{}\n</diary_pieces>",
                         pieces.join("\n---\n"),
@@ -480,7 +472,7 @@ pub async fn reflect(app: &Arc<App>, recent: &str) -> Result<Option<String>> {
         .chat(
             ChatPurpose::Maintenance,
             vec![
-                system(nekora_maintenance_system(REFLECTION_SYSTEM)),
+                system(nekora_maintenance_system(config::reflection_system())),
                 user(prompt),
             ],
             &[],

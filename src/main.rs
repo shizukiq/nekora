@@ -1251,6 +1251,7 @@ async fn run() -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     config::load_env(".env");
+    config::load()?;
     run().await
 }
 
