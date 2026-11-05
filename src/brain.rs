@@ -291,9 +291,7 @@ impl Brain {
             || async {
                 let mut request = request.clone();
                 if repair_tool_format.load(Ordering::Relaxed) {
-                    request
-                        .messages
-                        .push(system(config::tool_format_repair()));
+                    request.messages.push(system(config::tool_format_repair()));
                 }
                 let response = client.chat().create(request).await?;
                 let choice = response

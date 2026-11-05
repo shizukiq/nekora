@@ -152,7 +152,10 @@ pub fn proxy_prompt() -> String {
 }
 
 pub(crate) fn interaction_boundary() -> &'static str {
-    configured(&prompts().interaction_boundary, promptsall::INTERACTION_BOUNDARY)
+    configured(
+        &prompts().interaction_boundary,
+        promptsall::INTERACTION_BOUNDARY,
+    )
 }
 
 pub(crate) fn vision_prompt() -> &'static str {
@@ -160,11 +163,17 @@ pub(crate) fn vision_prompt() -> &'static str {
 }
 
 pub(crate) fn emotion_appraisal_system() -> &'static str {
-    configured(&prompts().emotion_appraisal, promptsall::EMOTION_APPRAISAL_SYSTEM)
+    configured(
+        &prompts().emotion_appraisal,
+        promptsall::EMOTION_APPRAISAL_SYSTEM,
+    )
 }
 
 pub(crate) fn maintenance_boundary() -> &'static str {
-    configured(&prompts().maintenance_boundary, promptsall::MAINTENANCE_DATA_BOUNDARY)
+    configured(
+        &prompts().maintenance_boundary,
+        promptsall::MAINTENANCE_DATA_BOUNDARY,
+    )
 }
 
 pub(crate) fn working_memory_system() -> &'static str {
@@ -184,11 +193,17 @@ pub(crate) fn reflection_system() -> &'static str {
 }
 
 pub(crate) fn diary_repair_instruction() -> &'static str {
-    configured(&prompts().diary_repair, promptsall::DIARY_REPAIR_INSTRUCTION)
+    configured(
+        &prompts().diary_repair,
+        promptsall::DIARY_REPAIR_INSTRUCTION,
+    )
 }
 
 pub(crate) fn tool_format_repair() -> &'static str {
-    configured(&prompts().tool_format_repair, promptsall::TOOL_FORMAT_REPAIR)
+    configured(
+        &prompts().tool_format_repair,
+        promptsall::TOOL_FORMAT_REPAIR,
+    )
 }
 
 pub(crate) fn image_prompt() -> &'static str {
