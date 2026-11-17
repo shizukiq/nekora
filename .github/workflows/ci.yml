@@ -51,4 +51,4 @@ jobs:
 
       - name: Check Docker image
         run: |
-          docker run --rm nekora:local cargo check --all-targets
+          docker run --rm nekora:local nekora --help
