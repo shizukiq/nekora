@@ -51,5 +51,5 @@ jobs:
 
       - name: Check Docker image
         run: |
-          # Verify the built binary exists at the expected path
-          ls -la target/release/nekora || ls -la target/debug/nekora
+          # Verify the built binary exists inside the Docker image
+          docker run --rm nekora:local ls -la /usr/local/bin/nekora
