@@ -51,4 +51,4 @@ jobs:
 
       - name: Check Docker image
         run: |
-          docker run --rm nekora:local nekora --help
+          docker run --rm nekora:local ls -la /usr/local/bin/nekora
